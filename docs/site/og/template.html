@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      @font-face {
+        font-family: "Inter Variable";
+        font-weight: 100 900;
+        src: url("../node_modules/@fontsource-variable/inter/files/inter-latin-wght-normal.woff2") format("woff2-variations");
+      }
+      @font-face {
+        font-family: "JetBrains Mono Variable";
+        font-weight: 100 800;
+        src: url("../node_modules/@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2") format("woff2-variations");
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+      }
+      html,
+      body {
+        width: 1200px;
+        height: 630px;
+        overflow: hidden;
+      }
+      body {
+        position: relative;
+        background: #14151b;
+        color: #eceef3;
+        font-family: "Inter Variable", sans-serif;
+        font-feature-settings: "cv11", "ss01";
+        -webkit-font-smoothing: antialiased;
+      }
+      .bg {
+        position: absolute;
+        inset: 0;
+        background:
+          radial-gradient(700px 420px at 0% 0%, rgb(10 132 255 / 0.2), transparent 70%),
+          radial-gradient(620px 460px at 82% 58%, rgb(64 200 224 / 0.16), transparent 70%),
+          radial-gradient(420px 300px at 28% 100%, rgb(48 209 88 / 0.08), transparent 70%);
+      }
+      .bg::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background-image:
+          linear-gradient(rgb(255 255 255 / 0.05) 1px, transparent 1px),
+          linear-gradient(90deg, rgb(255 255 255 / 0.05) 1px, transparent 1px);
+        background-size: 48px 48px;
+        mask-image: radial-gradient(ellipse 60% 70% at 15% 20%, #000 20%, transparent 75%);
+      }
+      .copy {
+        position: absolute;
+        left: 72px;
+        top: 70px;
+        width: 490px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 18px;
+      }
+      .brand img {
+        width: 76px;
+        height: 76px;
+        filter: drop-shadow(0 10px 24px rgb(10 132 255 / 0.35));
+      }
+      .brand span {
+        font-size: 50px;
+        font-weight: 700;
+        letter-spacing: -0.035em;
+      }
+      h1 {
+        margin-top: 46px;
+        font-size: 50px;
+        line-height: 1.08;
+        font-weight: 650;
+        letter-spacing: -0.035em;
+      }
+      .grad {
+        background: linear-gradient(90deg, #5bdcef, #2e9bf5 55%, #3d6dff);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .points {
+        margin-top: 34px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .points span {
+        display: inline-flex;
+        align-items: center;
+        gap: 9px;
+        padding: 7px 13px;
+        border-radius: 999px;
+        border: 1px solid rgb(255 255 255 / 0.1);
+        background: rgb(30 32 41 / 0.8);
+        font-size: 17px;
+        font-weight: 500;
+        color: #c9cdd9;
+        white-space: nowrap;
+      }
+      .points i {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+      }
+      .url {
+        position: absolute;
+        left: 72px;
+        bottom: 54px;
+        font-family: "JetBrains Mono Variable", monospace;
+        font-size: 20px;
+        font-weight: 500;
+        color: #8b8fa0;
+      }
+      .window {
+        position: absolute;
+        left: 600px;
+        top: 96px;
+        width: 760px;
+        height: 600px;
+        border-radius: 16px;
+        overflow: hidden;
+        background: #21232f;
+        box-shadow:
+          0 0 0 1px rgb(255 255 255 / 0.12),
+          0 40px 100px -20px rgb(0 0 0 / 0.8),
+          0 0 120px 10px rgb(10 132 255 / 0.18);
+      }
+      .titlebar {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+        height: 40px;
+        background: #2a2c38;
+        border-bottom: 1px solid rgb(0 0 0 / 0.35);
+        font-size: 15px;
+        font-weight: 600;
+        color: #c9cdd9;
+      }
+      .controls {
+        position: absolute;
+        right: 14px;
+        display: flex;
+        gap: 10px;
+      }
+      .controls b {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: #3a3d4b;
+      }
+      .window img {
+        display: block;
+        width: 1000px;
+        height: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="bg"></div>
+    <div class="copy">
+      <div class="brand">
+        <img src="../../../assets/logo.svg" alt="" />
+        <span>sysman</span>
+      </div>
+      <h1>Live, recorded and <span class="grad">crash&#8209;proof</span> system monitoring for Linux</h1>
+      <div class="points">
+        <span><i style="background: #30d158"></i>Every 2 s</span>
+        <span><i style="background: #3d9bff"></i>Years of history</span>
+        <span><i style="background: #ff9f0a"></i>Crash log</span>
+      </div>
+    </div>
+    <div class="url">sysman.asmechanics.com</div>
+    <div class="window">
+      <div class="titlebar">
+        sysman
+        <div class="controls"><b></b><b></b><b></b></div>
+      </div>
+      <img src="../public/shots/gpu.webp" alt="" />
+    </div>
+  </body>
+</html>
