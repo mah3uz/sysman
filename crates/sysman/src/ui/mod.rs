@@ -47,7 +47,8 @@ gpui_kit_assets::icon_assets!(
         ChartLine,
         HeartPulse,
         ChartArea,
-        CircleCheck
+        CircleCheck,
+        Trash
     ]
 );
 

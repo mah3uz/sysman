@@ -24,6 +24,8 @@ rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "1"
+# Already in the graph through the platform layer; `blocking-api` is the only addition.
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 
 # gpui is too slow to use unoptimised.
 [profile.dev.package."*"]

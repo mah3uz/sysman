@@ -26,6 +26,7 @@ use crate::data::live::Live;
 use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source};
 use crate::screens::dashboard::{caption, readout, top_list, whole_disk};
+use crate::screens::disk_map::DiskMap;
 use crate::ui::shell::Tab;
 use crate::ui::theme::{Theme, theme};
 use crate::ui::widgets::card::card;
@@ -282,6 +283,16 @@ pub struct Disk {
     charts: Charts,
     drives: Option<StorageMeta>,
     sensors: Option<HwmonMeta>,
+    /// Made on first visit, so the scan starts only when the map is wanted.
+    map: Option<Entity<DiskMap>>,
+}
+
+fn initial_view() -> View {
+    #[cfg(debug_assertions)]
+    if std::env::var("SYSMAN_DEV_DISK_VIEW").is_ok_and(|v| v.eq_ignore_ascii_case("map")) {
+        return View::Map;
+    }
+    View::Overview
 }
 
 fn wall_clock() -> f64 {
@@ -300,7 +311,7 @@ impl Disk {
         let mut this = Self {
             live,
             feed,
-            view: View::Overview,
+            view: initial_view(),
             range,
             selected: None,
             holders: HashMap::new(),
@@ -315,6 +326,7 @@ impl Disk {
             charts: Charts::default(),
             drives: None,
             sensors: None,
+            map: None,
         };
         this.refresh(cx);
         this
@@ -493,7 +505,7 @@ impl Disk {
 }
 
 /// A segmented control in the range picker's style.
-fn segmented(
+pub(crate) fn segmented(
     id: &'static str,
     items: Vec<(SharedString, bool)>,
     on_select: impl Fn(usize, &mut Window, &mut App) + 'static,
@@ -1357,15 +1369,10 @@ impl Render for Disk {
         let body = match self.view {
             View::Overview => self.overview(sample.as_ref(), cx).into_any_element(),
             View::Map => {
-                let t = theme(cx);
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(t.panel_title)
-                    .text_color(t.text_secondary)
-                    .child("Disk Map: coming soon")
+                let live = self.live.clone();
+                self.map
+                    .get_or_insert_with(|| gpui::AppContext::new(cx, |cx| DiskMap::new(live, cx)))
+                    .clone()
                     .into_any_element()
             }
         };
