@@ -98,10 +98,8 @@ import LiveSpark from './LiveSpark.vue'
 .grad-text {
   background-image: linear-gradient(90deg, #5bdcef, #2e9bf5 55%, #3d6dff);
 }
-@media (prefers-color-scheme: light) {
-  .grad-text {
-    background-image: linear-gradient(90deg, #0a7ea8, #0a63e8 55%, #2f4fe0);
-  }
+[data-theme="light"] .grad-text {
+  background-image: linear-gradient(90deg, #0a7ea8, #0a63e8 55%, #2f4fe0);
 }
 .hero-halo {
   background: radial-gradient(closest-side, rgb(10 132 255 / 0.28), transparent);

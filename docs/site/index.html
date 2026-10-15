@@ -7,8 +7,22 @@
     <meta name="description" content="sysman is a Linux system monitor: a small collector daemon records CPU, memory, GPUs, disks, network, sensors and processes every 2 seconds, keeps history, and writes a crash-proof log. A native app shows it all live and as history." />
     <link rel="canonical" href="https://sysman.asmechanics.com/" />
     <meta name="color-scheme" content="dark light" />
-    <meta name="theme-color" content="#15161c" media="(prefers-color-scheme: dark)" />
-    <meta name="theme-color" content="#f6f7fa" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#14151b" />
+    <script>
+      (function () {
+        var mode = 'system'
+        try {
+          mode = localStorage.getItem('theme') || 'system'
+        } catch (e) {}
+        var light = mode === 'light' || (mode !== 'dark' && matchMedia('(prefers-color-scheme: light)').matches)
+        var theme = light ? 'light' : 'dark'
+        var root = document.documentElement
+        root.dataset.theme = theme
+        root.style.colorScheme = theme
+        document.querySelector('meta[name="color-scheme"]').content = theme
+        document.querySelector('meta[name="theme-color"]').content = light ? '#f6f7fa' : '#14151b'
+      })()
+    </script>
     <link rel="icon" type="image/svg+xml" href="../../assets/logo.svg" />
     <link rel="icon" href="/favicon.ico" sizes="32x32" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
