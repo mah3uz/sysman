@@ -140,6 +140,10 @@ clean:
 site:
     cd docs/site && npm install && npm run dev
 
+# Build the website and serve the production build locally
+site-preview:
+    cd docs/site && npm ci && npm run build && npm run preview
+
 # Build and deploy the website to Cloudflare (needs `npx wrangler login` once)
 site-deploy:
     cd docs/site && npm ci && npm run deploy
