@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/logo.svg" alt="sysman mascot: a small chip creature with a sparkline smile" width="160"></p>
+<p align="center"><img src="assets/banner.svg" alt="sysman: a system monitor for Linux, live, recorded and crash-proof" width="100%"></p>
 
 # sysman
 
