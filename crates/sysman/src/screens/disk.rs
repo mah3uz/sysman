@@ -207,7 +207,7 @@ fn protocol(disk: &str) -> Option<&'static str> {
         .map(|(_, label)| label)
 }
 
-/// Grey below 60%, orange 60–89, red from 90, as the reference tints utilisation.
+/// Grey below 60%, orange 60–89, red from 90.
 fn busy_colour(pct: f64, t: &Theme) -> Hsla {
     if pct >= 90. {
         t.red
@@ -552,7 +552,7 @@ fn bar(fraction: f64, color: Hsla, cx: &App) -> gpui::Div {
     )
 }
 
-/// Label at the left, value at the right, as in the reference's health list.
+/// Label at the left, value at the right.
 fn kv(label: impl Into<SharedString>, value: impl Into<SharedString>, color: Hsla, cx: &App) -> gpui::Div {
     let t = theme(cx);
     div()

@@ -1,18 +1,16 @@
 # sysman — design
 
 A Linux system monitor: a collector daemon (`sysmand`) that records metrics, and a
-GPUI app (`sysman`) that shows them live and as history. It replaced the Python
-`sensor-log` collector on 2026-10-15; that collector's history (from 2026-10-12)
-was loaded into `history.db` by hand and the collector was removed.
+GPUI app (`sysman`) that shows them live and as history.
 
 ## Decisions
 
 | Topic | Decision |
 | --- | --- |
-| Order | Collector first (done apart from per-process history), then the app. |
+| Order | Collector first, then the app. |
 | History | SQLite, plus a small fsync'd JSONL file kept as crash evidence. |
 | Live data | The daemon serves it over a Unix socket. |
-| Paths | XDG directories. The product has no import feature. |
+| Paths | XDG directories. |
 | DB model | Numeric series with rollups; list-shaped data as JSON snapshots. |
 | Processes | Every process recorded every 10 s (48 h raw, 7 days of 1-minute rollups); top N in the crash log; the full table also on the socket. |
 | JSONL | Today and yesterday, uncompressed. |
@@ -20,11 +18,11 @@ was loaded into `history.db` by hand and the collector was removed.
 | Hardware | Vendor-neutral records. GPUs: NVIDIA, AMD, Intel (i915 and xe), generic DRM fallback. CPUs: x86 (AMD, Intel). |
 | Verification | This machine for AMD CPU, NVIDIA and amdgpu. Fixtures built from kernel docs for the rest, marked unverified on hardware. beszel (henrygd/beszel) is a reference for data sources. |
 | Sensors | Super I/O chips (nct67xx) read every 10 s, everything else every 2 s. |
-| App design | Must match Zesty0wl/mac-performance-monitor (`docs/research/mac-performance-monitor.md`). v1 has every screen, Disk Map included; Ask and Usage Timeline are macOS-only and dropped. |
+| App design | `docs/APP-DESIGN.md`. v1 has every screen, Disk Map included. |
 | Menu bar | A DankMaterialShell bar widget reading the socket, after the app's v1. |
 | Alerts | Evaluated in `sysmand` (so they fire with the app closed), freedesktop notifications; after the app's core screens. |
 
-## Non-negotiables (carried over from sensor-log)
+## Non-negotiables
 
 1. **The last reading before a crash is on disk.** Every JSONL line is written
    and `fdatasync`'d before the next tick.
@@ -103,8 +101,7 @@ The nct67xx Super I/O driver re-reads every register over port I/O whenever its
 cache is older than ~1.5 s; at 2 s polling that alone cost ~4.6% of a core.
 `[modules.hwmon] chip_intervals` maps chip-name prefixes to seconds (longest
 match wins); the default is `{ nct67 = 10 }`. Measured whole-daemon cost with
-defaults: ~2% of one core (sensor-log: ~6.9% including its `nvidia-smi`
-children).
+defaults: ~2% of one core.
 
 ### Writers
 
@@ -170,20 +167,25 @@ the app opens `history.db` read-only (WAL allows concurrent readers).
 
 ## Record format (schema 3)
 
-Envelope as sensor-log schema 2: `type`, `schema`, `t`, `time`, one key per
-module, `errors`. Units are in field names (`_bytes`, `_bps`, `_pct`, `_mhz`,
+Every record has `type` (`meta` or `sample`), `schema`, `t` (Unix seconds) and
+`time` (local, with offset). A sample has one key per module that ran on that
+tick and `errors` (`{module: message}`) when any failed; readers treat every
+module key as optional. A meta record carries the effective config, each
+module's interval and static `info` (hardware, topology, units, limits), and
+`failed_modules`. Units are in field names (`_bytes`, `_bps`, `_pct`, `_mhz`,
 `_c`, `_w`, `_ms`, `_s`, `_ps`). Types live in `crates/schema`; every
-collector's output is tested to round-trip through them. Changes from schema 2:
+collector's output is tested to round-trip through them.
 
-- Devices keyed by stable id: GPUs by PCI address, dm devices by dm name,
-  filesystems by mount point (one entry per device, `mounts` lists the rest).
+- Devices are keyed by stable id: GPUs by PCI address, dm devices by dm name,
+  hwmon chips by `name/device`, filesystems by mount point (one entry per
+  device, `mounts` lists the rest).
 - `gpu`: `devices.<pci>` with `vendor`, `driver`, `backend` and common optional
   fields; `processes[]` from NVML or DRM fdinfo; `backend_errors.<pci>`.
-- `cpu`: `temp_c` (package), `temps_c` (CCD/core), `power_w` (RAPL where
-  readable), guest time split out; meta gains vendor and topology (L3 groups,
-  hybrid core types, preferred-core ranking).
-- `memory`: `cache_bytes`, `zfs_arc_bytes`. `disk`: `queue_depth`.
-  `storage`: btrfs `missing`. `processes`: rows gain `start_time`; `table`.
+- `cpu`: usage with guest time split out, per-core use and frequency, `temp_c`
+  (package), `temps_c` (CCD/core), `power_w` (RAPL where readable); meta has
+  vendor and topology (L3 groups, hybrid core types, preferred-core ranking).
+- `processes`: top lists by CPU, memory and I/O, totals by name, and `table`
+  (every row, kept out of the crash log); rows carry `start_time`.
 
 ## Config
 
@@ -207,11 +209,10 @@ daemon at startup with a message naming them.
 
 ## Status and next steps
 
-1. ~~Core, modules, SQLite, socket.~~ Done.
-2. ~~Per-process history.~~ Done.
-3. ~~Install the service; retire sensor-log.~~ Done 2026-10-15.
-4. The app: screen design from the mac-performance-monitor reference, then build.
-5. Alerts in `sysmand`; DMS bar widget.
+1. ~~Collector: core, modules, SQLite, socket, per-process history.~~ Done.
+2. The app (`docs/APP-DESIGN.md`): Dashboard, Processes, GPU, Network and Disk
+   done; Energy, Hardware, Explorer, Insights, Groups and Disk Map to come.
+3. Alerts in `sysmand`; DMS bar widget.
 
 ## Not in scope yet
 

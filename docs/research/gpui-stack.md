@@ -94,12 +94,12 @@ Table fit for 700 processes at 2 s: virtualised, so only visible rows (~30) rend
 
 gpui-component ships `chart/{line,area,bar,candlestick,pie,radar,sankey}_chart.rs` over gpui-base `plot/` (scales `linear/point/band`, axis, grid, `shape/{line,area,bar,stack,arc,pie}`, `path_cache`, `hover`).
 
-Against the reference requirements:
+Against the chart requirements in `docs/APP-DESIGN.md` §5:
 
 | Requirement | Built in? | Evidence |
 |---|---|---|
 | Line, area, bar, stacked | Yes (`shape/stack.rs`, bar chart 1444 lines) | |
-| Monotone cubic | No. `Curve::{Natural, Linear, StepAfter}` only | `gpui-base plot/shape/line.rs:85,179-201`. Natural spline can overshoot; the reference requires no overshoot. |
+| Monotone cubic | No. `Curve::{Natural, Linear, StepAfter}` only | `gpui-base plot/shape/line.rs:85,179-201`. Natural spline can overshoot; the app requires no overshoot. |
 | Translucent min-max band | No dedicated API. Area chart has one `y` accessor and `.fill(Background)`; no lower-bound | `chart/area_chart.rs:165-175` |
 | Vertical gradient area fill | Yes: `.fill(impl Into<Background>)` accepts `linear_gradient` | `area_chart.rs:175` |
 | Dashed horizontal threshold lines | Lines yes, labels no. `reference_line(value)`, repeatable, dashed | `line_chart.rs:300-308`, `area_chart.rs:308`. No text label or per-line colour. |
@@ -135,7 +135,7 @@ No treemap in gpui-component (chart list above; `sankey_chart`, `pie_chart`, `ba
 - Scope `cx.notify()` to the entity that changed: one `Entity` per panel/chart; a sampler task updates a shared model and notifies only the visible tab's views. Views of hidden tabs should not render (render only the active tab) and should skip rebuilding paths.
 - Do not hold 700 rows in an element tree; use the virtualised `TableState`, or `uniform_list` directly if the table is custom. Notify the table only when visible rows changed (`visible_rows_changed` hook, `delegate.rs:202`).
 - Cache chart `Path`s per series; rebuild on new sample, not per frame. A 2 s tick is 0.5 repaints/s of data, but hover repaints every mouse move, so a cached path matters.
-- Hide samples while the window is hidden but keep collecting (the reference does this).
+- Hide samples while the window is hidden but keep collecting.
 - Insensical's `profile.dev.package."*" opt-level = 2` (`INS/Cargo.toml`) exists because gpui is too slow unoptimised; copy it.
 
 ## 10. Recommendation

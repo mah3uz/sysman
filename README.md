@@ -10,8 +10,7 @@ your machine is doing, and a native app that shows it live and as history.
   log on disk (every line forced to disk, so the last readings before a freeze
   or power cut survive), stores history in SQLite, and serves live data over a
   Unix socket.
-- **`sysman`** is a GPUI desktop app that reads that data. Its design follows
-  [mac-performance-monitor](https://github.com/Zesty0wl/mac-performance-monitor).
+- **`sysman`** is a GPUI desktop app that reads that data.
 
 No root is needed for either. Status: the collector is complete and in daily
 use; the app has its Dashboard, Processes, GPU, Network and Disk tabs, with

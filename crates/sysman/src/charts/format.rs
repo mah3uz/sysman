@@ -39,7 +39,7 @@ impl Unit {
     }
 }
 
-/// 1024-based, labelled as the reference does: `0 bytes`, `95.4 MB`.
+/// 1024-based, labelled `0 bytes`, `95.4 MB`.
 pub fn bytes(v: f64) -> String {
     if v.abs() < 1023.95 {
         return format!("{v:.0} bytes");
@@ -78,7 +78,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bytes_read_like_the_reference() {
+    fn bytes_use_1024_units_with_word_labels() {
         assert_eq!(bytes(0.), "0 bytes");
         assert_eq!(bytes(512.), "512 bytes");
         assert_eq!(bytes(1536.), "1.5 KB");

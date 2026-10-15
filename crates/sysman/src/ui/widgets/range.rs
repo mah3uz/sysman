@@ -69,7 +69,7 @@ pub fn range_picker(
     range_picker_of(&Range::ALL, current, on_select, cx)
 }
 
-/// A picker offering only `choices`, for screens whose reference shows fewer ranges.
+/// A picker offering only `choices`, for screens with fewer useful ranges.
 pub fn range_picker_of(
     choices: &[Range],
     current: Range,
