@@ -16,7 +16,10 @@ jobs:
       - name: Tag matches the workspace version
         run: |
           ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          [ "v$ver" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match version $ver" >&2; exit 1; }
+          case "$GITHUB_REF_NAME" in
+            "v$ver" | "v$ver"-*) ;;
+            *) echo "tag $GITHUB_REF_NAME does not match version $ver" >&2; exit 1 ;;
+          esac
 
       - name: Build in ubuntu:22.04
         run: dist/ci/run.sh build
@@ -33,5 +36,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "sysman ${GITHUB_REF_NAME#v}" \
+          pre=; case "$GITHUB_REF_NAME" in *-*) pre=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" --draft $pre --verify-tag --title "sysman ${GITHUB_REF_NAME#v}" \
             --generate-notes target/release-assets/*/*
