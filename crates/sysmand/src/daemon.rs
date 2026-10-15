@@ -191,6 +191,7 @@ mod tests {
         name: "pressure",
         default_interval: 2,
         snapshot: false,
+        unlogged: &[],
         build: |o, sys| {
             Ok(Box::new(crate::collectors::pressure::Pressure::new(
                 crate::collector::options(o)?,

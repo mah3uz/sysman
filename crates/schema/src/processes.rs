@@ -21,6 +21,9 @@ pub struct Process {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fds: Option<u64>,
     pub cmdline: String,
+    /// Absolute Unix seconds; with `pid` it identifies the process instance.
+    #[serde(default)]
+    pub start_time: u64,
 }
 
 /// Processes sharing a `comm`, summed. Shared memory is counted once per process.
@@ -55,4 +58,7 @@ pub struct Processes {
     pub groups_cpu: Option<Vec<Group>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub groups_memory: Option<Vec<Group>>,
+    /// Every process with a rate, for history; the top lists are views of it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub table: Vec<Process>,
 }

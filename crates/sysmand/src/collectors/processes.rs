@@ -38,6 +38,7 @@ struct Snapshot {
     state: String,
     threads: u64,
     rss_bytes: u64,
+    start_time: u64,
 }
 
 /// Owns its rate state, so scanners used by different callers do not disturb each other.
@@ -49,6 +50,8 @@ pub struct ProcessScanner {
     page_size: u64,
     deltas: Deltas<String>,
     users: HashMap<u32, String>,
+    /// user and cmdline per process instance, which cannot change once it has started
+    identity: HashMap<(u32, u64), (Option<String>, String)>,
     passwd_mtime: Option<SystemTime>,
 }
 
@@ -67,6 +70,7 @@ impl ProcessScanner {
             page_size: page_size as u64,
             deltas: Deltas::default(),
             users: HashMap::new(),
+            identity: HashMap::new(),
             passwd_mtime: None,
         })
     }
@@ -76,6 +80,7 @@ impl ProcessScanner {
     pub fn scan(&mut self) -> Result<Option<Table>> {
         let mut procs: HashMap<String, Snapshot> = HashMap::new();
         let mut counters: HashMap<String, Vec<u64>> = HashMap::new();
+        let btime = self.boot_time();
         for pid in self.sys.list("/proc") {
             if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
                 continue;
@@ -84,7 +89,7 @@ impl ProcessScanner {
             let Some(stat) = self.sys.read_opt(format!("/proc/{pid}/stat")) else {
                 continue;
             };
-            let Ok((snap, start, ticks)) = self.parse_stat(&pid, &stat) else {
+            let Ok((mut snap, start, ticks)) = self.parse_stat(&pid, &stat) else {
                 continue;
             };
             let mut counts = vec![ticks];
@@ -93,6 +98,7 @@ impl ProcessScanner {
             {
                 counts.extend(parse_io(&io));
             }
+            snap.start_time = btime + start / self.clk_tck as u64;
             let key = format!("{pid}:{start}");
             procs.insert(key.clone(), snap);
             counters.insert(key, counts);
@@ -124,6 +130,7 @@ impl ProcessScanner {
                 user: None,
                 fds: None,
                 cmdline: String::new(),
+                start_time: p.start_time,
             });
         }
         rows.sort_by_key(|r| r.pid);
@@ -135,7 +142,7 @@ impl ProcessScanner {
         }))
     }
 
-    fn parse_stat(&self, pid: &str, stat: &str) -> Result<(Snapshot, String, u64)> {
+    fn parse_stat(&self, pid: &str, stat: &str) -> Result<(Snapshot, u64, u64)> {
         // comm may contain spaces and parentheses, so split on the last ")"
         let (head, tail) = stat
             .rsplit_once(')')
@@ -156,27 +163,57 @@ impl ProcessScanner {
             state: f[0].to_string(),
             threads: num(17)?,
             rss_bytes: num(21)? * self.page_size,
+            start_time: 0,
         };
-        Ok((snap, f[19].to_string(), num(11)? + num(12)?))
+        Ok((snap, num(19)?, num(11)? + num(12)?))
+    }
+
+    fn boot_time(&self) -> u64 {
+        self.sys
+            .read_opt("/proc/stat")
+            .and_then(|s| s.lines().find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok()))
+            .unwrap_or(0)
+    }
+
+    fn read_identity(&self, pid: u32) -> (Option<String>, String) {
+        let uid = std::fs::metadata(self.sys.path(format!("/proc/{pid}")))
+            .ok()
+            .map(|m| m.uid());
+        let user = uid.map(|u| self.users.get(&u).cloned().unwrap_or_else(|| u.to_string()));
+        let cmdline = self
+            .sys
+            .read_opt(format!("/proc/{pid}/cmdline"))
+            .unwrap_or_default()
+            .replace('\0', " ");
+        (user, cmdline.trim().chars().take(self.cmdline_max).collect())
+    }
+
+    fn read_fds(&self, pid: u32) -> Option<u64> {
+        std::fs::read_dir(self.sys.path(format!("/proc/{pid}/fd")))
+            .ok()
+            .map(|d| d.count() as u64)
     }
 
     /// Fills `user`, `fds` and `cmdline`, which cost a metadata call, a directory read and a file read per row.
     pub fn fill_details(&mut self, rows: &mut [Process]) {
         self.refresh_users();
         for r in rows {
-            let uid = std::fs::metadata(self.sys.path(format!("/proc/{}", r.pid)))
-                .ok()
-                .map(|m| m.uid());
-            r.user = uid.map(|u| self.users.get(&u).cloned().unwrap_or_else(|| u.to_string()));
-            r.fds = std::fs::read_dir(self.sys.path(format!("/proc/{}/fd", r.pid)))
-                .ok()
-                .map(|d| d.count() as u64);
-            let cmdline = self
-                .sys
-                .read_opt(format!("/proc/{}/cmdline", r.pid))
-                .unwrap_or_default()
-                .replace('\0', " ");
-            r.cmdline = cmdline.trim().chars().take(self.cmdline_max).collect();
+            (r.user, r.cmdline) = self.read_identity(r.pid);
+            r.fds = self.read_fds(r.pid);
+        }
+    }
+
+    /// Like `fill_details`, but `user` and `cmdline` are read only for processes not seen on the previous call.
+    pub fn fill_table(&mut self, rows: &mut [Process]) {
+        self.refresh_users();
+        let mut old = std::mem::take(&mut self.identity);
+        for r in rows {
+            let key = (r.pid, r.start_time);
+            let (user, cmdline) = old.remove(&key).unwrap_or_else(|| self.read_identity(r.pid));
+            r.fds = self.read_fds(r.pid);
+            r.user = user.clone();
+            r.cmdline = cmdline.clone();
+            self.identity.insert(key, (user, cmdline));
         }
     }
 
@@ -245,10 +282,11 @@ impl Collector for Processes {
     }
 
     fn sample(&mut self) -> Result<Option<Value>> {
-        let Some(table) = self.scanner.scan()? else {
+        let Some(mut table) = self.scanner.scan()? else {
             return Ok(None);
         };
         let n = self.opts.top_n;
+        self.scanner.fill_table(&mut table.rows);
         let rows = &table.rows;
         let mut out = schema::processes::Processes {
             count: table.count,
@@ -259,6 +297,7 @@ impl Collector for Processes {
             top_io: None,
             groups_cpu: None,
             groups_memory: None,
+            table: Vec::new(),
         };
         if self.opts.io {
             let io = |r: &Process| (r.read_bps.unwrap_or(0) + r.write_bps.unwrap_or(0)) as f64;
@@ -287,12 +326,7 @@ impl Collector for Processes {
             out.groups_cpu = Some(top(&groups, |g| g.cpu_pct, n));
             out.groups_memory = Some(top(&groups, |g| g.rss_bytes as f64, n));
         }
-        for list in [Some(&mut out.top_cpu), Some(&mut out.top_memory), out.top_io.as_mut()]
-            .into_iter()
-            .flatten()
-        {
-            self.scanner.fill_details(list);
-        }
+        out.table = table.rows;
         Ok(Some(serde_json::to_value(out)?))
     }
 }
@@ -334,6 +368,69 @@ mod tests {
         assert_eq!(row(&t, 5).comm, "Web (Content) x");
         assert_eq!(row(&t, 5).ppid, 1);
         assert_eq!(row(&t, 5).rss_bytes, 7 * s.page_size);
+    }
+
+    #[test]
+    fn start_time_is_boot_time_plus_start_ticks_in_seconds() {
+        // field 22 counts ticks since boot, so it is meaningless as an identity until anchored to btime
+        let f = Fixture::new()
+            .file("proc/stat", "cpu  1 2 3\nbtime 1700000000\n")
+            .file("proc/5/stat", &stat(5, "a", 1, 0, 1, 25_000, 7));
+        let mut s = scanner(&f);
+        s.scan().unwrap();
+        let t = s.scan().unwrap().unwrap();
+        assert_eq!(row(&t, 5).start_time, 1_700_000_000 + 25_000 / s.clk_tck as u64);
+    }
+
+    #[test]
+    fn table_reads_identity_once_per_process_but_fds_every_tick() {
+        let f = Fixture::new()
+            .file("proc/5/stat", &stat(5, "a", 1, 0, 1, 10, 7))
+            .file("proc/5/cmdline", "first\0")
+            .file("proc/5/fd/0", "");
+        let mut s = scanner(&f);
+        s.scan().unwrap();
+        let mut t = s.scan().unwrap().unwrap();
+        s.fill_table(&mut t.rows);
+        assert_eq!((row(&t, 5).cmdline.as_str(), row(&t, 5).fds), ("first", Some(1)));
+        // a live process instance cannot change its cmdline, so a re-read would only cost; fds do change
+        std::fs::write(f.path().join("proc/5/cmdline"), "second\0").unwrap();
+        std::fs::write(f.path().join("proc/5/fd/1"), "").unwrap();
+        let mut t = s.scan().unwrap().unwrap();
+        s.fill_table(&mut t.rows);
+        assert_eq!((row(&t, 5).cmdline.as_str(), row(&t, 5).fds), ("first", Some(2)));
+        // a new instance on the same pid is read afresh, and the old entry is dropped
+        std::fs::write(f.path().join("proc/5/stat"), stat(5, "a", 1, 0, 1, 99, 7)).unwrap();
+        let mut t = s.scan().unwrap().unwrap();
+        assert!(t.rows.is_empty(), "a new instance has no rate yet");
+        s.fill_table(&mut t.rows);
+        assert!(s.identity.is_empty());
+        let mut t = s.scan().unwrap().unwrap();
+        s.fill_table(&mut t.rows);
+        assert_eq!(row(&t, 5).cmdline, "second");
+    }
+
+    #[test]
+    fn collector_sample_carries_the_whole_table() {
+        let f = Fixture::new()
+            .file("proc/1/stat", &stat(1, "a", 0, 0, 1, 10, 1))
+            .file("proc/2/stat", &stat(2, "b", 0, 0, 1, 11, 1));
+        let mut c = Processes::new(
+            Options {
+                top_n: 1,
+                ..Options::default()
+            },
+            f.sys(),
+        )
+        .unwrap();
+        c.sample().unwrap();
+        let v = c.sample().unwrap().unwrap();
+        assert_schema::<schema::processes::Processes>(&v);
+        assert_eq!(
+            v["table"].as_array().unwrap().len(),
+            2,
+            "idle processes are in the table, not the top lists"
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 
-use crate::collector::MODULES;
+use crate::collector::{MODULES, loggable};
 use crate::config::Config;
 use crate::daemon::{Daemon, local_date, unix_now};
 use crate::jsonl::Jsonl;
@@ -108,7 +108,7 @@ fn run() -> Result<()> {
         let due = if first { None } else { Some(tick) };
         first = false;
         if let Some(record) = daemon.sample_record(due) {
-            log.write(&record)?;
+            log.write(&loggable(&record, MODULES))?;
             hub.publish(&record);
             history.send(record);
         }

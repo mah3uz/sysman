@@ -38,6 +38,7 @@ pub struct Retention {
     pub raw_hours: u32,
     pub rollup_1m_days: u32,
     pub rollup_15m_days: u32,
+    pub proc_rollup_days: u32,
 }
 
 impl Default for Retention {
@@ -47,6 +48,7 @@ impl Default for Retention {
             raw_hours: 48,
             rollup_1m_days: 90,
             rollup_15m_days: 730,
+            proc_rollup_days: 7,
         }
     }
 }
@@ -86,8 +88,8 @@ impl Config {
             bail!("[retention] log_days must be at least 1 (today's file)");
         }
         let r = &file.retention;
-        if r.raw_hours == 0 || r.rollup_1m_days == 0 || r.rollup_15m_days == 0 {
-            bail!("[retention] raw_hours, rollup_1m_days and rollup_15m_days must be at least 1");
+        if r.raw_hours == 0 || r.rollup_1m_days == 0 || r.rollup_15m_days == 0 || r.proc_rollup_days == 0 {
+            bail!("[retention] raw_hours, rollup_1m_days, rollup_15m_days and proc_rollup_days must be at least 1");
         }
         let mut modules = BTreeMap::new();
         for (name, mut table) in file.modules {

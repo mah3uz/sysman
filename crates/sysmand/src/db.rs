@@ -5,6 +5,8 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, Transaction, params};
+use schema::processes::Process;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::config::Retention;
@@ -29,6 +31,20 @@ CREATE TABLE IF NOT EXISTS errors (
     t INTEGER NOT NULL, module TEXT NOT NULL, message TEXT NOT NULL,
     PRIMARY KEY (t, module)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS meta (t INTEGER PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS procs (
+    id INTEGER PRIMARY KEY, pid INTEGER NOT NULL, start_time INTEGER NOT NULL, comm TEXT NOT NULL,
+    cmdline TEXT, user TEXT, first_t INTEGER NOT NULL, last_t INTEGER NOT NULL,
+    UNIQUE (pid, start_time));
+CREATE TABLE IF NOT EXISTS proc_points (
+    proc_id INTEGER NOT NULL, t INTEGER NOT NULL, cpu_pct REAL, rss_bytes INTEGER, threads INTEGER,
+    fds INTEGER, read_bps REAL, write_bps REAL,
+    PRIMARY KEY (proc_id, t)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS proc_rollup_1m (
+    proc_id INTEGER NOT NULL, t INTEGER NOT NULL, cpu_avg REAL, cpu_max REAL, rss_avg REAL, rss_max INTEGER,
+    threads_max INTEGER, fds_max INTEGER, read_bps_avg REAL, write_bps_avg REAL, count INTEGER NOT NULL,
+    PRIMARY KEY (proc_id, t)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS procs_comm ON procs (comm);
+CREATE INDEX IF NOT EXISTS procs_last ON procs (last_t);
 ";
 
 const ENVELOPE: [&str; 5] = ["type", "schema", "t", "time", "errors"];
@@ -71,6 +87,70 @@ impl Acc {
     }
 }
 
+/// One process's readings in a tick; `fds` and the rates are absent for processes that cannot be inspected.
+#[derive(Debug, Clone, Copy)]
+struct ProcPoint {
+    cpu_pct: f64,
+    rss_bytes: i64,
+    threads: i64,
+    fds: Option<i64>,
+    read_bps: Option<f64>,
+    write_bps: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcAcc {
+    cpu_sum: f64,
+    cpu_max: f64,
+    rss_sum: f64,
+    rss_max: i64,
+    threads_max: i64,
+    fds_max: Option<i64>,
+    read_sum: f64,
+    read_n: i64,
+    write_sum: f64,
+    write_n: i64,
+    count: i64,
+}
+
+impl ProcAcc {
+    fn new(p: ProcPoint) -> Self {
+        let mut a = Self {
+            cpu_sum: 0.0,
+            cpu_max: p.cpu_pct,
+            rss_sum: 0.0,
+            rss_max: p.rss_bytes,
+            threads_max: p.threads,
+            fds_max: None,
+            read_sum: 0.0,
+            read_n: 0,
+            write_sum: 0.0,
+            write_n: 0,
+            count: 0,
+        };
+        a.add(p);
+        a
+    }
+
+    fn add(&mut self, p: ProcPoint) {
+        self.cpu_sum += p.cpu_pct;
+        self.cpu_max = self.cpu_max.max(p.cpu_pct);
+        self.rss_sum += p.rss_bytes as f64;
+        self.rss_max = self.rss_max.max(p.rss_bytes);
+        self.threads_max = self.threads_max.max(p.threads);
+        self.fds_max = self.fds_max.max(p.fds);
+        if let Some(r) = p.read_bps {
+            self.read_sum += r;
+            self.read_n += 1;
+        }
+        if let Some(w) = p.write_bps {
+            self.write_sum += w;
+            self.write_n += 1;
+        }
+        self.count += 1;
+    }
+}
+
 pub struct Db {
     conn: Connection,
     retention: Retention,
@@ -79,6 +159,10 @@ pub struct Db {
     /// Open 1-minute buckets by (series id, bucket start); 15-minute buckets are
     /// merged in the database as each minute closes.
     minute: HashMap<(i64, i64), Acc>,
+    /// (pid, start time) to (id, last_t); only processes seen within raw retention are kept.
+    procs: HashMap<(i64, i64), (i64, i64)>,
+    /// Open 1-minute process buckets by (proc id, bucket start).
+    proc_minute: HashMap<(i64, i64), ProcAcc>,
     last_prune: i64,
 }
 
@@ -97,12 +181,26 @@ impl Db {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let minute = reopen_minutes(&conn, &series)?;
+        // relative to the newest process rather than the clock, so the window follows the data
+        let newest: Option<i64> = conn.query_row("SELECT max(last_t) FROM procs", [], |r| r.get(0))?;
+        let procs: HashMap<(i64, i64), (i64, i64)> = match newest {
+            Some(newest) => conn
+                .prepare("SELECT pid, start_time, id, last_t FROM procs WHERE last_t >= ?1")?
+                .query_map([newest - i64::from(retention.raw_hours) * 3600], |r| {
+                    Ok(((r.get(0)?, r.get(1)?), (r.get(2)?, r.get(3)?)))
+                })?
+                .collect::<rusqlite::Result<_>>()?,
+            None => HashMap::new(),
+        };
+        let proc_minute = reopen_proc_minutes(&conn, &procs)?;
         Ok(Self {
             conn,
             retention,
             snapshot_modules,
             series,
             minute,
+            procs,
+            proc_minute,
             last_prune: 0,
         })
     }
@@ -119,6 +217,7 @@ impl Db {
             }
             Some("sample") => {
                 close_minutes(&tx, &mut self.minute, t - t.rem_euclid(60))?;
+                close_proc_minutes(&tx, &mut self.proc_minute, t - t.rem_euclid(60))?;
                 write_sample(
                     &tx,
                     &mut self.series,
@@ -127,11 +226,22 @@ impl Db {
                     t,
                     record,
                 )?;
+                if let Some(table) = record["processes"].get("table") {
+                    write_procs(
+                        &tx,
+                        &mut self.procs,
+                        &mut self.proc_minute,
+                        t,
+                        Vec::<Process>::deserialize(table)?,
+                    )?;
+                }
             }
             other => anyhow::bail!("unknown record type {other:?}"),
         }
         if t - self.last_prune >= 3600 {
             prune(&tx, &self.retention, t)?;
+            let raw = t - i64::from(self.retention.raw_hours) * 3600;
+            self.procs.retain(|_, (_, last)| *last >= raw);
             self.last_prune = t;
         }
         tx.commit()?;
@@ -156,7 +266,7 @@ fn write_sample(
         if snapshot_modules.contains(name) {
             tx.execute(
                 "INSERT OR REPLACE INTO snapshots (module, t, data) VALUES (?1, ?2, ?3)",
-                params![name, t, value.to_string()],
+                params![name, t, snapshot_json(name, value)],
             )?;
         }
     }
@@ -186,6 +296,79 @@ fn write_sample(
     Ok(())
 }
 
+/// `table` feeds the process history; left in, every snapshot row would carry the whole process list.
+fn snapshot_json(module: &str, value: &Value) -> String {
+    match value.as_object() {
+        Some(fields) if module == "processes" && fields.contains_key("table") => {
+            let kept = fields.iter().filter(|(k, _)| *k != "table");
+            Value::Object(kept.map(|(k, v)| (k.clone(), v.clone())).collect()).to_string()
+        }
+        _ => value.to_string(),
+    }
+}
+
+fn write_procs(
+    tx: &Transaction,
+    procs: &mut HashMap<(i64, i64), (i64, i64)>,
+    minute: &mut HashMap<(i64, i64), ProcAcc>,
+    t: i64,
+    rows: Vec<Process>,
+) -> Result<()> {
+    let mut touch = tx.prepare_cached("UPDATE procs SET last_t = ?2 WHERE id = ?1")?;
+    // the conflict branch covers an instance whose id was not loaded into the map at open
+    let mut insert = tx.prepare_cached(
+        "INSERT INTO procs (pid, start_time, comm, cmdline, user, first_t, last_t) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+         ON CONFLICT (pid, start_time) DO UPDATE SET last_t = excluded.last_t RETURNING id",
+    )?;
+    let mut point = tx.prepare_cached(
+        "INSERT OR REPLACE INTO proc_points (proc_id, t, cpu_pct, rss_bytes, threads, fds, read_bps, write_bps)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for r in rows {
+        let key = (i64::from(r.pid), r.start_time as i64);
+        let id = match procs.get_mut(&key) {
+            Some((id, last)) => {
+                touch.execute(params![*id, t])?;
+                *last = t;
+                *id
+            }
+            None => {
+                let cmdline = Some(r.cmdline.as_str()).filter(|c| !c.is_empty());
+                let id = insert.query_row(params![key.0, key.1, r.comm, cmdline, r.user, t], |row| row.get(0))?;
+                procs.insert(key, (id, t));
+                id
+            }
+        };
+        let p = ProcPoint {
+            cpu_pct: r.cpu_pct,
+            rss_bytes: r.rss_bytes as i64,
+            threads: r.threads as i64,
+            fds: r.fds.map(|f| f as i64),
+            read_bps: r.read_bps.map(|v| v as f64),
+            write_bps: r.write_bps.map(|v| v as f64),
+        };
+        point.execute(params![
+            id,
+            t,
+            p.cpu_pct,
+            p.rss_bytes,
+            p.threads,
+            p.fds,
+            p.read_bps,
+            p.write_bps
+        ])?;
+        add_proc_point(minute, id, t, p);
+    }
+    Ok(())
+}
+
+fn add_proc_point(minute: &mut HashMap<(i64, i64), ProcAcc>, id: i64, t: i64, p: ProcPoint) {
+    minute
+        .entry((id, t - t.rem_euclid(60)))
+        .and_modify(|a| a.add(p))
+        .or_insert_with(|| ProcAcc::new(p));
+}
+
 fn add_point(minute: &mut HashMap<(i64, i64), Acc>, id: i64, t: i64, v: f64) {
     minute
         .entry((id, t - t.rem_euclid(60)))
@@ -208,6 +391,72 @@ fn reopen_minutes(conn: &Connection, series: &HashMap<String, i64>) -> Result<Ha
         }
     }
     Ok(minute)
+}
+
+/// Rebuilds the process minutes a previous run left open, as `reopen_minutes` does for series.
+fn reopen_proc_minutes(
+    conn: &Connection,
+    procs: &HashMap<(i64, i64), (i64, i64)>,
+) -> Result<HashMap<(i64, i64), ProcAcc>> {
+    let mut minute = HashMap::new();
+    let mut last = conn.prepare("SELECT max(t) FROM proc_rollup_1m WHERE proc_id = ?1")?;
+    let mut points = conn.prepare(
+        "SELECT t, cpu_pct, rss_bytes, threads, fds, read_bps, write_bps FROM proc_points WHERE proc_id = ?1 AND t >= ?2",
+    )?;
+    for &(id, _) in procs.values() {
+        let rolled: Option<i64> = last.query_row([id], |r| r.get(0))?;
+        let from = rolled.map_or(i64::MIN, |t| t + 60);
+        let rows = points.query_map(params![id, from], |r| {
+            let p = ProcPoint {
+                cpu_pct: r.get(1)?,
+                rss_bytes: r.get(2)?,
+                threads: r.get(3)?,
+                fds: r.get(4)?,
+                read_bps: r.get(5)?,
+                write_bps: r.get(6)?,
+            };
+            Ok((r.get(0)?, p))
+        })?;
+        for row in rows {
+            let (t, p) = row?;
+            add_proc_point(&mut minute, id, t, p);
+        }
+    }
+    Ok(minute)
+}
+
+/// Writes every 1-minute process bucket older than `current`.
+fn close_proc_minutes(tx: &Transaction, minute: &mut HashMap<(i64, i64), ProcAcc>, current: i64) -> Result<()> {
+    let closed: Vec<(i64, i64)> = minute.keys().filter(|(_, t)| *t < current).copied().collect();
+    if closed.is_empty() {
+        return Ok(());
+    }
+    // a minute is rebuilt whole from its points on restart, so a replace never loses a half
+    let mut insert = tx.prepare_cached(
+        "INSERT OR REPLACE INTO proc_rollup_1m (proc_id, t, cpu_avg, cpu_max, rss_avg, rss_max, threads_max,
+                                               fds_max, read_bps_avg, write_bps_avg, count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )?;
+    for (id, t) in closed {
+        let a = minute.remove(&(id, t)).expect("listed above");
+        let n = a.count as f64;
+        let read = (a.read_n > 0).then(|| a.read_sum / a.read_n as f64);
+        let write = (a.write_n > 0).then(|| a.write_sum / a.write_n as f64);
+        insert.execute(params![
+            id,
+            t,
+            a.cpu_sum / n,
+            a.cpu_max,
+            a.rss_sum / n,
+            a.rss_max,
+            a.threads_max,
+            a.fds_max,
+            read,
+            write,
+            a.count
+        ])?;
+    }
+    Ok(())
 }
 
 /// Writes every 1-minute bucket older than `current` and merges it into its 15-minute bucket.
@@ -253,6 +502,30 @@ fn prune(tx: &Transaction, r: &Retention, now: i64) -> Result<()> {
         )?;
     }
     tx.execute("DELETE FROM errors WHERE t < ?1", params![raw])?;
+    prune_procs(tx, r, now)
+}
+
+fn prune_procs(tx: &Transaction, r: &Retention, now: i64) -> Result<()> {
+    let raw = now - i64::from(r.raw_hours) * 3600;
+    let cutoff = now - i64::from(r.proc_rollup_days) * 86400;
+    let ids = |sql: &str| -> Result<Vec<i64>> {
+        Ok(tx
+            .prepare_cached(sql)?
+            .query_map([cutoff], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    };
+    // per-process range deletes use the primary key; a bare `t < ?` would scan the whole table
+    let mut points = tx.prepare_cached("DELETE FROM proc_points WHERE proc_id = ?1 AND t < ?2")?;
+    let mut rollups = tx.prepare_cached("DELETE FROM proc_rollup_1m WHERE proc_id = ?1 AND t < ?2")?;
+    for id in ids("SELECT id FROM procs WHERE last_t >= ?1")? {
+        points.execute(params![id, raw])?;
+        rollups.execute(params![id, cutoff])?;
+    }
+    for id in ids("SELECT id FROM procs WHERE last_t < ?1")? {
+        points.execute(params![id, i64::MAX])?;
+        rollups.execute(params![id, i64::MAX])?;
+    }
+    tx.execute("DELETE FROM procs WHERE last_t < ?1", params![cutoff])?;
     Ok(())
 }
 
@@ -458,5 +731,136 @@ mod tests {
             .unwrap();
         assert_eq!(points, 1);
         assert_eq!(rollup(&db, "rollup_1m").len(), 2);
+    }
+
+    fn proc_row(pid: u32, start: u64, cpu: f64) -> Value {
+        json!({"pid": pid, "ppid": 1, "comm": "p", "state": "S", "threads": 2, "rss_bytes": 1000, "cpu_pct": cpu,
+               "read_bps": 10, "fds": 3, "cmdline": "p --x", "user": "me", "start_time": start})
+    }
+
+    fn proc_sample(t: i64, rows: Vec<Value>) -> Value {
+        json!({"type": "sample", "schema": 3, "t": t as f64, "time": "x",
+               "processes": {"count": rows.len(), "top_cpu": [], "table": rows}})
+    }
+
+    fn count(db: &Db, table: &str) -> i64 {
+        db.conn
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn reused_pid_with_a_new_start_time_is_a_separate_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        db.write(&proc_sample(100, vec![proc_row(7, 50, 1.0)])).unwrap();
+        db.write(&proc_sample(110, vec![proc_row(7, 50, 1.0), proc_row(8, 60, 1.0)]))
+            .unwrap();
+        db.write(&proc_sample(120, vec![proc_row(7, 90, 5.0)])).unwrap();
+        assert_eq!(count(&db, "procs"), 3);
+        // the old instance keeps only its own two points; the pid's new owner starts clean
+        let per_proc: Vec<(i64, i64)> = db
+            .conn
+            .prepare("SELECT p.start_time, count(*) FROM proc_points pp JOIN procs p ON p.id = pp.proc_id WHERE p.pid = 7 GROUP BY p.id ORDER BY p.start_time")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(per_proc, [(50, 2), (90, 1)]);
+        let (first, last): (i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT first_t, last_t FROM procs WHERE pid = 7 AND start_time = 50",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((first, last), (100, 110));
+    }
+
+    #[test]
+    fn proc_minutes_survive_a_restart_mid_minute() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        db.write(&proc_sample(120, vec![proc_row(7, 50, 10.0)])).unwrap();
+        db.write(&proc_sample(130, vec![proc_row(7, 50, 30.0)])).unwrap();
+        assert_eq!(count(&db, "proc_rollup_1m"), 0, "the minute is still open");
+        drop(db);
+        // the minute open at shutdown must be rebuilt from its points, not dropped
+        let mut db = open(&dir);
+        db.write(&proc_sample(140, vec![proc_row(7, 50, 20.0)])).unwrap();
+        db.write(&proc_sample(180, vec![proc_row(7, 50, 0.0)])).unwrap();
+        let (t, avg, max, rss, fds, read, write, n): (i64, f64, f64, f64, i64, f64, Option<f64>, i64) = db
+            .conn
+            .query_row(
+                "SELECT t, cpu_avg, cpu_max, rss_avg, fds_max, read_bps_avg, write_bps_avg, count FROM proc_rollup_1m",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (t, avg, max, rss, fds, read, write, n),
+            (120, 20.0, 30.0, 1000.0, 3, 10.0, None, 3)
+        );
+        assert_eq!(count(&db, "proc_points"), 4);
+    }
+
+    #[test]
+    fn retention_removes_old_proc_points_rollups_and_procs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        db.write(&proc_sample(120, vec![proc_row(7, 50, 1.0)])).unwrap();
+        db.write(&proc_sample(180, vec![proc_row(7, 50, 1.0)])).unwrap();
+        // 49 h later: past raw retention (48 h), inside the 7 days of rollups
+        let later = 180 + 49 * 3600;
+        db.write(&proc_sample(later, vec![proc_row(8, 60, 1.0)])).unwrap();
+        assert_eq!(
+            (
+                count(&db, "proc_points"),
+                count(&db, "proc_rollup_1m"),
+                count(&db, "procs")
+            ),
+            (1, 2, 2)
+        );
+        // 8 days later: the first process is past every window
+        db.write(&proc_sample(180 + 8 * 86400, vec![proc_row(8, 60, 1.0)]))
+            .unwrap();
+        assert_eq!(
+            (
+                count(&db, "proc_points"),
+                count(&db, "proc_rollup_1m"),
+                count(&db, "procs")
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(db.procs.len(), 1, "the in-memory map is bounded too");
+    }
+
+    #[test]
+    fn snapshot_row_does_not_carry_the_process_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        db.write(&proc_sample(100, vec![proc_row(7, 50, 1.0)])).unwrap();
+        let data: String = db
+            .conn
+            .query_row("SELECT data FROM snapshots WHERE module = 'processes'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let v: Value = serde_json::from_str(&data).unwrap();
+        assert!(v.get("table").is_none() && v["count"] == 1, "{data}");
+        assert_eq!(count(&db, "procs"), 1, "the table still reached the history");
     }
 }
