@@ -7,6 +7,7 @@ pub mod history;
 pub mod insights;
 pub mod live;
 pub mod net;
+pub mod prefs;
 pub mod pressure;
 pub mod process;
 pub mod source;
