@@ -138,8 +138,27 @@ int BPF_PROG(udp_sendmsg_exit, struct sock *sk, struct msghdr *msg, __u64 len, i
 	return 0;
 }
 
+// Linux 5.19 dropped noblock and later kernels addr_len; the loader enables the variant matching the kernel's BTF.
 SEC("fexit/udp_recvmsg")
-int BPF_PROG(udp_recvmsg_exit, struct sock *sk, struct msghdr *msg, __u64 len, int flags, int *addr_len, int ret)
+int BPF_PROG(udp_recvmsg_exit, struct sock *sk, struct msghdr *msg, __u64 len, int flags, int ret)
+{
+	if (!sock_loopback(sk) && !name_loopback(msg))
+		add(true, ret);
+	return 0;
+}
+
+SEC("fexit/udp_recvmsg")
+int BPF_PROG(udp_recvmsg_addr_len_exit, struct sock *sk, struct msghdr *msg, __u64 len, int flags, int *addr_len,
+	     int ret)
+{
+	if (!sock_loopback(sk) && !name_loopback(msg))
+		add(true, ret);
+	return 0;
+}
+
+SEC("fexit/udp_recvmsg")
+int BPF_PROG(udp_recvmsg_noblock_exit, struct sock *sk, struct msghdr *msg, __u64 len, int noblock, int flags,
+	     int *addr_len, int ret)
 {
 	if (!sock_loopback(sk) && !name_loopback(msg))
 		add(true, ret);
@@ -155,7 +174,25 @@ int BPF_PROG(udpv6_sendmsg_exit, struct sock *sk, struct msghdr *msg, __u64 len,
 }
 
 SEC("fexit/udpv6_recvmsg")
-int BPF_PROG(udpv6_recvmsg_exit, struct sock *sk, struct msghdr *msg, __u64 len, int flags, int *addr_len, int ret)
+int BPF_PROG(udpv6_recvmsg_exit, struct sock *sk, struct msghdr *msg, __u64 len, int flags, int ret)
+{
+	if (!sock_loopback(sk) && !name_loopback(msg))
+		add(true, ret);
+	return 0;
+}
+
+SEC("fexit/udpv6_recvmsg")
+int BPF_PROG(udpv6_recvmsg_addr_len_exit, struct sock *sk, struct msghdr *msg, __u64 len, int flags, int *addr_len,
+	     int ret)
+{
+	if (!sock_loopback(sk) && !name_loopback(msg))
+		add(true, ret);
+	return 0;
+}
+
+SEC("fexit/udpv6_recvmsg")
+int BPF_PROG(udpv6_recvmsg_noblock_exit, struct sock *sk, struct msghdr *msg, __u64 len, int noblock, int flags,
+	     int *addr_len, int ret)
 {
 	if (!sock_loopback(sk) && !name_loopback(msg))
 		add(true, ret);
