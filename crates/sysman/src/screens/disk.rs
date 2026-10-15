@@ -16,11 +16,12 @@ use schema::fs::{Filesystem, Fs};
 use schema::hwmon::HwmonMeta;
 use schema::processes::Process;
 use schema::series::escape;
-use schema::storage::{Drive, StorageMeta};
+use schema::storage::{Drive, Smart, StorageMeta};
 
 use crate::charts::format::{Unit, bytes};
 use crate::charts::sparkline::Sparkline;
 use crate::charts::trend::{ChartState, TrendChart, YScale};
+use crate::data::helper::{self, DiskHealth, Wear};
 use crate::data::history::{Bucket, History, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::process::ProcessFeed;
@@ -30,6 +31,7 @@ use crate::ui::shell::Tab;
 use crate::ui::theme::{Theme, theme};
 use crate::ui::widgets::card::card;
 use crate::ui::widgets::hairline;
+use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::legend::legend;
 use crate::ui::widgets::panel::{caption_label, panel};
 use crate::ui::widgets::range::{Range, range_picker_of, remember, remembered};
@@ -568,6 +570,51 @@ fn kv(label: impl Into<SharedString>, value: impl Into<SharedString>, color: Hsl
         )
 }
 
+fn smart_block(s: &Smart, cx: &App) -> AnyElement {
+    let t = theme(cx);
+    let (verdict, verdict_tint) = if s.passed {
+        ("Passed", t.green)
+    } else {
+        ("Failing", t.red)
+    };
+    let rows = helper::smart_rows(s).map(|(label, value)| {
+        let tint = if label == "Media errors" && s.media_errors.is_some_and(|n| n > 0) {
+            t.red
+        } else if value == "–" {
+            t.text_tertiary
+        } else {
+            t.text
+        };
+        kv(label, value, tint, cx)
+    });
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .child(kv("Verdict", verdict, verdict_tint, cx).font_weight(FontWeight::SEMIBOLD))
+        .when_some(s.percent_used, |d, used| {
+            let tint = match helper::wear(used) {
+                Wear::Fine => t.green,
+                Wear::Worn => t.orange,
+                Wear::Spent => t.red,
+            };
+            d.child(kv("Life used", format!("{used}%"), tint, cx))
+                .child(bar(f64::from(used) / 100., tint, cx))
+        })
+        .children(rows)
+        .when(!s.warnings.is_empty(), |d| {
+            d.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(4.))
+                    .children(s.warnings.iter().map(|w| capsule(w.clone(), t.orange, cx))),
+            )
+        })
+        .into_any_element()
+}
+
 fn state_colour(state: Option<&str>, t: &Theme) -> Hsla {
     match state {
         Some("live") => t.green,
@@ -655,6 +702,7 @@ impl Disk {
                     .child(caption_label("Device", cx))
                     .child(picker),
             )
+            .child(self.view_switch(cx))
             .child(
                 div()
                     .flex()
@@ -1125,7 +1173,21 @@ impl Disk {
                     d.children(btrfs)
                 }
             }))
-            .child(caption("SMART wear and power-on hours need root", cx))
+            .map(|d| match helper::disk_health(sample, disk) {
+                DiskHealth::Hint => d.child(helper_hint(
+                    "smart-enable",
+                    "Drive health (SMART) needs the privileged helper",
+                    cx,
+                )),
+                DiskHealth::Smart(smart) => d
+                    .child(div().h(t.hairline_width).bg(t.hairline))
+                    .child(caption_label("SMART", cx))
+                    .child(smart_block(smart, cx)),
+                DiskHealth::NoReading => d
+                    .child(div().h(t.hairline_width).bg(t.hairline))
+                    .child(caption_label("SMART", cx))
+                    .child(caption("No SMART reading for this drive", cx)),
+            })
     }
 
     fn free_space_panel(&self, sample: Option<&Sample>, cx: &App) -> impl IntoElement {
@@ -1333,9 +1395,8 @@ fn detail_card(
         .child(spark)
 }
 
-impl Render for Disk {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sample = self.live.read(cx).latest.clone();
+impl Disk {
+    fn view_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
         let switch = segmented(
             "disk-view",
@@ -1352,8 +1413,20 @@ impl Render for Disk {
                 .ok();
             },
             cx,
-        )
-        .into_any_element();
+        );
+        div()
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap(px(5.))
+            .child(caption_label("View", cx))
+            .child(switch)
+    }
+}
+
+impl Render for Disk {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let sample = self.live.read(cx).latest.clone();
         let body = match self.view {
             View::Overview => self.overview(sample.as_ref(), cx).into_any_element(),
             View::Map => {
@@ -1373,7 +1446,18 @@ impl Render for Disk {
             .size_full()
             .flex()
             .flex_col()
-            .child(div().flex().flex_row().justify_center().pt(px(12.)).child(switch))
+            .when(self.view == View::Map, |d| {
+                let t = theme(cx);
+                d.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .px(t.page_padding)
+                        .pt(t.page_padding)
+                        .child(self.view_switch(cx)),
+                )
+            })
             .child(body)
     }
 }

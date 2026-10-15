@@ -181,7 +181,8 @@ impl Live {
             )*};
         }
         keep!(
-            cgroups, cpu, disk, fs, gpu, hwmon, memory, net, netinfo, power, pressure, processes, storage, system
+            cgroups, cpu, disk, fs, gpu, helper, hwmon, memory, net, netinfo, power, pressure, processes, storage,
+            system
         );
         latest.schema = sample.schema;
         latest.t = sample.t;

@@ -1,4 +1,5 @@
 pub mod card;
+pub mod hint;
 pub mod legend;
 pub mod panel;
 pub mod range;

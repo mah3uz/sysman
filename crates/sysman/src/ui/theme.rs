@@ -12,6 +12,13 @@ pub struct Theme {
     pub hairline_width: Pixels,
     pub tooltip: Hsla,
     pub selection: Hsla,
+    /// The title bar's tab strip and its raised active segment.
+    pub strip: Hsla,
+    pub strip_border: Hsla,
+    pub strip_active: Hsla,
+    /// Bordered round controls such as the refresh pill.
+    pub control: Hsla,
+    pub control_border: Hsla,
     pub text: Hsla,
     pub text_secondary: Hsla,
     pub text_tertiary: Hsla,
@@ -57,14 +64,19 @@ fn white(alpha: f32) -> Hsla {
 impl Theme {
     pub fn dark() -> Self {
         Self {
-            window: rgb(0x1E1E20).into(),
+            window: rgb(0x21232F).into(),
             panel: white(0.05),
             card: white(0.05),
             card_hover: white(0.08),
             hairline: white(0.08),
             hairline_width: px(0.5),
-            tooltip: rgb(0x2C2C2F).into(),
+            tooltip: rgb(0x2D2F3B).into(),
             selection: white(0.13),
+            strip: white(0.06),
+            strip_border: white(0.10),
+            strip_active: white(0.14),
+            control: white(0.04),
+            control_border: white(0.12),
             text: white(0.92),
             text_secondary: white(0.60),
             text_tertiary: white(0.38),

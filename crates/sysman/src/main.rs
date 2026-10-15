@@ -41,6 +41,10 @@ fn main() {
                 return;
             }
             open(shell, cx);
+            #[cfg(debug_assertions)]
+            if std::env::var_os("SYSMAN_DEV_SETTINGS").is_some() {
+                sysman::ui::settings::open(cx);
+            }
         });
 }
 

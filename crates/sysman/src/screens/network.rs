@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -17,13 +18,18 @@ use schema::system::SystemMeta;
 
 use crate::charts::format::{Unit, bytes};
 use crate::charts::trend::{ChartState, TrendChart, YScale};
+use crate::data::desktop::IconIndex;
+use crate::data::helper;
 use crate::data::history::{Bucket, History, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::net::{self, Kind, counted, primary_route, retransmits_high, signal_quality, split_addresses};
+use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source, matching};
+use crate::screens::processes::{Icons, process_icon};
 use crate::ui::shell::Tab;
 use crate::ui::theme::theme;
 use crate::ui::widgets::hairline;
+use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::legend::legend;
 use crate::ui::widgets::panel::{caption_label, panel};
 use crate::ui::widgets::range::{Range, range_picker, remember, remembered};
@@ -37,8 +43,9 @@ const ADAPTER_CHART_HEIGHT: f32 = 120.;
 const HEADER_VALUE: Pixels = px(17.);
 const NET_INTERVAL_S: u64 = 2;
 const PREFIX: &str = "/net/interfaces/";
-const PER_APP_CAPTION: &str = "Per-app traffic is not shown: the kernel attributes bytes to processes only through \
-                               eBPF or netfilter accounting, which needs root.";
+const TOP_APPS: usize = 8;
+const PER_APP_HINT: &str = "The kernel counts traffic per process only for an eBPF program, which needs the \
+                            privileged helper.";
 
 /// A plotted series. Interface keys hold the escaped path segment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -125,6 +132,8 @@ struct Charts {
 
 pub struct Network {
     live: Entity<Live>,
+    feed: Entity<ProcessFeed>,
+    icons_requested: bool,
     range: Range,
     stored: Option<Stored>,
     loading: bool,
@@ -146,10 +155,13 @@ fn wall_clock() -> f64 {
 }
 
 impl Network {
-    pub fn new(live: Entity<Live>, cx: &mut Context<Self>) -> Self {
+    pub fn new(live: Entity<Live>, feed: Entity<ProcessFeed>, cx: &mut Context<Self>) -> Self {
         cx.observe(&live, |this, _, cx| this.refresh(cx)).detach();
+        cx.observe(&feed, |_, _, cx| cx.notify()).detach();
         let mut this = Self {
             live,
+            feed,
+            icons_requested: false,
             range: remembered(Tab::Network, cx),
             stored: None,
             loading: false,
@@ -533,18 +545,87 @@ impl Network {
             .child(legend(self.width_s, cx))
             .child(
                 div()
+                    .text_size(t.caption)
+                    .text_color(t.text_secondary)
+                    .font_features(t.numbers.clone())
+                    .child(footer),
+            )
+    }
+
+    /// App icons are indexed only once per-app rows can show.
+    fn ensure_icons(&mut self, cx: &mut Context<Self>) {
+        if self.icons_requested || cx.try_global::<Icons>().is_some() {
+            return;
+        }
+        self.icons_requested = true;
+        let task = cx.background_executor().spawn(async { IconIndex::load() });
+        cx.spawn(async move |this, cx| {
+            let icons = Arc::new(task.await);
+            cx.update(|cx| cx.set_global(Icons(icons)));
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+    }
+
+    fn per_app_panel(&self, sample: Option<&Sample>, cx: &App) -> impl IntoElement {
+        let t = theme(cx);
+        let body: Vec<AnyElement> = if !helper::running(sample) {
+            vec![helper_hint("per-app-enable", PER_APP_HINT, cx).into_any_element()]
+        } else {
+            let rows = self.feed.read(cx).table().map_or(&[][..], |t| t.rows.as_slice());
+            let top = helper::top_traffic(rows, TOP_APPS);
+            let icons = cx.try_global::<Icons>().map(|i| i.0.clone()).unwrap_or_default();
+            let rate_cell = |arrow: IconName, color: Hsla, bps: Option<u64>| {
+                div()
+                    .w(px(96.))
                     .flex()
-                    .flex_col()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
                     .gap(px(4.))
+                    .child(Icon::new(arrow).xsmall().text_color(color))
                     .child(
                         div()
-                            .text_size(t.caption)
-                            .text_color(t.text_secondary)
                             .font_features(t.numbers.clone())
-                            .child(footer),
+                            .text_color(t.text_secondary)
+                            .child(rate(bps)),
                     )
-                    .child(caption(PER_APP_CAPTION, cx)),
-            )
+            };
+            let list = if top.is_empty() {
+                caption("No process is sending or receiving", cx).into_any_element()
+            } else {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .text_size(t.caption)
+                    .children(top.into_iter().map(|p| {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(process_icon(p, &icons, 16., cx))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .child(p.comm.clone()),
+                            )
+                            .child(rate_cell(IconName::ArrowDown, t.green, p.net_rx_bps))
+                            .child(rate_cell(IconName::ArrowUp, t.red, p.net_tx_bps))
+                    }))
+                    .into_any_element()
+            };
+            vec![
+                list,
+                caption("TCP and UDP bytes per process, loopback excluded.", cx).into_any_element(),
+            ]
+        };
+        panel(IconName::AppWindow, "Per-app traffic", cx).children(body)
     }
 
     fn adapters_panel(&self, sample: Option<&Sample>, this: &WeakEntity<Self>, cx: &App) -> impl IntoElement {
@@ -952,6 +1033,9 @@ impl Render for Network {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sample = self.live.read(cx).latest.clone();
         let sample = sample.as_ref();
+        if helper::running(sample) {
+            self.ensure_icons(cx);
+        }
         let this = cx.entity().downgrade();
         let cx: &App = cx;
         let t = theme(cx);
@@ -975,6 +1059,7 @@ impl Render for Network {
                             .py(t.page_padding)
                             .child(self.header(sample, this.clone(), cx))
                             .child(self.throughput(cx))
+                            .child(self.per_app_panel(sample, cx))
                             .child(self.adapters_panel(sample, &this, cx))
                             .child(self.configuration(cx)),
                     ),
