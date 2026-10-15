@@ -54,9 +54,23 @@ gpui_kit_assets::icon_assets!(
         Lock,
         Pencil,
         PencilLine,
-        Trash
+        Trash,
+        Mouse,
+        Keyboard,
+        Headphones,
+        Gamepad2,
+        Battery,
+        BatteryFull,
+        BatteryMedium,
+        BatteryLow,
+        BatteryCharging,
+        Laptop
     ]
 );
+
+pub fn open_settings(cx: &mut gpui::App) {
+    settings::open(cx);
+}
 
 /// Our icons first, then the component library's own.
 pub struct Assets;

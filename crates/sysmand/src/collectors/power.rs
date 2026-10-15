@@ -30,6 +30,9 @@ impl Power {
             cycle_count: int("cycle_count"),
             energy_wh: micro("energy_now"),
             energy_full_wh: micro("energy_full"),
+            energy_full_design_wh: micro("energy_full_design"),
+            charge_full_ah: micro("charge_full"),
+            charge_full_design_ah: micro("charge_full_design"),
             power_w: micro("power_now"),
             voltage_v: micro("voltage_now"),
         }
@@ -69,6 +72,7 @@ mod tests {
             .file(&format!("{BASE}/BAT0/cycle_count"), "213\n")
             .file(&format!("{BASE}/BAT0/energy_now"), "41230000\n")
             .file(&format!("{BASE}/BAT0/energy_full"), "52000000\n")
+            .file(&format!("{BASE}/BAT0/energy_full_design"), "57000000\n")
             .file(&format!("{BASE}/BAT0/power_now"), "8500000\n")
             .file(&format!("{BASE}/BAT0/voltage_now"), "12100000\n")
             .file(&format!("{BASE}/AC/type"), "Mains\n")
@@ -121,6 +125,27 @@ mod tests {
         assert_eq!(b["energy_full_wh"], 52.0);
         assert_eq!(b["power_w"], 8.5);
         assert_eq!(b["voltage_v"], 12.1);
+    }
+
+    #[test]
+    fn design_capacity_is_collected_so_health_can_be_computed() {
+        let b = &sample(&laptop())["BAT0"];
+        assert_eq!(b["energy_full_design_wh"], 57.0);
+        let health = b["energy_full_wh"].as_f64().unwrap() / b["energy_full_design_wh"].as_f64().unwrap();
+        assert!((health - 0.912).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_pack_reporting_charge_gives_the_charge_pair_in_amp_hours() {
+        // a pack exposing only charge_* would otherwise have no health at all
+        let f = Fixture::new()
+            .file(&format!("{BASE}/BAT1/type"), "Battery\n")
+            .file(&format!("{BASE}/BAT1/charge_full"), "4800000\n")
+            .file(&format!("{BASE}/BAT1/charge_full_design"), "5544000\n");
+        let b = &sample(&f)["BAT1"];
+        assert_eq!(b["charge_full_ah"], 4.8);
+        assert_eq!(b["charge_full_design_ah"], 5.544);
+        assert!(b.get("energy_full_design_wh").is_none());
     }
 
     #[test]

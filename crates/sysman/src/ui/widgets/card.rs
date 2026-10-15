@@ -55,8 +55,8 @@ pub fn card(id: &'static str, label: &str, color: Hsla, cx: &App) -> Stateful<Di
             .flex_row()
             .items_center()
             .gap(px(5.))
-            .child(div().size(px(6.)).rounded_full().bg(color))
-            .child(caption_label(label, cx))
+            .child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(color))
+            .child(div().min_w_0().truncate().child(caption_label(label, cx)))
             .child(div().flex_1())
             .child(Icon::new(IconName::Info).xsmall().text_color(t.text_tertiary)),
     )

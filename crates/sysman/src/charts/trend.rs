@@ -200,6 +200,7 @@ pub struct Line {
     pub data: Rc<[Bucket]>,
     pub color: Hsla,
     pub label: SharedString,
+    pub dashed: bool,
 }
 
 struct Rule {
@@ -285,6 +286,18 @@ impl TrendChart {
             data,
             color,
             label: label.into(),
+            dashed: false,
+        });
+        self
+    }
+
+    /// A projection rather than a record: dashed, with no range band or fill.
+    pub fn dashed(mut self, data: Rc<[Bucket]>, color: Hsla, label: impl Into<SharedString>) -> Self {
+        self.lines.push(Line {
+            data,
+            color,
+            label: label.into(),
+            dashed: true,
         });
         self
     }
@@ -404,6 +417,14 @@ impl TrendChart {
                 let avg = at(|b| b.avg);
                 if avg.len() == 1 {
                     built.dots.push((point(px(avg[0].0), px(avg[0].1)), line.color));
+                    continue;
+                }
+                if line.dashed {
+                    let mut stroke = PathBuilder::stroke(px(1.5)).dash_array(&[px(5.), px(4.)]);
+                    trace(&mut stroke, &avg, true);
+                    if let Ok(path) = stroke.build() {
+                        built.over.push((path, line.color.opacity(0.85).into()));
+                    }
                     continue;
                 }
                 let mut lower = at(|b| b.min);

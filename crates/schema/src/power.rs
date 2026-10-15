@@ -31,6 +31,13 @@ pub struct Supply {
     pub energy_wh: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub energy_full_wh: Option<f64>,
+    /// Health is full over design; a pack that reports charge rather than energy fills the `charge_*` pair instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_full_design_wh: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charge_full_ah: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charge_full_design_ah: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power_w: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
