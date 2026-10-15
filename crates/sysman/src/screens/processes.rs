@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
-    Anchor, AnyElement, App, AppContext, ClipboardItem, Context, Div, DragMoveEvent, EmptyView, Entity, FontWeight,
-    Global, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Stateful,
+    Anchor, AnyElement, App, AppContext, ClipboardItem, Context, Div, Entity, FocusHandle, FontWeight, Global, Hsla,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Stateful,
     StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
@@ -18,7 +18,7 @@ use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{Icon, Selectable, Sizable, Size, WindowExt};
+use gpui_component::{Icon, Sizable, Size, WindowExt};
 use gpui_kit_assets::IconName;
 use schema::Sample;
 use schema::cpu::CpuMeta;
@@ -37,7 +37,7 @@ use crate::data::prefs::{Prefs, prefs};
 use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source, top_up};
 use crate::screens::dashboard::{Groups, cpu_colour};
-use crate::ui::shell::{Focus, Tab, take_focus};
+use crate::ui::shell::{CONTROL_HEIGHT, Focus, Tab, pill, take_focus};
 use crate::ui::theme::theme;
 use crate::ui::widgets::app_icon::app_icon;
 use crate::ui::widgets::card::card;
@@ -46,19 +46,20 @@ use crate::ui::widgets::hairline;
 use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::panel::caption_label;
 use crate::ui::widgets::range::{Range, range_picker, remember, remembered};
+use crate::ui::widgets::sidebar::{self, Side, Sidebar, Toggled, Widths};
 use crate::ui::widgets::text::caption;
 
 const BUCKETS: u32 = 120;
 const RELOAD_S: f64 = 60.;
-const INSPECTOR_WIDTH: f32 = 420.;
-const INSPECTOR_MIN: f32 = 320.;
-const INSPECTOR_MAX: f32 = 640.;
+const INSPECTOR: Widths = Widths::new(420., 320., 640.);
 const COLUMNS_KEY: &str = "processes.columns";
 const SORT_KEY: &str = "processes.sort";
 const INSPECTOR_KEY: &str = "processes.inspector";
 /// Room the table leaves for its vertical scrollbar.
 const SCROLLBAR: f32 = 16.;
 const CELL_PAD: f32 = 6.;
+const TABLE_TEXT: f32 = 14.;
+const TOOLBAR_HEIGHT: f32 = 46.;
 const CHART_HEIGHT: f32 = 110.;
 const INDENT: f32 = 14.;
 const TRAIL_S: f64 = 30. * 60.;
@@ -336,36 +337,19 @@ pub fn save_sort(prefs: &mut Prefs, (col, descending): (Col, bool)) {
     prefs.set(SORT_KEY, &pref);
 }
 
-/// The inspector's width and whether it is folded away.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// Whether the user folded the inspector away; it shows only while a process is selected either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct InspectorPref {
-    pub width: f32,
     pub collapsed: bool,
 }
 
-impl Default for InspectorPref {
-    fn default() -> Self {
-        Self {
-            width: INSPECTOR_WIDTH,
-            collapsed: false,
-        }
-    }
-}
-
-pub fn clamp_inspector(width: f32) -> f32 {
-    if width.is_finite() {
-        width.clamp(INSPECTOR_MIN, INSPECTOR_MAX).round()
-    } else {
-        INSPECTOR_WIDTH
-    }
-}
-
 pub fn load_inspector(prefs: &Prefs) -> InspectorPref {
-    let pref: InspectorPref = prefs.get(INSPECTOR_KEY).unwrap_or_default();
-    InspectorPref {
-        width: clamp_inspector(pref.width),
-        ..pref
-    }
+    prefs.get(INSPECTOR_KEY).unwrap_or_default()
+}
+
+/// The inspector shows for a selection, unless the user folded it away.
+pub fn inspector_open(selected: bool, pref: InspectorPref) -> bool {
+    selected && !pref.collapsed
 }
 
 fn store(f: impl FnOnce(&mut Prefs)) {
@@ -670,6 +654,7 @@ impl TableDelegate for ProcessTable {
             .px(px(CELL_PAD))
             .when(col.numeric(), |d| d.justify_end())
             .cursor_pointer()
+            .text_size(px(TABLE_TEXT - 1.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text)
             .child(
@@ -708,7 +693,7 @@ impl TableDelegate for ProcessTable {
             .id(("row", row_ix))
             .when(selected, |d| d.bg(tint))
             .on_click(cx.listener(move |table, _, _, cx| {
-                table.delegate_mut().model.selected = row_key;
+                table.delegate_mut().model.selected = if selected { None } else { row_key };
                 cx.notify();
             }))
     }
@@ -1069,12 +1054,11 @@ pub struct Processes {
     /// The columns the user picked; `None` follows the defaults.
     columns: Option<Vec<Col>>,
     panel: InspectorPref,
+    inspector: Entity<Sidebar>,
+    keys: FocusHandle,
     #[cfg(debug_assertions)]
     dev_select: Option<String>,
 }
-
-/// Dragged by the inspector's left edge.
-struct InspectorResize;
 
 /// Toggles `col` in `cols`, keeping display order; Process stays, as it holds the tree.
 pub fn toggle_column(cols: &[Col], col: Col) -> Vec<Col> {
@@ -1112,6 +1096,17 @@ impl Processes {
         if let Some((col, descending)) = sort {
             (model.sort, model.descending) = (col, descending);
         }
+        let inspector = cx.new(|_| Sidebar::on_demand("processes.right", Side::Right, INSPECTOR));
+        cx.subscribe(&inspector, |this: &mut Self, sidebar, _: &Toggled, cx| {
+            // its own hide button folds it away just as the toolbar's toggle does
+            let collapsed = sidebar.read(cx).collapsed();
+            if collapsed == this.inspector_open() {
+                this.panel.collapsed = collapsed;
+                this.save_inspector();
+                cx.notify();
+            }
+        })
+        .detach();
         let mut this = Self {
             me: cx.weak_entity(),
             live,
@@ -1127,6 +1122,8 @@ impl Processes {
             }),
             columns,
             panel,
+            inspector,
+            keys: cx.focus_handle(),
             search: None,
             range: remembered(Tab::Processes, cx),
             stored: None,
@@ -1271,7 +1268,22 @@ impl Processes {
         if let (Some(p), Some((t, _))) = (&self.inspected, &self.feed.read(cx).latest) {
             self.trail.push((*t, p.clone()));
         }
+        self.sync_inspector(cx);
         self.refresh(cx);
+    }
+
+    fn inspector_open(&self) -> bool {
+        inspector_open(self.inspected.is_some(), self.panel)
+    }
+
+    fn sync_inspector(&mut self, cx: &mut Context<Self>) {
+        let open = self.inspector_open();
+        self.inspector.update(cx, |s, cx| s.set_collapsed(!open, cx));
+    }
+
+    fn deselect(&mut self, cx: &mut Context<Self>) {
+        self.with_table(cx, |table| table.model.selected = None);
+        self.sync_selection(cx);
     }
 
     fn set_range(&mut self, range: Range, cx: &mut Context<Self>) {
@@ -1298,6 +1310,7 @@ impl Processes {
     fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
         self.panel.collapsed = !self.panel.collapsed;
         self.save_inspector();
+        self.sync_inspector(cx);
         cx.notify();
     }
 
@@ -1659,35 +1672,51 @@ impl Processes {
         let hierarchy = self.delegate(cx).model.hierarchy;
         let collapsed = self.panel.collapsed;
         let this = cx.entity().downgrade();
+        let search = self.search.as_ref().map(|search| {
+            div()
+                .w(px(380.))
+                .min_w(px(160.))
+                .h(CONTROL_HEIGHT)
+                .flex()
+                .items_center()
+                .px(px(4.))
+                .rounded(px(8.))
+                .bg(t.window)
+                .border_1()
+                .border_color(t.control_border)
+                .child(
+                    Input::new(search)
+                        .appearance(false)
+                        .cleanable(true)
+                        .prefix(Icon::new(IconName::Search).small().text_color(t.text_secondary)),
+                )
+        });
+        let button = |id: &'static str| pill(Button::new(id).ghost().small(), t).font_weight(FontWeight::MEDIUM);
         div()
+            .flex_shrink_0()
+            .h(px(TOOLBAR_HEIGHT))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(8.))
             .px(px(12.))
-            .py(px(4.))
+            .bg(t.panel)
             .border_t_1()
             .border_b_1()
             .border_color(t.hairline)
-            .child(div().flex_1().children(self.search.as_ref().map(|search| {
-                Input::new(search)
-                    .appearance(false)
-                    .cleanable(true)
-                    .prefix(Icon::new(IconName::Search).small().text_color(t.text_secondary))
-            })))
+            .children(search)
+            .child(div().flex_1())
             .child(
-                Button::new("hierarchy")
-                    .ghost()
-                    .xsmall()
+                button("hierarchy")
+                    .px(px(12.))
                     .icon(Icon::new(IconName::ListTree))
                     .label("Hierarchy")
-                    .selected(hierarchy)
+                    .when(hierarchy, |b| b.bg(t.strip_active).border_color(t.strip_border))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_hierarchy(cx))),
             )
             .child(
-                Button::new("columns")
-                    .ghost()
-                    .xsmall()
+                button("columns")
+                    .px(px(12.))
                     .icon(Icon::new(IconName::Columns3))
                     .label("Columns")
                     .dropdown_caret(true)
@@ -1715,15 +1744,19 @@ impl Processes {
                     }),
             )
             .child(
-                Button::new("inspector-toggle")
-                    .ghost()
-                    .xsmall()
+                button("inspector-toggle")
+                    .w(CONTROL_HEIGHT)
                     .icon(Icon::new(if collapsed {
                         IconName::PanelRightOpen
                     } else {
                         IconName::PanelRightClose
                     }))
-                    .tooltip(if collapsed { "Show details" } else { "Hide details" })
+                    .when(!collapsed, |b| b.bg(t.strip_active).border_color(t.strip_border))
+                    .tooltip(if collapsed {
+                        "Show details of the selected process"
+                    } else {
+                        "Hide details"
+                    })
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx))),
             )
     }
@@ -1779,13 +1812,13 @@ impl Processes {
 
     fn inspector(&self, cx: &mut Context<Self>) -> AnyElement {
         let this = cx.entity().downgrade();
+        let close = this.clone();
         let cx: &App = cx;
         let t = theme(cx);
         let body = div().flex().flex_col().gap(px(16.)).p(px(16.));
+        // only while sliding out after a deselect
         let Some(p) = &self.inspected else {
-            return body
-                .child(caption("Select a process to see its details and history.", cx))
-                .into_any_element();
+            return body.into_any_element();
         };
         let icons = self.delegate(cx).icons.clone();
         let running = self.delegate(cx).model.selected_process().is_some();
@@ -1908,6 +1941,17 @@ impl Processes {
                                 .child(p.comm.clone()),
                         )
                         .child(caption(format!("PID {}", p.pid), cx).font_features(t.numbers.clone())),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new("inspector-close")
+                        .ghost()
+                        .small()
+                        .icon(Icon::new(IconName::X))
+                        .tooltip("Close (Esc)")
+                        .on_click(move |_, _, cx| {
+                            close.update(cx, |this, cx| this.deselect(cx)).ok();
+                        }),
                 ),
         )
         .child(details)
@@ -2036,14 +2080,10 @@ impl Render for Processes {
             .columns
             .clone()
             .unwrap_or_else(|| Col::defaults(helper::net_columns(&self.delegate(cx).model.table, helper_running)));
-        let inspector_width = if self.panel.collapsed {
-            0.
-        } else {
-            self.panel.width + 1.
-        };
+        let inspector_width = self.inspector.read(cx).width();
         let widths = widths(
             &cols,
-            f32::from(window.viewport_size().width) - inspector_width - SCROLLBAR,
+            f32::from(window.viewport_size().width - inspector_width) - SCROLLBAR,
         );
         let mem_total = sample.as_ref().and_then(|s| s.memory.as_ref()).map(|m| m.total_bytes);
         if let Some(table) = &self.table {
@@ -2062,18 +2102,33 @@ impl Render for Processes {
             }
         }
         let toolbar = self.toolbar(cx).into_any_element();
-        let inspector = (!self.panel.collapsed).then(|| self.inspector(cx));
+        let inspector = sidebar::showing(&self.inspector, cx).then(|| {
+            let t = theme(cx);
+            div()
+                .id("process-inspector")
+                .size_full()
+                .overflow_y_scroll()
+                .border_l_1()
+                .border_color(t.hairline)
+                .bg(t.panel)
+                .child(self.inspector(cx))
+                .into_any_element()
+        });
+        let inspector = sidebar::sidebar(&self.inspector, inspector, window, cx);
         let t = theme(cx);
         let table = self.table.clone().expect("built above");
+        let keys = self.keys.clone();
         div()
             .size_full()
             .flex()
             .flex_row()
-            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<InspectorResize>, _, cx| {
-                this.panel.width = clamp_inspector(f32::from(e.bounds.right() - e.event.position.x));
-                cx.notify();
+            .track_focus(&self.keys)
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+                if e.keystroke.key == "escape" && this.inspected.is_some() {
+                    this.deselect(cx);
+                    cx.stop_propagation();
+                }
             }))
-            .on_drop(cx.listener(|this, _: &InspectorResize, _, _| this.save_inspector()))
             .child(
                 div()
                     .flex_1()
@@ -2101,47 +2156,19 @@ impl Render for Processes {
                         div()
                             .flex_1()
                             .min_h_0()
-                            .text_size(px(13.))
+                            .text_size(px(TABLE_TEXT))
                             .font_features(t.numbers.clone())
+                            // so Escape reaches this screen after a row is clicked
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| keys.focus(window, cx))
                             .child(
                                 DataTable::new(&table)
                                     .stripe(true)
                                     .bordered(false)
-                                    .with_size(Size::XSmall),
+                                    .with_size(Size::Small),
                             ),
                     ),
             )
-            .when_some(inspector, |d, inspector| {
-                d.child(
-                    div()
-                        .relative()
-                        .flex_shrink_0()
-                        .w(px(self.panel.width))
-                        .h_full()
-                        .child(
-                            div()
-                                .id("process-inspector")
-                                .size_full()
-                                .overflow_y_scroll()
-                                .border_l_1()
-                                .border_color(t.hairline)
-                                .bg(t.panel)
-                                .child(inspector),
-                        )
-                        .child(
-                            div()
-                                .id("inspector-resize")
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .bottom_0()
-                                .w(px(5.))
-                                .cursor_col_resize()
-                                .hover(|d| d.bg(t.hairline))
-                                .on_drag(InspectorResize, |_, _, _, cx| cx.new(|_| EmptyView)),
-                        ),
-                )
-            })
+            .child(inspector)
     }
 }
 
@@ -2361,29 +2388,25 @@ mod tests {
     }
 
     #[test]
-    fn the_inspector_width_stays_within_bounds() {
-        assert_eq!(clamp_inspector(100.), INSPECTOR_MIN);
-        assert_eq!(clamp_inspector(2000.), INSPECTOR_MAX);
-        assert_eq!(clamp_inspector(450.4), 450.);
-        assert_eq!(clamp_inspector(f32::NAN), INSPECTOR_WIDTH);
+    fn the_inspector_shows_only_for_a_selection_and_remembers_being_folded() {
+        let open = InspectorPref { collapsed: false };
+        let folded = InspectorPref { collapsed: true };
+        // with nothing selected an inspector could only be an empty pane
+        assert!(!inspector_open(false, open));
+        assert!(inspector_open(true, open));
+        assert!(
+            !inspector_open(true, folded),
+            "a fold outlives the selection that showed it"
+        );
         let dir = tempfile::tempdir().unwrap();
-        let mut prefs = Prefs::load(dir.path().join("ui.toml"));
-        assert_eq!(load_inspector(&prefs), InspectorPref::default());
-        // a hand-edited width must not hide the panel or squeeze the table
-        prefs.set(
-            INSPECTOR_KEY,
-            &InspectorPref {
-                width: 5.,
-                collapsed: true,
-            },
-        );
-        assert_eq!(
-            load_inspector(&prefs),
-            InspectorPref {
-                width: INSPECTOR_MIN,
-                collapsed: true
-            }
-        );
+        let path = dir.path().join("ui.toml");
+        let mut prefs = Prefs::load(path.clone());
+        assert_eq!(load_inspector(&prefs), open);
+        prefs.set(INSPECTOR_KEY, &folded);
+        assert_eq!(load_inspector(&Prefs::load(path.clone())), folded);
+        // a file written when the width was stored here still loads; the sidebar keeps the width now
+        std::fs::write(&path, "[\"processes.inspector\"]\nwidth = 500.0\ncollapsed = true\n").unwrap();
+        assert_eq!(load_inspector(&Prefs::load(path)), folded);
     }
 
     #[test]
