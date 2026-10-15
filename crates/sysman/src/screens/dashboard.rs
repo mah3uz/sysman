@@ -433,6 +433,7 @@ impl Dashboard {
 
     fn spark(&self, metric: Metric, color: Hsla, cx: &App) -> Sparkline {
         Sparkline::new(
+            ("dashboard-spark", metric as usize),
             self.data(metric),
             color,
             self.span,

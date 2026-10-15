@@ -797,7 +797,14 @@ impl Energy {
 
     fn spark(&self, key: &str, colour: Hsla) -> Sparkline {
         let (data, span, w) = self.series(key);
-        Sparkline::new(data, colour, span, w as f64, Self::gap_s(w))
+        Sparkline::new(
+            SharedString::from(format!("energy-spark-{key}")),
+            data,
+            colour,
+            span,
+            w as f64,
+            Self::gap_s(w),
+        )
     }
 
     fn chart(&self, state: &Rc<RefCell<ChartState>>, key: &str) -> TrendChart {

@@ -1404,6 +1404,7 @@ impl Processes {
     fn spark(&self, card: Card, color: Hsla) -> Sparkline {
         let gap = (self.width_s as f64 * 1.5).max(5.);
         Sparkline::new(
+            ("processes-spark", card as usize),
             Self::data(&self.cards, card),
             color,
             self.span,

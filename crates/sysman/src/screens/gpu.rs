@@ -511,7 +511,14 @@ impl Gpu {
     }
 
     fn spark(&self, field: Field, color: Hsla, cx: &App) -> Sparkline {
-        Sparkline::new(self.data(field), color, self.span, self.width_s as f64, self.gap_s(cx))
+        Sparkline::new(
+            ("gpu-spark", field as usize),
+            self.data(field),
+            color,
+            self.span,
+            self.width_s as f64,
+            self.gap_s(cx),
+        )
     }
 
     fn cmdline(&mut self, p: &Process) -> Option<String> {

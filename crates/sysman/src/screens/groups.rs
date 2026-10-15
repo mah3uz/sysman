@@ -671,7 +671,7 @@ impl Groups {
             .unwrap_or_else(|| Rc::from(Vec::new()));
         let gap = (self.width_s as f64 * 1.5).max(RECORD_INTERVAL_S * 2.5);
         let peak = reduce(&rss, self.span, self.width_s as f64, Lens::Peak);
-        let mut spark = Sparkline::new(rss, tint, self.span, self.width_s as f64, gap);
+        let mut spark = Sparkline::new(("group-spark", i), rss, tint, self.span, self.width_s as f64, gap);
         if let Some(peak) = peak {
             spark = spark.caption(format!("peak {}", bytes(peak)));
         }

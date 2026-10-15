@@ -924,7 +924,7 @@ impl Insights {
                             .child(format!("{:.0} min observed", g.observed_s / 60.)),
                     ),
             )
-            .child(Sparkline::new(data, t.orange, span, 60., 150.).fit())
+            .child(Sparkline::new(("growth-spark", i), data, t.orange, span, 60., 150.).fit())
             .child(
                 div()
                     .flex()
