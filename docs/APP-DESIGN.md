@@ -10,7 +10,7 @@ and what each screen contains.
 | UI framework | `gpui-pre` + `gpui-pre-platform` from crates.io, renamed to `gpui` / `gpui_platform` | A pinned snapshot of Zed's gpui (`gpui-pre 0.3.7` = zed@1a28cff), and the gpui `gpui-component` builds against |
 | Components | `gpui-component` (pinned with `=`) | Virtualised sortable table, segmented tab bar, resizable panes, sidebar, menus, tooltips, client-side title bar, themes |
 | Charts, treemap, energy flow, core bars | Custom elements on `canvas` + `PathBuilder` | `gpui-component` charts lack monotone cubic, min–max band, labelled dashed rules, gaps and a shared cursor |
-| Fonts | Adwaita Sans (UI, tabular digits), Adwaita Mono (paths, ids) | Clean, Inter-derived, widely installed |
+| Fonts | The system sans-serif (UI, tabular digits) and monospace (paths, ids), as fontconfig resolves them | Matches the desktop; nothing bundled |
 | Data | `schema` crate types; socket client; read-only SQLite | Same types as the daemon, so a format change breaks the build, not the screen |
 
 Guard against two gpui copies: CI step `cargo tree -d --depth 0 -p sysman | grep -q gpui && fail` (without `--depth 0` the listing names gpui as a parent of other duplicates).
@@ -83,7 +83,7 @@ Metric colours: CPU green with 60/85 bands, memory pressure orange, app memory
 blue, cache teal, kernel purple, swap indigo, download green, upload red, disk
 read blue, write orange, CPU temperature orange, GPU temperature red.
 
-Typography (Adwaita Sans, tabular digits for every number): panel title 13
+Typography (the system sans-serif, tabular digits for every number): panel title 13
 semibold; card label 10 semibold uppercase, secondary; card value 15 semibold;
 captions 10–11 secondary; axis labels 9. Spacing: page padding 20, column gap
 16, panel padding 16, card padding 11×13, rail width 300. Radii: panel 12, card

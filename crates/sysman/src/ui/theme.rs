@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::process::Command;
+use std::sync::{Arc, OnceLock};
 
 use gpui::{App, FontFeatures, FontWeight, Global, Hsla, Pixels, Rems, SharedString, px, rems, rgb};
 use serde::{Deserialize, Serialize};
@@ -122,6 +123,24 @@ pub struct Theme {
 
 impl Global for Theme {}
 
+/// The desktop's default sans and monospace families, as fontconfig resolves them.
+fn system_fonts() -> &'static (SharedString, SharedString) {
+    static FONTS: OnceLock<(SharedString, SharedString)> = OnceLock::new();
+    FONTS.get_or_init(|| (fontconfig_family("sans-serif"), fontconfig_family("monospace")))
+}
+
+// gpui maps its own system-font name to a fixed family on Linux, so ask fontconfig for the user's choice
+fn fontconfig_family(generic: &str) -> SharedString {
+    Command::new("fc-match")
+        .args(["--format=%{family[0]}", generic])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .filter(|family| !family.trim().is_empty())
+        .map_or_else(|| ".SystemUIFont".into(), |family| family.trim().to_owned().into())
+}
+
 fn white(alpha: f32) -> Hsla {
     gpui::white().opacity(alpha)
 }
@@ -163,8 +182,8 @@ impl Theme {
             pink: rgb(0xFF375F).into(),
             indigo: rgb(0x5E5CE6).into(),
 
-            font: "Adwaita Sans".into(),
-            mono: "Adwaita Mono".into(),
+            font: system_fonts().0.clone(),
+            mono: system_fonts().1.clone(),
             numbers: FontFeatures(Arc::new(vec![("tnum".into(), 1)])),
             panel_title: sz(13.),
             card_label: sz(10.),
