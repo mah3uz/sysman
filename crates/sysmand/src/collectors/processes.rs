@@ -40,6 +40,18 @@ struct Snapshot {
     threads: u64,
     rss_bytes: u64,
     start_time: u64,
+    nice: i64,
+    priority: i64,
+    vsize_bytes: u64,
+    cpu_time_s: f64,
+}
+
+/// What cannot change once a process instance has started: its user, command line and executable.
+#[derive(Clone)]
+struct Identity {
+    user: Option<String>,
+    cmdline: String,
+    exe: Option<String>,
 }
 
 /// Owns its rate state, so scanners used by different callers do not disturb each other.
@@ -54,8 +66,7 @@ pub struct ProcessScanner {
     helper_io: Deltas<(u32, u64)>,
     helper_net: Deltas<(u32, u64)>,
     users: HashMap<u32, String>,
-    /// user and cmdline per process instance, which cannot change once it has started
-    identity: HashMap<(u32, u64), (Option<String>, String)>,
+    identity: HashMap<(u32, u64), Identity>,
     passwd_mtime: Option<SystemTime>,
 }
 
@@ -81,7 +92,7 @@ impl ProcessScanner {
         })
     }
 
-    /// `None` on the first call, which only primes the counters. Rows carry no `user`, `fds` or `cmdline`;
+    /// `None` on the first call, which only primes the counters. Rows carry no `user`, `fds`, `cmdline` or `exe`;
     /// `fill_details` adds them.
     pub fn scan(&mut self) -> Result<Option<Table>> {
         let mut procs: HashMap<String, Snapshot> = HashMap::new();
@@ -139,6 +150,11 @@ impl ProcessScanner {
                 net_tx_bps: None,
                 cmdline: String::new(),
                 start_time: p.start_time,
+                nice: Some(p.nice),
+                priority: Some(p.priority),
+                vsize_bytes: Some(p.vsize_bytes),
+                cpu_time_s: Some(p.cpu_time_s),
+                exe: None,
             });
         }
         rows.sort_by_key(|r| r.pid);
@@ -160,10 +176,16 @@ impl ProcessScanner {
         if f.len() < 22 {
             bail!("/proc/{pid}/stat: {} fields after comm, expected at least 22", f.len());
         }
+        // f[0] is field 3 of proc(5), so field n is f[n - 3]
         let num = |i: usize| -> Result<u64> {
             f[i].parse()
                 .with_context(|| format!("/proc/{pid}/stat: field {:?}", f[i]))
         };
+        let signed = |i: usize| -> Result<i64> {
+            f[i].parse()
+                .with_context(|| format!("/proc/{pid}/stat: field {:?}", f[i]))
+        };
+        let ticks = num(11)? + num(12)?;
         let snap = Snapshot {
             pid: pid.parse().with_context(|| format!("pid {pid:?}"))?,
             ppid: num(1)? as u32,
@@ -172,8 +194,12 @@ impl ProcessScanner {
             threads: num(17)?,
             rss_bytes: num(21)? * self.page_size,
             start_time: 0,
+            nice: signed(16)?,
+            priority: signed(15)?,
+            vsize_bytes: num(20)?,
+            cpu_time_s: ticks as f64 / self.clk_tck,
         };
-        Ok((snap, num(19)?, num(11)? + num(12)?))
+        Ok((snap, num(19)?, ticks))
     }
 
     fn boot_time(&self) -> u64 {
@@ -183,7 +209,7 @@ impl ProcessScanner {
             .unwrap_or(0)
     }
 
-    fn read_identity(&self, pid: u32) -> (Option<String>, String) {
+    fn read_identity(&self, pid: u32) -> Identity {
         let uid = std::fs::metadata(self.sys.path(format!("/proc/{pid}")))
             .ok()
             .map(|m| m.uid());
@@ -193,7 +219,18 @@ impl ProcessScanner {
             .read_opt(format!("/proc/{pid}/cmdline"))
             .unwrap_or_default()
             .replace('\0', " ");
-        (user, cmdline.trim().chars().take(self.cmdline_max).collect())
+        let exe = std::fs::read_link(self.sys.path(format!("/proc/{pid}/exe")))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+        Identity {
+            user,
+            cmdline: cmdline.trim().chars().take(self.cmdline_max).collect(),
+            exe,
+        }
+    }
+
+    fn apply(r: &mut Process, id: Identity) {
+        (r.user, r.cmdline, r.exe) = (id.user, id.cmdline, id.exe);
     }
 
     fn read_fds(&self, pid: u32) -> Option<u64> {
@@ -202,26 +239,27 @@ impl ProcessScanner {
             .map(|d| d.count() as u64)
     }
 
-    /// Fills `user`, `fds` and `cmdline`, which cost a metadata call, a directory read and a file read per row.
+    /// Fills `user`, `fds`, `cmdline` and `exe`, which cost a metadata call, a directory read, a file read and a
+    /// link read per row.
     pub fn fill_details(&mut self, rows: &mut [Process]) {
         self.refresh_users();
         for r in rows {
-            (r.user, r.cmdline) = self.read_identity(r.pid);
+            Self::apply(r, self.read_identity(r.pid));
             r.fds = self.read_fds(r.pid);
         }
     }
 
-    /// Like `fill_details`, but `user` and `cmdline` are read only for processes not seen on the previous call.
+    /// Like `fill_details`, but `user`, `cmdline` and `exe` are read only for processes not seen on the previous
+    /// call.
     pub fn fill_table(&mut self, rows: &mut [Process]) {
         self.refresh_users();
         let mut old = std::mem::take(&mut self.identity);
         for r in rows {
             let key = (r.pid, r.start_time);
-            let (user, cmdline) = old.remove(&key).unwrap_or_else(|| self.read_identity(r.pid));
+            let identity = old.remove(&key).unwrap_or_else(|| self.read_identity(r.pid));
             r.fds = self.read_fds(r.pid);
-            r.user = user.clone();
-            r.cmdline = cmdline.clone();
-            self.identity.insert(key, (user, cmdline));
+            Self::apply(r, identity.clone());
+            self.identity.insert(key, identity);
         }
     }
 
@@ -427,6 +465,48 @@ mod tests {
         assert_eq!(row(&t, 5).comm, "Web (Content) x");
         assert_eq!(row(&t, 5).ppid, 1);
         assert_eq!(row(&t, 5).rss_bytes, 7 * s.page_size);
+    }
+
+    #[test]
+    fn nice_priority_vsize_and_cpu_time_come_from_the_fields_after_comm() {
+        // a comm with spaces and ")" shifts every field if counted from the start of the line
+        let line = "5 (a) b (c)) R 1 1 1 0 -1 0 0 0 0 0 250 150 0 0 -51 -5 3 0 10 123456789 7 0 0\n";
+        let f = Fixture::new().file("proc/5/stat", line);
+        let mut s = scanner(&f);
+        s.scan().unwrap();
+        let t = s.scan().unwrap().unwrap();
+        let p = row(&t, 5);
+        assert_eq!(p.comm, "a) b (c)");
+        assert_eq!((p.priority, p.nice, p.threads), (Some(-51), Some(-5), 3));
+        assert_eq!(p.vsize_bytes, Some(123_456_789));
+        assert_eq!(p.cpu_time_s, Some(400. / s.clk_tck), "utime plus stime, in seconds");
+    }
+
+    #[test]
+    fn exe_is_read_once_per_process_and_absent_when_unreadable() {
+        let f = Fixture::new()
+            .file("proc/5/stat", &stat(5, "a", 1, 0, 1, 10, 7))
+            .file("proc/6/stat", &stat(6, "b", 1, 0, 1, 11, 7));
+        std::os::unix::fs::symlink("/usr/bin/first", f.path().join("proc/5/exe")).unwrap();
+        let mut s = scanner(&f);
+        s.scan().unwrap();
+        let mut t = s.scan().unwrap().unwrap();
+        s.fill_table(&mut t.rows);
+        assert_eq!(row(&t, 5).exe.as_deref(), Some("/usr/bin/first"));
+        assert_eq!(
+            row(&t, 6).exe,
+            None,
+            "another user's process: no link to read, not an empty path"
+        );
+        std::fs::remove_file(f.path().join("proc/5/exe")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/second", f.path().join("proc/5/exe")).unwrap();
+        let mut t = s.scan().unwrap().unwrap();
+        s.fill_table(&mut t.rows);
+        assert_eq!(
+            row(&t, 5).exe.as_deref(),
+            Some("/usr/bin/first"),
+            "cached with the command line"
+        );
     }
 
     #[test]

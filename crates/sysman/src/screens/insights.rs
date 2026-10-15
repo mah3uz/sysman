@@ -1451,6 +1451,7 @@ mod tests {
             net_tx_bps: net.map(|n| n.1),
             cmdline: comm.into(),
             start_time: 1,
+            ..Default::default()
         };
         let rows = [
             row(1, "firefox", Some((100, 10))),

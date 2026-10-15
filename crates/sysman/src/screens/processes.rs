@@ -3,27 +3,28 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::StyledImage;
 use gpui::{
-    AnyElement, App, AppContext, ClipboardItem, Context, Div, Entity, FontWeight, Global, Hsla, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div, img,
-    prelude::FluentBuilder, px,
+    Anchor, AnyElement, App, AppContext, ClipboardItem, Context, Div, DragMoveEvent, EmptyView, Entity, FontWeight,
+    Global, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Window, div, img, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{PopupMenu, PopupMenuItem};
+use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
-use gpui_component::table::{Column, ColumnSort, DataTable, TableDelegate, TableState};
+use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, Selectable, Sizable, Size, WindowExt};
 use gpui_kit_assets::IconName;
 use schema::Sample;
 use schema::cpu::CpuMeta;
 use schema::processes::Process;
+use serde::{Deserialize, Serialize};
 
 use crate::charts::core_bars::{CoreBar, core_bars};
 use crate::charts::format::{Unit, bytes};
@@ -33,6 +34,7 @@ use crate::data::desktop::IconIndex;
 use crate::data::helper;
 use crate::data::history::{Bucket, History, ProcField, bucket_width, db_path};
 use crate::data::live::Live;
+use crate::data::prefs::{Prefs, prefs};
 use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source, top_up};
 use crate::screens::dashboard::{Groups, cpu_colour};
@@ -46,7 +48,15 @@ use crate::ui::widgets::range::{Range, range_picker, remember, remembered};
 
 const BUCKETS: u32 = 120;
 const RELOAD_S: f64 = 60.;
-const INSPECTOR_WIDTH: f32 = 380.;
+const INSPECTOR_WIDTH: f32 = 420.;
+const INSPECTOR_MIN: f32 = 320.;
+const INSPECTOR_MAX: f32 = 640.;
+const COLUMNS_KEY: &str = "processes.columns";
+const SORT_KEY: &str = "processes.sort";
+const INSPECTOR_KEY: &str = "processes.inspector";
+/// Room the table leaves for its vertical scrollbar.
+const SCROLLBAR: f32 = 16.;
+const CELL_PAD: f32 = 6.;
 const CHART_HEIGHT: f32 = 110.;
 const INDENT: f32 = 14.;
 const TRAIL_S: f64 = 30. * 60.;
@@ -70,18 +80,54 @@ pub fn key(p: &Process) -> Key {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Col {
     Process,
+    Command,
+    Path,
     Memory,
+    MemPct,
+    Virtual,
     Cpu,
+    CpuTime,
     Threads,
     Fds,
+    Read,
+    Write,
     NetRx,
     NetTx,
     User,
+    State,
+    Nice,
+    Priority,
+    Started,
     Pid,
+    Ppid,
 }
 
 impl Col {
-    const ALL: [Col; 7] = [
+    /// Every column, in display order.
+    pub const ALL: [Col; 21] = [
+        Self::Process,
+        Self::Command,
+        Self::Path,
+        Self::Memory,
+        Self::MemPct,
+        Self::Virtual,
+        Self::Cpu,
+        Self::CpuTime,
+        Self::Threads,
+        Self::Fds,
+        Self::Read,
+        Self::Write,
+        Self::NetRx,
+        Self::NetTx,
+        Self::User,
+        Self::State,
+        Self::Nice,
+        Self::Priority,
+        Self::Started,
+        Self::Pid,
+        Self::Ppid,
+    ];
+    const DEFAULT: [Col; 7] = [
         Self::Process,
         Self::Memory,
         Self::Cpu,
@@ -91,63 +137,274 @@ impl Col {
         Self::Pid,
     ];
 
-    /// Every column, with the Net pair after FDs when the helper reports per-process traffic.
-    pub fn shown(net: bool) -> Vec<Col> {
-        let mut cols = Self::ALL.to_vec();
-        if net {
-            let at = cols.iter().position(|&c| c == Self::Fds).map_or(cols.len(), |i| i + 1);
-            cols.splice(at..at, [Self::NetRx, Self::NetTx]);
+    /// The default columns, with the Net pair when the helper reports per-process traffic.
+    pub fn defaults(net: bool) -> Vec<Col> {
+        Self::ALL
+            .into_iter()
+            .filter(|c| Self::DEFAULT.contains(c) || (net && matches!(c, Self::NetRx | Self::NetTx)))
+            .collect()
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Process => "process",
+            Self::Command => "command",
+            Self::Path => "path",
+            Self::Memory => "memory",
+            Self::MemPct => "mem_pct",
+            Self::Virtual => "virtual",
+            Self::Cpu => "cpu",
+            Self::CpuTime => "cpu_time",
+            Self::Threads => "threads",
+            Self::Fds => "fds",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::NetRx => "net_rx",
+            Self::NetTx => "net_tx",
+            Self::User => "user",
+            Self::State => "state",
+            Self::Nice => "nice",
+            Self::Priority => "priority",
+            Self::Started => "started",
+            Self::Pid => "pid",
+            Self::Ppid => "ppid",
         }
-        cols
+    }
+
+    fn from_key(key: &str) -> Option<Col> {
+        Self::ALL.into_iter().find(|c| c.key() == key)
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Process => "Process",
-            Self::Memory => "Memory (RSS)",
-            Self::Cpu => "CPU",
+            Self::Command => "Command",
+            Self::Path => "Path",
+            Self::Memory => "Memory",
+            Self::MemPct => "Mem %",
+            Self::Virtual => "Virtual",
+            Self::Cpu => "CPU %",
+            Self::CpuTime => "CPU time",
             Self::Threads => "Threads",
             Self::Fds => "FDs",
+            Self::Read => "Read/s",
+            Self::Write => "Write/s",
             Self::NetRx => "Net ↓",
             Self::NetTx => "Net ↑",
             Self::User => "User",
+            Self::State => "State",
+            Self::Nice => "Nice",
+            Self::Priority => "Priority",
+            Self::Started => "Started",
             Self::Pid => "PID",
+            Self::Ppid => "PPID",
         }
     }
 
+    /// The fixed width, or for a column that flexes to fill, its minimum.
     fn width(self) -> f32 {
         match self {
-            Self::Process => 300.,
-            Self::Memory => 112.,
+            Self::Process | Self::Command => 220.,
+            Self::Path => 240.,
+            Self::Memory => 96.,
+            Self::MemPct => 72.,
+            Self::Virtual => 92.,
             Self::Cpu => 72.,
-            Self::Threads => 72.,
+            Self::CpuTime => 88.,
+            Self::Threads => 80.,
             Self::Fds => 64.,
+            Self::Read | Self::Write => 88.,
             Self::NetRx | Self::NetTx => 84.,
-            Self::User => 110.,
-            Self::Pid => 76.,
+            Self::User => 104.,
+            Self::State => 64.,
+            Self::Nice => 60.,
+            Self::Priority => 80.,
+            Self::Started => 88.,
+            Self::Pid | Self::Ppid => 76.,
         }
+    }
+
+    fn flexes(self) -> bool {
+        matches!(self, Self::Process | Self::Command)
     }
 
     fn numeric(self) -> bool {
-        !matches!(self, Self::Process | Self::User)
+        !matches!(
+            self,
+            Self::Process | Self::Command | Self::Path | Self::User | Self::State
+        )
+    }
+}
+
+/// Widths for `cols` in a table `total` wide: fixed columns keep theirs, Process and Command share the rest.
+pub fn widths(cols: &[Col], total: f32) -> Vec<f32> {
+    let fixed: f32 = cols.iter().filter(|c| !c.flexes()).map(|c| c.width()).sum();
+    let spare = (total - fixed).max(0.);
+    let both = cols.contains(&Col::Process) && cols.contains(&Col::Command);
+    cols.iter()
+        .map(|&c| {
+            let share = match c {
+                Col::Process if both => 0.4,
+                Col::Command if both => 0.6,
+                _ => 1.,
+            };
+            if c.flexes() {
+                (spare * share).max(c.width()).floor()
+            } else {
+                c.width()
+            }
+        })
+        .collect()
+}
+
+/// The first click on a column sorts it, largest or A first; a second click reverses it.
+pub fn toggle_sort((sort, descending): (Col, bool), clicked: Col) -> (Col, bool) {
+    if clicked == sort {
+        (sort, !descending)
+    } else {
+        (clicked, clicked.numeric())
     }
 }
 
 /// Ascending order on `col`; ties fall back to the pid so equal rows never swap places between refreshes.
 pub fn compare(a: &Process, b: &Process, col: Col) -> Ordering {
-    let lower = |p: &Process| p.comm.chars().flat_map(char::to_lowercase).collect::<Vec<_>>();
+    let lower = |s: &str| s.chars().flat_map(char::to_lowercase).collect::<Vec<_>>();
     let primary = match col {
-        Col::Process => lower(a).cmp(&lower(b)),
-        Col::Memory => a.rss_bytes.cmp(&b.rss_bytes),
+        Col::Process => lower(&a.comm).cmp(&lower(&b.comm)),
+        Col::Command => lower(&a.cmdline).cmp(&lower(&b.cmdline)),
+        Col::Path => a.exe.cmp(&b.exe),
+        Col::Memory | Col::MemPct => a.rss_bytes.cmp(&b.rss_bytes),
+        Col::Virtual => a.vsize_bytes.cmp(&b.vsize_bytes),
         Col::Cpu => a.cpu_pct.total_cmp(&b.cpu_pct),
+        Col::CpuTime => a.cpu_time_s.unwrap_or(-1.).total_cmp(&b.cpu_time_s.unwrap_or(-1.)),
         Col::Threads => a.threads.cmp(&b.threads),
         Col::Fds => a.fds.cmp(&b.fds),
+        Col::Read => a.read_bps.cmp(&b.read_bps),
+        Col::Write => a.write_bps.cmp(&b.write_bps),
         Col::NetRx => a.net_rx_bps.cmp(&b.net_rx_bps),
         Col::NetTx => a.net_tx_bps.cmp(&b.net_tx_bps),
         Col::User => a.user.cmp(&b.user),
+        Col::State => a.state.cmp(&b.state),
+        Col::Nice => a.nice.cmp(&b.nice),
+        Col::Priority => a.priority.cmp(&b.priority),
+        Col::Started => a.start_time.cmp(&b.start_time),
         Col::Pid => Ordering::Equal,
+        Col::Ppid => a.ppid.cmp(&b.ppid),
     };
     primary.then(a.pid.cmp(&b.pid))
+}
+
+/// The columns the user picked, or `None` for the defaults.
+pub fn load_columns(prefs: &Prefs) -> Option<Vec<Col>> {
+    let keys: Vec<String> = prefs.get(COLUMNS_KEY)?;
+    let picked: Vec<Col> = keys.iter().filter_map(|k| Col::from_key(k)).collect();
+    // a picked set always holds Process, so an empty list stands for the defaults
+    if picked.is_empty() {
+        return None;
+    }
+    Some(
+        Col::ALL
+            .into_iter()
+            .filter(|c| *c == Col::Process || picked.contains(c))
+            .collect(),
+    )
+}
+
+pub fn save_columns(prefs: &mut Prefs, cols: Option<&[Col]>) {
+    let keys: Vec<&str> = cols.unwrap_or_default().iter().map(|c| c.key()).collect();
+    prefs.set(COLUMNS_KEY, &keys);
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SortPref {
+    column: String,
+    descending: bool,
+}
+
+pub fn load_sort(prefs: &Prefs) -> Option<(Col, bool)> {
+    let pref: SortPref = prefs.get(SORT_KEY)?;
+    Some((Col::from_key(&pref.column)?, pref.descending))
+}
+
+pub fn save_sort(prefs: &mut Prefs, (col, descending): (Col, bool)) {
+    let pref = SortPref {
+        column: col.key().into(),
+        descending,
+    };
+    prefs.set(SORT_KEY, &pref);
+}
+
+/// The inspector's width and whether it is folded away.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct InspectorPref {
+    pub width: f32,
+    pub collapsed: bool,
+}
+
+impl Default for InspectorPref {
+    fn default() -> Self {
+        Self {
+            width: INSPECTOR_WIDTH,
+            collapsed: false,
+        }
+    }
+}
+
+pub fn clamp_inspector(width: f32) -> f32 {
+    if width.is_finite() {
+        width.clamp(INSPECTOR_MIN, INSPECTOR_MAX).round()
+    } else {
+        INSPECTOR_WIDTH
+    }
+}
+
+pub fn load_inspector(prefs: &Prefs) -> InspectorPref {
+    let pref: InspectorPref = prefs.get(INSPECTOR_KEY).unwrap_or_default();
+    InspectorPref {
+        width: clamp_inspector(pref.width),
+        ..pref
+    }
+}
+
+fn store(f: impl FnOnce(&mut Prefs)) {
+    f(&mut prefs().lock().unwrap_or_else(PoisonError::into_inner));
+}
+
+fn state_meaning(state: &str) -> &'static str {
+    match state {
+        "R" => "Running or runnable",
+        "S" => "Sleeping until an event",
+        "D" => "Waiting on I/O, uninterruptible",
+        "Z" => "Zombie: exited, not yet reaped by its parent",
+        "T" => "Stopped by a signal",
+        "t" => "Stopped by a debugger",
+        "X" => "Dead",
+        "I" => "Idle kernel thread",
+        "P" => "Parked",
+        "W" => "Paging or waking",
+        "K" => "Wakekill",
+        _ => "Unknown state",
+    }
+}
+
+/// Minutes, seconds and hundredths, or hours, minutes and seconds once past an hour.
+pub fn cpu_time(seconds: f64) -> String {
+    let centis = (seconds.max(0.) * 100.).round() as u64;
+    let (h, m, s, c) = (centis / 360_000, centis / 6000 % 60, centis / 100 % 60, centis % 100);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}.{c:02}")
+    }
+}
+
+/// The time of day for a process started in the last day, else the date.
+fn started(start: u64, now: f64) -> String {
+    if now - (start as f64) < 86_400. {
+        clock(start as f64, "%H:%M:%S")
+    } else {
+        clock(start as f64, "%b %-d")
+    }
 }
 
 /// Case-insensitive substring of the name or command line, or the exact pid.
@@ -398,11 +655,12 @@ pub(crate) fn process_icon(p: &Process, icons: &IconIndex, size: f32, cx: &App) 
 
 pub struct ProcessTable {
     pub model: Model,
-    /// The Process column takes the width the others leave.
-    process_width: f32,
     cols: Vec<Col>,
+    /// One per column, from `widths`.
+    widths: Vec<f32>,
     icons: Arc<IconIndex>,
     me: Option<String>,
+    mem_total: Option<u64>,
 }
 
 impl TableDelegate for ProcessTable {
@@ -416,39 +674,53 @@ impl TableDelegate for ProcessTable {
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
         let col = self.cols[col_ix];
-        let width = if col == Col::Process {
-            self.process_width
-        } else {
-            col.width()
-        };
-        let column = Column::new(col.label(), col.label()).width(px(width)).sortable();
-        let column = match (col == self.model.sort, self.model.descending) {
-            (true, true) => column.descending(),
-            (true, false) => column.ascending(),
-            (false, _) => column,
-        };
-        if col.numeric() { column.text_right() } else { column }
-    }
-
-    fn perform_sort(&mut self, col_ix: usize, sort: ColumnSort, _: &mut Window, _: &mut Context<TableState<Self>>) {
-        (self.model.sort, self.model.descending) = match sort {
-            ColumnSort::Ascending => (self.cols[col_ix], false),
-            ColumnSort::Descending => (self.cols[col_ix], true),
-            ColumnSort::Default => (Col::Memory, true),
-        };
-        self.model.rebuild();
+        let width = self.widths.get(col_ix).copied().unwrap_or_else(|| col.width());
+        // cells pad themselves, so the whole header cell takes the click
+        Column::new(col.key(), col.label()).width(px(width)).p_0()
     }
 
     fn render_th(&mut self, col_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
         let col = self.cols[col_ix];
+        let t = theme(cx);
+        let sorted = (col == self.model.sort).then_some(self.model.descending);
         div()
+            .id(("th", col_ix))
             .size_full()
             .flex()
+            .flex_row()
             .items_center()
+            .gap(px(3.))
+            .px(px(CELL_PAD))
             .when(col.numeric(), |d| d.justify_end())
+            .cursor_pointer()
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(theme(cx).text)
-            .child(col.label())
+            .text_color(t.text)
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(col.label()),
+            )
+            .children(sorted.map(|descending| {
+                Icon::new(if descending {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronUp
+                })
+                .size(px(12.))
+                .flex_shrink_0()
+                .text_color(t.text_secondary)
+            }))
+            .on_click(cx.listener(move |table, _, _, cx| {
+                let model = &mut table.delegate_mut().model;
+                let sort = toggle_sort((model.sort, model.descending), col);
+                (model.sort, model.descending) = sort;
+                model.rebuild();
+                store(|p| save_sort(p, sort));
+                cx.notify();
+            }))
     }
 
     fn render_tr(&mut self, row_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> Stateful<Div> {
@@ -476,6 +748,13 @@ impl TableDelegate for ProcessTable {
         };
         let t = theme(cx);
         let col = self.cols[col_ix];
+        let cell = div()
+            .size_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .px(px(CELL_PAD))
+            .overflow_hidden();
         let number = |text: String| {
             div()
                 .w_full()
@@ -485,18 +764,40 @@ impl TableDelegate for ProcessTable {
                 .child(text)
                 .into_any_element()
         };
+        let text = |text: String, color: Hsla| {
+            div()
+                .w_full()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_color(color)
+                .child(text)
+                .into_any_element()
+        };
+        let dash = || {
+            div()
+                .w_full()
+                .flex()
+                .when(col.numeric(), |d| d.justify_end())
+                .text_color(t.text_tertiary)
+                .child("–")
+                .into_any_element()
+        };
         let unreadable = |id: &'static str| {
             div()
                 .id((id, row_ix))
                 .w_full()
                 .flex()
-                .justify_end()
+                .when(col.numeric(), |d| d.justify_end())
                 .text_color(t.text_tertiary)
                 .child("–")
                 .tooltip(|window, cx| Tooltip::new("not permitted").build(window, cx))
                 .into_any_element()
         };
-        match col {
+        let rate = |v: Option<u64>, id: &'static str| {
+            v.map_or_else(|| unreadable(id), |n| number(Unit::BytesPerSec.format(n as f64)))
+        };
+        let content = match col {
             Col::Process => {
                 let row_key = key(p);
                 let open = !self.model.collapsed.contains(&row_key);
@@ -545,28 +846,44 @@ impl TableDelegate for ProcessTable {
                     )
                     .into_any_element()
             }
+            Col::Command if p.cmdline.is_empty() => dash(),
+            Col::Command => text(p.cmdline.clone(), t.text_secondary),
+            // kernel threads have no executable at all, which is not a matter of permission
+            Col::Path if p.cmdline.is_empty() => dash(),
+            Col::Path => p
+                .exe
+                .clone()
+                .map_or_else(|| unreadable("exe"), |exe| text(exe, t.text_secondary)),
             Col::Memory => number(bytes(p.rss_bytes as f64)),
+            Col::MemPct => self.mem_total.filter(|&total| total > 0).map_or_else(dash, |total| {
+                number(format!("{:.1}%", 100. * p.rss_bytes as f64 / total as f64))
+            }),
+            Col::Virtual => p.vsize_bytes.map_or_else(dash, |v| number(bytes(v as f64))),
             Col::Cpu => number(format!("{:.1}%", p.cpu_pct)),
+            Col::CpuTime => p.cpu_time_s.map_or_else(dash, |s| number(cpu_time(s))),
             Col::Threads => number(p.threads.to_string()),
             Col::Fds => p.fds.map_or_else(|| unreadable("fds"), |n| number(n.to_string())),
-            Col::NetRx => p
-                .net_rx_bps
-                .map_or_else(|| unreadable("net-rx"), |n| number(Unit::BytesPerSec.format(n as f64))),
-            Col::NetTx => p
-                .net_tx_bps
-                .map_or_else(|| unreadable("net-tx"), |n| number(Unit::BytesPerSec.format(n as f64))),
-            Col::User => match &p.user {
-                Some(user) => div()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_color(t.text_secondary)
-                    .child(user.clone())
-                    .into_any_element(),
-                None => div().text_color(t.text_tertiary).child("–").into_any_element(),
-            },
+            Col::Read => rate(p.read_bps, "read"),
+            Col::Write => rate(p.write_bps, "write"),
+            Col::NetRx => rate(p.net_rx_bps, "net-rx"),
+            Col::NetTx => rate(p.net_tx_bps, "net-tx"),
+            Col::User => p.user.clone().map_or_else(dash, |u| text(u, t.text_secondary)),
+            Col::State => {
+                let meaning = state_meaning(&p.state);
+                div()
+                    .id(("state", row_ix))
+                    .child(p.state.clone())
+                    .tooltip(move |window, cx| Tooltip::new(meaning).build(window, cx))
+                    .into_any_element()
+            }
+            Col::Nice => p.nice.map_or_else(dash, |n| number(n.to_string())),
+            Col::Priority => p.priority.map_or_else(dash, |n| number(n.to_string())),
+            Col::Started if p.start_time == 0 => dash(),
+            Col::Started => number(started(p.start_time, wall_clock())),
             Col::Pid => number(p.pid.to_string()),
-        }
+            Col::Ppid => number(p.ppid.to_string()),
+        };
+        cell.child(content).into_any_element()
     }
 
     fn context_menu(
@@ -592,6 +909,7 @@ impl TableDelegate for ProcessTable {
         menu.item(copy("Copy name", p.comm.clone()))
             .item(copy("Copy PID", p.pid.to_string()))
             .item(copy("Copy command line", p.cmdline.clone()))
+            .when_some(p.exe.clone(), |menu, exe| menu.item(copy("Copy path", exe)))
             .separator()
             .item(end(Signal::Term, p.clone()))
             .item(end(Signal::Kill, p))
@@ -719,8 +1037,23 @@ pub struct Processes {
     cpu_meta: Option<CpuMeta>,
     /// A process another screen asked to show, selected once the table holds it.
     focus: Option<Focus>,
+    /// The columns the user picked; `None` follows the defaults.
+    columns: Option<Vec<Col>>,
+    panel: InspectorPref,
     #[cfg(debug_assertions)]
     dev_select: Option<String>,
+}
+
+/// Dragged by the inspector's left edge.
+struct InspectorResize;
+
+/// Toggles `col` in `cols`, keeping display order; Process stays, as it holds the tree.
+pub fn toggle_column(cols: &[Col], col: Col) -> Vec<Col> {
+    let on = cols.contains(&col);
+    Col::ALL
+        .into_iter()
+        .filter(|&c| c == Col::Process || if c == col { !on } else { cols.contains(&c) })
+        .collect()
 }
 
 impl Processes {
@@ -742,17 +1075,28 @@ impl Processes {
             }
         };
         let cursor = Rc::new(Cell::new(None));
+        let (columns, sort, panel) = {
+            let prefs = prefs().lock().unwrap_or_else(PoisonError::into_inner);
+            (load_columns(&prefs), load_sort(&prefs), load_inspector(&prefs))
+        };
+        let mut model = Model::new(cx.try_global::<HierarchyMode>().is_some_and(|h| h.0));
+        if let Some((col, descending)) = sort {
+            (model.sort, model.descending) = (col, descending);
+        }
         let mut this = Self {
             live,
             feed,
             table: None,
             pending: Some(ProcessTable {
-                model: Model::new(cx.try_global::<HierarchyMode>().is_some_and(|h| h.0)),
+                model,
                 icons,
                 me: current_user(),
-                process_width: Col::Process.width(),
-                cols: Col::shown(false),
+                cols: Vec::new(),
+                widths: Vec::new(),
+                mem_total: None,
             }),
+            columns,
+            panel,
             search: None,
             range: remembered(Tab::Processes, cx),
             stored: None,
@@ -775,6 +1119,20 @@ impl Processes {
         #[cfg(debug_assertions)]
         if std::env::var_os("SYSMAN_DEV_HIERARCHY").is_some() {
             this.with_table(cx, |table| table.model.hierarchy = true);
+        }
+        #[cfg(debug_assertions)]
+        if let Ok(keys) = std::env::var("SYSMAN_DEV_PROC_COLUMNS") {
+            this.columns = Some(match keys.as_str() {
+                "all" => Col::ALL.to_vec(),
+                keys => Col::ALL
+                    .into_iter()
+                    .filter(|c| *c == Col::Process || keys.split(',').any(|k| k == c.key()))
+                    .collect(),
+            });
+        }
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYSMAN_DEV_INSPECTOR_COLLAPSED").is_some() {
+            this.panel.collapsed = true;
         }
         this.on_feed(cx);
         this
@@ -894,6 +1252,29 @@ impl Processes {
         }
     }
 
+    fn set_column(&mut self, col: Col, cx: &mut Context<Self>) {
+        let cols = toggle_column(&self.delegate(cx).cols, col);
+        store(|p| save_columns(p, Some(&cols)));
+        self.columns = Some(cols);
+        cx.notify();
+    }
+
+    fn reset_columns(&mut self, cx: &mut Context<Self>) {
+        store(|p| save_columns(p, None));
+        self.columns = None;
+        cx.notify();
+    }
+
+    fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
+        self.panel.collapsed = !self.panel.collapsed;
+        self.save_inspector();
+        cx.notify();
+    }
+
+    fn save_inspector(&self) {
+        store(|p| p.set(INSPECTOR_KEY, &self.panel));
+    }
+
     fn toggle_hierarchy(&mut self, cx: &mut Context<Self>) {
         let on = self.with_table(cx, |table| {
             table.model.hierarchy = !table.model.hierarchy;
@@ -1007,6 +1388,38 @@ fn caption(text: impl Into<SharedString>, cx: &App) -> Div {
         .text_size(t.small_caption)
         .text_color(t.text_secondary)
         .child(text.into())
+}
+
+/// A captioned monospace value with a Copy button, or `absent` dimmed when there is nothing to copy.
+fn copyable(id: &'static str, label: &str, value: Option<String>, absent: &str, cx: &App) -> impl IntoElement {
+    let t = theme(cx);
+    let text = div().text_size(t.caption).font_family(t.mono.clone());
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(3.))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(caption(label.to_owned(), cx))
+                .child(div().flex_1())
+                .when_some(value.clone(), |d, value| {
+                    d.child(
+                        Button::new(id)
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::Copy))
+                            .tooltip(format!("Copy {}", label.to_lowercase()))
+                            .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(value.clone()))),
+                    )
+                }),
+        )
+        .child(match value {
+            Some(value) => text.text_color(t.text).child(value),
+            None => text.text_color(t.text_tertiary).child(absent.to_owned()),
+        })
 }
 
 fn value_row(value: String, detail: Option<String>, cx: &App) -> impl IntoElement {
@@ -1149,6 +1562,8 @@ impl Processes {
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let hierarchy = self.delegate(cx).model.hierarchy;
+        let collapsed = self.panel.collapsed;
+        let this = cx.entity().downgrade();
         div()
             .flex()
             .flex_row()
@@ -1173,6 +1588,48 @@ impl Processes {
                     .label("Hierarchy")
                     .selected(hierarchy)
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_hierarchy(cx))),
+            )
+            .child(
+                Button::new("columns")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(IconName::Columns3))
+                    .label("Columns")
+                    .dropdown_caret(true)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, cx| {
+                        let Some(screen) = this.upgrade() else {
+                            return menu;
+                        };
+                        let shown = screen.read(cx).delegate(cx).cols.clone();
+                        for col in Col::ALL {
+                            let screen = screen.downgrade();
+                            menu = menu.item(
+                                PopupMenuItem::new(col.label())
+                                    .checked(shown.contains(&col))
+                                    .disabled(col == Col::Process)
+                                    .on_click(move |_, _, cx| {
+                                        screen.update(cx, |this, cx| this.set_column(col, cx)).ok();
+                                    }),
+                            );
+                        }
+                        let screen = screen.downgrade();
+                        menu.separator()
+                            .item(PopupMenuItem::new("Reset to default").on_click(move |_, _, cx| {
+                                screen.update(cx, |this, cx| this.reset_columns(cx)).ok();
+                            }))
+                    }),
+            )
+            .child(
+                Button::new("inspector-toggle")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(if collapsed {
+                        IconName::PanelRightOpen
+                    } else {
+                        IconName::PanelRightClose
+                    }))
+                    .tooltip(if collapsed { "Show details" } else { "Hide details" })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx))),
             )
     }
 
@@ -1271,25 +1728,37 @@ impl Processes {
         )
         .child(kv("User", p.user.clone().unwrap_or_else(|| "–".into())))
         .child(kv("Started", clock(p.start_time as f64, "%b %-d %H:%M:%S")))
-        .child(kv("State", p.state.clone()))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(3.))
-                .child(caption("Command line", cx))
-                .child(
-                    div()
-                        .text_size(t.caption)
-                        .font_family(t.mono.clone())
-                        .text_color(t.text)
-                        .child(if p.cmdline.is_empty() {
-                            format!("[{}]", p.comm)
-                        } else {
-                            p.cmdline.clone()
-                        }),
-                ),
-        );
+        .child(kv("State", format!("{} · {}", p.state, state_meaning(&p.state))))
+        .child(kv(
+            "Nice",
+            match (p.nice, p.priority) {
+                (Some(nice), Some(priority)) => format!("{nice} · priority {priority}"),
+                _ => "–".into(),
+            },
+        ))
+        .child(kv("CPU time", p.cpu_time_s.map_or_else(|| "–".into(), cpu_time)))
+        .child(kv(
+            "Virtual",
+            p.vsize_bytes.map_or_else(|| "–".into(), |v| bytes(v as f64)),
+        ))
+        .child(copyable(
+            "copy-path",
+            "Path",
+            p.exe.clone(),
+            if p.cmdline.is_empty() {
+                "–"
+            } else {
+                "– (not permitted)"
+            },
+            cx,
+        ))
+        .child(copyable(
+            "copy-command",
+            "Command line",
+            Some(p.cmdline.clone()).filter(|c| !c.is_empty()),
+            &format!("[{}]", p.comm),
+            cx,
+        ));
         let swatch = |color: Hsla, label: &'static str| {
             div()
                 .flex()
@@ -1426,6 +1895,7 @@ impl Processes {
             let table = cx.new(|cx| {
                 let mut state = TableState::new(delegate, window, cx)
                     .row_selectable(false)
+                    .col_selectable(false)
                     .col_movable(false);
                 if let Some(line) = line {
                     state.scroll_to_row(line, cx);
@@ -1443,30 +1913,48 @@ impl Render for Processes {
         self.ensure_widgets(window, cx);
         let sample = self.live.read(cx).latest.clone();
         let helper_running = helper::running(sample.as_ref());
-        let cols = Col::shown(helper::net_columns(&self.delegate(cx).model.table, helper_running));
-        let others: f32 = cols[1..].iter().map(|c| c.width()).sum();
-        let fill = (f32::from(window.viewport_size().width) - INSPECTOR_WIDTH - others - 16.)
-            .max(Col::Process.width())
-            .floor();
+        let cols = self
+            .columns
+            .clone()
+            .unwrap_or_else(|| Col::defaults(helper::net_columns(&self.delegate(cx).model.table, helper_running)));
+        let inspector_width = if self.panel.collapsed {
+            0.
+        } else {
+            self.panel.width + 1.
+        };
+        let widths = widths(
+            &cols,
+            f32::from(window.viewport_size().width) - inspector_width - SCROLLBAR,
+        );
+        let mem_total = sample.as_ref().and_then(|s| s.memory.as_ref()).map(|m| m.total_bytes);
         if let Some(table) = &self.table {
             let delegate = table.read(cx).delegate();
-            if delegate.process_width != fill || delegate.cols != cols {
+            if delegate.widths != widths || delegate.cols != cols || delegate.mem_total != mem_total {
+                let layout = delegate.widths != widths || delegate.cols != cols;
                 table.update(cx, |state, cx| {
                     let delegate = state.delegate_mut();
-                    delegate.process_width = fill;
+                    delegate.widths = widths;
                     delegate.cols = cols;
-                    state.refresh(cx);
+                    delegate.mem_total = mem_total;
+                    if layout {
+                        state.refresh(cx);
+                    }
                 });
             }
         }
         let toolbar = self.toolbar(cx).into_any_element();
-        let inspector = self.inspector(cx);
+        let inspector = (!self.panel.collapsed).then(|| self.inspector(cx));
         let t = theme(cx);
         let table = self.table.clone().expect("built above");
         div()
             .size_full()
             .flex()
             .flex_row()
+            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<InspectorResize>, _, cx| {
+                this.panel.width = clamp_inspector(f32::from(e.bounds.right() - e.event.position.x));
+                cx.notify();
+            }))
+            .on_drop(cx.listener(|this, _: &InspectorResize, _, _| this.save_inspector()))
             .child(
                 div()
                     .flex_1()
@@ -1504,18 +1992,37 @@ impl Render for Processes {
                             ),
                     ),
             )
-            .child(
-                div()
-                    .id("process-inspector")
-                    .flex_shrink_0()
-                    .w(px(INSPECTOR_WIDTH))
-                    .h_full()
-                    .overflow_y_scroll()
-                    .border_l_1()
-                    .border_color(t.hairline)
-                    .bg(t.panel)
-                    .child(inspector),
-            )
+            .when_some(inspector, |d, inspector| {
+                d.child(
+                    div()
+                        .relative()
+                        .flex_shrink_0()
+                        .w(px(self.panel.width))
+                        .h_full()
+                        .child(
+                            div()
+                                .id("process-inspector")
+                                .size_full()
+                                .overflow_y_scroll()
+                                .border_l_1()
+                                .border_color(t.hairline)
+                                .bg(t.panel)
+                                .child(inspector),
+                        )
+                        .child(
+                            div()
+                                .id("inspector-resize")
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(5.))
+                                .cursor_col_resize()
+                                .hover(|d| d.bg(t.hairline))
+                                .on_drag(InspectorResize, |_, _, _, cx| cx.new(|_| EmptyView)),
+                        ),
+                )
+            })
     }
 }
 
@@ -1540,6 +2047,7 @@ mod tests {
             net_tx_bps: None,
             cmdline: format!("/usr/bin/{comm} --flag"),
             start_time: 1000 + u64::from(pid),
+            ..Default::default()
         }
     }
 
@@ -1645,8 +2153,8 @@ mod tests {
 
     #[test]
     fn net_columns_sit_after_fds_and_sort_absent_rates_lowest() {
-        assert!(!Col::shown(false).contains(&Col::NetRx));
-        let cols = Col::shown(true);
+        assert!(!Col::defaults(false).contains(&Col::NetRx));
+        let cols = Col::defaults(true);
         let fds = cols.iter().position(|&c| c == Col::Fds).unwrap();
         assert_eq!(cols[fds + 1..fds + 3], [Col::NetRx, Col::NetTx]);
         let mut busy = proc(1, 0, "a", 1);
@@ -1656,6 +2164,121 @@ mod tests {
             Ordering::Greater,
             "a process the helper has no rate for sorts below any rate"
         );
+    }
+
+    #[test]
+    fn a_header_click_sorts_numbers_largest_first_and_text_a_first_then_reverses() {
+        let start = (Col::Memory, true);
+        let cpu = toggle_sort(start, Col::Cpu);
+        assert_eq!(cpu, (Col::Cpu, true), "the busiest process is what one looks for first");
+        assert_eq!(toggle_sort(cpu, Col::Cpu), (Col::Cpu, false));
+        assert_eq!(
+            toggle_sort((Col::Cpu, false), Col::Cpu),
+            (Col::Cpu, true),
+            "a third click flips back"
+        );
+        let user = toggle_sort(cpu, Col::User);
+        assert_eq!(user, (Col::User, false), "names read A to Z");
+        assert_eq!(toggle_sort(user, Col::User), (Col::User, true));
+        assert_eq!(
+            toggle_sort((Col::Cpu, false), Col::Started),
+            (Col::Started, true),
+            "newest first"
+        );
+    }
+
+    #[test]
+    fn picked_columns_and_sort_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui.toml");
+        let mut prefs = Prefs::load(path.clone());
+        assert_eq!(load_columns(&prefs), None, "no choice yet: the defaults");
+        let cols = toggle_column(&toggle_column(&Col::defaults(false), Col::Fds), Col::Ppid);
+        save_columns(&mut prefs, Some(&cols));
+        save_sort(&mut prefs, (Col::CpuTime, false));
+
+        let mut prefs = Prefs::load(path.clone());
+        let loaded = load_columns(&prefs).unwrap();
+        assert_eq!(loaded, cols);
+        assert!(!loaded.contains(&Col::Fds) && loaded.contains(&Col::Ppid));
+        assert_eq!(load_sort(&prefs), Some((Col::CpuTime, false)));
+
+        save_columns(&mut prefs, None);
+        assert_eq!(
+            load_columns(&Prefs::load(path)),
+            None,
+            "a reset follows the defaults again, so a later helper still brings the Net pair"
+        );
+    }
+
+    #[test]
+    fn the_process_column_cannot_be_hidden_and_unknown_names_are_dropped() {
+        assert_eq!(
+            toggle_column(&[Col::Process, Col::Pid], Col::Process),
+            [Col::Process, Col::Pid],
+            "it holds the tree and the icon"
+        );
+        assert_eq!(
+            toggle_column(&[Col::Process, Col::Pid], Col::Memory),
+            [Col::Process, Col::Memory, Col::Pid],
+            "display order, not click order"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut prefs = Prefs::load(dir.path().join("ui.toml"));
+        // a file from a newer or older version may name columns this one does not know
+        prefs.set(COLUMNS_KEY, &["pid", "gone", "user"]);
+        assert_eq!(load_columns(&prefs), Some(vec![Col::Process, Col::User, Col::Pid]));
+        prefs.set(COLUMNS_KEY, &["gone"]);
+        assert_eq!(load_columns(&prefs), None);
+    }
+
+    #[test]
+    fn the_inspector_width_stays_within_bounds() {
+        assert_eq!(clamp_inspector(100.), INSPECTOR_MIN);
+        assert_eq!(clamp_inspector(2000.), INSPECTOR_MAX);
+        assert_eq!(clamp_inspector(450.4), 450.);
+        assert_eq!(clamp_inspector(f32::NAN), INSPECTOR_WIDTH);
+        let dir = tempfile::tempdir().unwrap();
+        let mut prefs = Prefs::load(dir.path().join("ui.toml"));
+        assert_eq!(load_inspector(&prefs), InspectorPref::default());
+        // a hand-edited width must not hide the panel or squeeze the table
+        prefs.set(
+            INSPECTOR_KEY,
+            &InspectorPref {
+                width: 5.,
+                collapsed: true,
+            },
+        );
+        assert_eq!(
+            load_inspector(&prefs),
+            InspectorPref {
+                width: INSPECTOR_MIN,
+                collapsed: true
+            }
+        );
+    }
+
+    #[test]
+    fn process_and_command_share_the_spare_width() {
+        let cols = [Col::Process, Col::Memory, Col::Pid];
+        let w = widths(&cols, 1000.);
+        assert_eq!(w.iter().sum::<f32>(), 1000., "the table fills its width");
+        assert_eq!(w[1..], [Col::Memory.width(), Col::Pid.width()]);
+        let w = widths(&[Col::Process, Col::Command, Col::Pid], 1076.);
+        assert_eq!(w, [400., 600., 76.]);
+        let w = widths(&cols, 100.);
+        assert_eq!(
+            w[0],
+            Col::Process.width(),
+            "too narrow: scroll rather than crush the name"
+        );
+    }
+
+    #[test]
+    fn cpu_time_reads_like_a_stopwatch() {
+        assert_eq!(cpu_time(0.), "0:00.00");
+        assert_eq!(cpu_time(83.456), "1:23.46");
+        assert_eq!(cpu_time(3600. + 125.), "1:02:05");
     }
 
     #[test]

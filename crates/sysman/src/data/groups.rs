@@ -393,6 +393,7 @@ mod tests {
             net_tx_bps: None,
             cmdline: cmdline.into(),
             start_time: 0,
+            ..Default::default()
         }
     }
 
