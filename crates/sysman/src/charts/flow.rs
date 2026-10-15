@@ -1,8 +1,8 @@
-use std::cell::Cell;
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::time::Instant;
 
 use gpui::{
-    App, BorderStyle, Bounds, Font, Hsla, IntoElement, ParentElement, PathBuilder, Pixels, Point, RenderOnce,
+    App, BorderStyle, Bounds, Entity, Font, Hsla, IntoElement, ParentElement, PathBuilder, Pixels, Point, RenderOnce,
     SharedString, Styled, TextAlign, TransformationMatrix, Window, canvas, div, fill, outline, point, px, size,
 };
 use gpui_kit_assets::IconName;
@@ -12,12 +12,20 @@ use crate::ui::shell::paused;
 use crate::ui::theme::theme;
 
 pub const HEIGHT: Pixels = px(240.);
-/// Each step redraws the whole window, so the dots move at this rate rather than the display's.
-const STEP: Duration = Duration::from_millis(42);
-
-thread_local! {
-    static STEP_DUE: Cell<bool> = const { Cell::new(false) };
-}
+/// Dot speed along a line, px/s, for an idle and for a saturated flow.
+pub const SPEED: (f64, f64) = (40., 90.);
+/// Share of dot slots lit for an idle and for a saturated flow; a heavier flow shows more dots, not faster ones.
+const DENSITY: (f64, f64) = (0.16, 0.72);
+/// Distance between dot slots along a line.
+const PITCH: f64 = 26.;
+/// A new reading eases the speed and density over this long.
+const EASE_S: f64 = 0.4;
+/// A longer gap between frames (paused, hidden) does not move the dots on.
+const MAX_FRAME_S: f64 = 0.25;
+/// Dots fade in and out over this distance at each end of a line.
+const FADE_PX: f64 = 14.;
+/// Watts at which a flow counts as half saturated.
+const HALF_W: f64 = 25.;
 const LEFT_X: f32 = 56.;
 const SINK_WIDTH: f32 = 132.;
 const HUB_SIZE: (f32, f32) = (86., 64.);
@@ -64,18 +72,17 @@ pub struct Link {
     pub from: End,
     pub to: End,
     pub color: Hsla,
-    /// Sets the travelling dot's speed and size; `None` draws the line without a dot.
+    /// Sets how many dots travel the line and how fast; `None` draws the line without dots.
     pub watts: Option<f64>,
 }
 
-/// Lines from sources through hubs to sinks, each with one dot travelling at a speed set by its watts.
+/// Lines from sources through hubs to sinks, with dots travelling each line more densely the more watts it carries.
 #[derive(IntoElement)]
 pub struct EnergyFlow {
     pub sources: Vec<Source>,
     pub hubs: Vec<Hub>,
     pub sinks: Vec<Sink>,
     pub links: Vec<Link>,
-    pub started: Instant,
     pub animate: bool,
 }
 
@@ -91,9 +98,105 @@ pub fn rows(count: usize, height: f32, top: f32, bottom: f32) -> Vec<f32> {
     }
 }
 
-/// Pixels per second; a floor keeps an idle line visibly alive.
-pub fn speed(watts: f64) -> f64 {
-    (12. * watts).max(16.)
+/// 0 for an idle line, approaching 1 for a heavy one; it saturates so a big flow reads as more, not frantic.
+pub fn level(watts: f64) -> f64 {
+    let w = watts.max(0.);
+    w / (w + HALF_W)
+}
+
+fn smoothstep(u: f64) -> f64 {
+    let u = u.clamp(0., 1.);
+    u * u * (3. - 2. * u)
+}
+
+/// A line's level easing from `x0` to `x1` since `t0`, and the distance its dots had travelled at `t0`.
+/// Travel is the closed-form integral of the eased speed, so it never jumps when a new reading arrives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Drift {
+    t0: f64,
+    d0: f64,
+    x0: f64,
+    x1: f64,
+}
+
+impl Drift {
+    pub fn new(t: f64, x: f64) -> Self {
+        Self {
+            t0: t,
+            d0: 0.,
+            x0: x,
+            x1: x,
+        }
+    }
+
+    pub fn level(&self, t: f64) -> f64 {
+        self.x0 + (self.x1 - self.x0) * smoothstep((t - self.t0) / EASE_S)
+    }
+
+    pub fn speed(&self, t: f64) -> f64 {
+        SPEED.0 + (SPEED.1 - SPEED.0) * self.level(t)
+    }
+
+    /// Distance along the line, px.
+    pub fn travel(&self, t: f64) -> f64 {
+        let tau = (t - self.t0).max(0.);
+        let u = tau / EASE_S;
+        // the integral of smoothstep over the ease, then 1 per second after it
+        let eased = if u < 1. {
+            EASE_S * (u.powi(3) - u.powi(4) / 2.)
+        } else {
+            EASE_S * 0.5 + (tau - EASE_S)
+        };
+        let level_area = self.x0 * tau + (self.x1 - self.x0) * eased;
+        self.d0 + SPEED.0 * tau + (SPEED.1 - SPEED.0) * level_area
+    }
+
+    pub fn retarget(&mut self, t: f64, x: f64) {
+        if (x - self.x1).abs() > 1e-6 {
+            *self = Self {
+                t0: t,
+                d0: self.travel(t),
+                x0: self.level(t),
+                x1: x,
+            };
+        }
+    }
+}
+
+/// Whether dot slot `n` shows at `density`, from 0 to 1. Golden-ratio steps spread the lit slots evenly at
+/// any density, and a slot fades rather than pops as the density passes it.
+pub fn lit(n: i64, seed: f64, density: f64) -> f64 {
+    let u = (n as f64 * 0.618_033_988_75 + seed).rem_euclid(1.);
+    ((density - u) / 0.08).clamp(0., 1.)
+}
+
+/// The animation clock and each line's drift, kept across frames.
+#[derive(Default)]
+struct Motion {
+    /// Seconds of motion shown so far; it stands still while no frames are drawn.
+    clock: f64,
+    last: Option<Instant>,
+    lines: HashMap<String, Drift>,
+}
+
+impl Motion {
+    fn advance(&mut self, now: Instant, animate: bool) {
+        if animate && let Some(last) = self.last {
+            self.clock += now.duration_since(last).as_secs_f64().min(MAX_FRAME_S);
+        }
+        self.last = Some(now);
+    }
+}
+
+fn line_key(link: &Link) -> String {
+    format!("{:?}>{:?}", link.from, link.to)
+}
+
+fn seed(key: &str) -> f64 {
+    let h = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    (h % 10_000) as f64 / 10_000.
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -123,28 +226,44 @@ impl Conduit {
         (0..4).fold((0., 0.), |acc, i| (acc.0 + w[i] * p[i].0, acc.1 + w[i] * p[i].1))
     }
 
-    fn samples(&self) -> Vec<(f32, f32)> {
-        (0..=24).map(|i| self.at(i as f32 / 24.)).collect()
-    }
-
-    pub fn length(&self) -> f32 {
-        self.samples().windows(2).map(|w| dist(w[0], w[1])).sum()
-    }
-
-    /// The point a fraction `f` of the way along the curve by length, so a dot moves at constant speed.
-    pub fn along(&self, f: f32) -> (f32, f32) {
-        let pts = self.samples();
-        let total = self.length();
-        let mut left = f.clamp(0., 1.) * total;
-        for w in pts.windows(2) {
-            let d = dist(w[0], w[1]);
-            if left <= d && d > 0. {
-                let k = left / d;
-                return (w[0].0 + (w[1].0 - w[0].0) * k, w[0].1 + (w[1].1 - w[0].1) * k);
-            }
-            left -= d;
+    /// A table of the curve's length against its parameter, built once per frame.
+    pub fn track(self) -> Track {
+        const N: usize = 64;
+        let mut lengths = Vec::with_capacity(N + 1);
+        let mut total = 0.;
+        let mut prev = self.a;
+        for i in 0..=N {
+            let p = self.at(i as f32 / N as f32);
+            total += dist(prev, p);
+            lengths.push(total);
+            prev = p;
         }
-        self.b
+        Track { curve: self, lengths }
+    }
+}
+
+/// A conduit measured by arc length, so dots placed at equal distances move at constant speed through the bends.
+pub struct Track {
+    curve: Conduit,
+    lengths: Vec<f32>,
+}
+
+impl Track {
+    pub fn length(&self) -> f32 {
+        self.lengths.last().copied().unwrap_or(0.)
+    }
+
+    /// The point `d` px along the curve.
+    pub fn at_distance(&self, d: f32) -> (f32, f32) {
+        let d = d.clamp(0., self.length());
+        let i = self
+            .lengths
+            .partition_point(|&l| l < d)
+            .clamp(1, self.lengths.len() - 1);
+        let (l0, l1) = (self.lengths[i - 1], self.lengths[i]);
+        let k = if l1 > l0 { (d - l0) / (l1 - l0) } else { 0. };
+        let n = (self.lengths.len() - 1) as f32;
+        self.curve.at((i as f32 - 1. + k) / n)
     }
 }
 
@@ -252,7 +371,7 @@ fn p(xy: (f32, f32)) -> Point<Pixels> {
 }
 
 impl EnergyFlow {
-    fn paint(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    fn paint(&self, bounds: Bounds<Pixels>, motion: &Entity<Motion>, window: &mut Window, cx: &mut App) {
         let t = theme(cx);
         let mut font = gpui::font(t.font.clone());
         font.features = t.numbers.clone();
@@ -273,7 +392,6 @@ impl EnergyFlow {
         let (ox, oy) = (f32::from(bounds.left()), f32::from(bounds.top()));
         let g = Geometry::new(self, f32::from(bounds.size.width), f32::from(bounds.size.height));
         let shift = |(x, y): (f32, f32)| (x + ox, y + oy);
-        let elapsed = self.started.elapsed().as_secs_f64();
 
         let conduits: Vec<(Conduit, &Link)> = self
             .links
@@ -403,32 +521,58 @@ impl EnergyFlow {
             );
         }
 
-        for (c, link) in &conduits {
-            let Some(watts) = link.watts else {
+        let flowing = conduits.iter().any(|(_, l)| l.watts.is_some());
+        let animate = self.animate && flowing && !paused(cx);
+        let (clock, drifts) = motion.update(cx, |m, _| {
+            m.advance(Instant::now(), animate);
+            let clock = m.clock;
+            let mut kept = HashMap::new();
+            let drifts: Vec<Option<(Drift, String)>> = conduits
+                .iter()
+                .map(|(_, link)| {
+                    let x = level(link.watts?);
+                    let key = line_key(link);
+                    let mut d = m.lines.get(&key).copied().unwrap_or_else(|| Drift::new(clock, x));
+                    d.retarget(clock, x);
+                    kept.insert(key.clone(), d);
+                    Some((d, key))
+                })
+                .collect();
+            m.lines = kept;
+            (clock, drifts)
+        });
+        #[cfg(debug_assertions)]
+        let mut dev_travel = Vec::new();
+        for ((c, link), drift) in conduits.iter().zip(drifts) {
+            let Some((drift, key)) = drift else {
                 continue;
             };
-            let length = f64::from(c.length()).max(1.);
-            let period = (length / speed(watts)).max(0.4);
-            let f = if self.animate { (elapsed / period).fract() } else { 0.5 };
-            let r = 2.85 + (watts / 40.).clamp(0., 1.) * 1.95;
-            window.paint_quad(dot(p(c.along(f as f32)), px(r as f32), link.color.opacity(0.95)));
+            let track = c.track();
+            let len = f64::from(track.length());
+            let x = drift.level(clock);
+            let travel = drift.travel(clock);
+            #[cfg(debug_assertions)]
+            dev_travel.push(travel);
+            let density = DENSITY.0 + (DENSITY.1 - DENSITY.0) * x;
+            let r = 2.4 + 1.4 * x;
+            let seed = seed(&key);
+            let first = ((travel - len) / PITCH).ceil() as i64;
+            let last = (travel / PITCH).floor() as i64;
+            for n in first..=last {
+                let at = travel - n as f64 * PITCH;
+                let alpha = lit(n, seed, density) * smoothstep(at.min(len - at) / FADE_PX);
+                if alpha > 0.01 {
+                    let centre = p(track.at_distance(at as f32));
+                    window.paint_quad(dot(centre, px(r as f32), link.color.opacity(0.95 * alpha as f32)));
+                }
+            }
         }
-        self.next_step(window, cx);
-    }
-
-    /// Asks for the next step only from a painted diagram, so frames stop when its tab closes or the window hides,
-    /// and at most one step is due however often the screen redraws for its own reasons.
-    fn next_step(&self, window: &Window, cx: &mut App) {
-        if !self.animate || self.links.iter().all(|l| l.watts.is_none()) || paused(cx) || STEP_DUE.replace(true) {
-            return;
+        #[cfg(debug_assertions)]
+        dev::record(&dev_travel);
+        // Requested from a painted diagram only, so frames stop when its tab closes or the window hides.
+        if animate {
+            window.request_animation_frame();
         }
-        let view = window.current_view();
-        cx.spawn(async move |cx| {
-            cx.background_executor().timer(STEP).await;
-            STEP_DUE.set(false);
-            cx.update(|cx| cx.notify(view));
-        })
-        .detach();
     }
 }
 
@@ -476,14 +620,85 @@ fn battery_glyph(window: &mut Window, origin: (f32, f32), percent: f64, tint: Hs
 }
 
 impl RenderOnce for EnergyFlow {
-    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let motion = window.use_keyed_state("energy-flow-motion", cx, |_, _| Motion::default());
         div().w_full().h(HEIGHT).child(
             canvas(
                 |_, _, _| (),
-                move |bounds, (), window, cx| self.paint(bounds, window, cx),
+                move |bounds, (), window, cx| self.paint(bounds, &motion, window, cx),
             )
             .size_full(),
         )
+    }
+}
+
+/// Frame intervals and each line's dot step on stderr every 5 s while `SYSMAN_DEV_FRAMES` is set.
+#[cfg(debug_assertions)]
+mod dev {
+    use std::cell::RefCell;
+    use std::time::Instant;
+
+    struct Stats {
+        since: Instant,
+        last: Option<(Instant, Vec<f64>)>,
+        intervals: Vec<f64>,
+        steps: Vec<Vec<f64>>,
+    }
+
+    thread_local! {
+        static STATS: RefCell<Option<Stats>> = RefCell::new(std::env::var_os("SYSMAN_DEV_FRAMES").map(|_| Stats {
+            since: Instant::now(),
+            last: None,
+            intervals: Vec::new(),
+            steps: Vec::new(),
+        }));
+    }
+
+    fn mean_sd(v: &[f64]) -> (f64, f64) {
+        let n = v.len().max(1) as f64;
+        let mean = v.iter().sum::<f64>() / n;
+        (mean, (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n).sqrt())
+    }
+
+    /// `travel` is each line's distance along its path.
+    pub fn record(travel: &[f64]) {
+        STATS.with_borrow_mut(|stats| {
+            let Some(s) = stats else {
+                return;
+            };
+            let now = Instant::now();
+            if let Some((at, before)) = &s.last
+                && before.len() == travel.len()
+            {
+                s.intervals.push(now.duration_since(*at).as_secs_f64() * 1000.);
+                s.steps.resize(travel.len(), Vec::new());
+                for (i, (a, b)) in before.iter().zip(travel).enumerate() {
+                    s.steps[i].push(b - a);
+                }
+            }
+            s.last = Some((now, travel.to_vec()));
+            if s.since.elapsed().as_secs_f64() >= 5. && !s.intervals.is_empty() {
+                let (im, isd) = mean_sd(&s.intervals);
+                let imax = s.intervals.iter().copied().fold(0., f64::max);
+                let lines: Vec<String> = s
+                    .steps
+                    .iter()
+                    .map(|v| {
+                        let (m, sd) = mean_sd(v);
+                        let max = v.iter().copied().fold(0., f64::max);
+                        format!("{m:.2}±{sd:.2}({max:.1})")
+                    })
+                    .collect();
+                eprintln!(
+                    "SYSMAN_DEV_FRAMES flow: {} frames, interval {im:.1}±{isd:.1} ms (max {imax:.1}); step px mean±sd(max) per line: {}",
+                    s.intervals.len(),
+                    lines.join(" ")
+                );
+                s.since = now;
+                s.intervals.clear();
+                s.steps.clear();
+            }
+        });
     }
 }
 
@@ -501,20 +716,79 @@ mod tests {
     }
 
     #[test]
-    fn a_dot_moves_at_constant_speed_along_a_bent_line() {
-        let c = Conduit::between((0., 0.), (200., 100.));
-        let (start, end) = (c.along(0.), c.along(1.));
-        assert_eq!(start, (0., 0.));
-        assert!(dist(end, (200., 100.)) < 0.5);
-        // equal fractions cover equal distances, unlike the raw curve parameter
-        let quarter = dist(c.along(0.), c.along(0.25));
-        let next = dist(c.along(0.25), c.along(0.5));
-        assert!((quarter - next).abs() < 2., "{quarter} vs {next}");
+    fn equal_distances_along_a_bent_line_are_equal_steps_on_screen() {
+        let track = Conduit::between((0., 0.), (300., 160.)).track();
+        assert_eq!(track.at_distance(0.), (0., 0.));
+        assert!(dist(track.at_distance(track.length()), (300., 160.)) < 0.5);
+        // the raw curve parameter bunches points in the bend; 2 px steps by length must not
+        let steps: Vec<f32> = (0..track.length() as i32 / 2)
+            .map(|i| dist(track.at_distance(i as f32 * 2.), track.at_distance(i as f32 * 2. + 2.)))
+            .collect();
+        let (lo, hi) = steps
+            .iter()
+            .fold((f32::MAX, 0f32), |(lo, hi), s| (lo.min(*s), hi.max(*s)));
+        assert!(hi - lo < 0.05, "steps from {lo} to {hi}");
     }
 
     #[test]
-    fn more_watts_travel_faster_but_an_idle_line_still_moves() {
-        assert_eq!(speed(0.), 16.);
-        assert!(speed(30.) > speed(10.));
+    fn every_line_moves_within_the_calm_speed_range_however_many_watts() {
+        for w in [0., 1., 25., 450., 1e6] {
+            let s = Drift::new(0., level(w)).speed(10.);
+            assert!((SPEED.0..=SPEED.1).contains(&s), "{w} W gave {s} px/s");
+        }
+        assert!(level(300.) > level(30.), "a heavier flow still reads as more");
+    }
+
+    #[test]
+    fn a_new_reading_changes_speed_smoothly_without_moving_the_dots() {
+        let mut d = Drift::new(0., level(5.));
+        let before = d.travel(3.);
+        let speed_before = d.speed(3.);
+        d.retarget(3., level(400.));
+        assert!(
+            (d.travel(3.) - before).abs() < 1e-9,
+            "no jump in position at the update"
+        );
+        assert!(
+            (d.speed(3.) - speed_before).abs() < 1e-9,
+            "no jump in speed at the update"
+        );
+        assert!(
+            (d.level(3. + EASE_S) - level(400.)).abs() < 1e-9,
+            "settled after the ease"
+        );
+        // travel is the integral of speed through and after the ease
+        let h = 1e-4;
+        for t in [3.05, 3.2, 3.39, 3.6, 5.] {
+            let numeric = (d.travel(t + h) - d.travel(t - h)) / (2. * h);
+            assert!(
+                (numeric - d.speed(t)).abs() < 1e-3,
+                "at {t}: {numeric} vs {}",
+                d.speed(t)
+            );
+        }
+    }
+
+    #[test]
+    fn lit_slots_match_the_density_and_stay_evenly_spread() {
+        let shown: Vec<i64> = (0..1000).filter(|&n| lit(n, 0.3, 0.25) > 0.5).collect();
+        let share = shown.len() as f64 / 1000.;
+        assert!((share - 0.21).abs() < 0.03, "{share}");
+        let widest = shown.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        assert!(
+            widest as f64 <= 2. / share,
+            "no gap past twice the average: {widest} slots"
+        );
+    }
+
+    #[test]
+    fn the_clock_stands_still_across_a_pause() {
+        let mut m = Motion::default();
+        let t0 = Instant::now();
+        m.advance(t0, true);
+        m.advance(t0 + std::time::Duration::from_millis(16), true);
+        assert!((m.clock - 0.016).abs() < 1e-6);
+        m.advance(t0 + std::time::Duration::from_secs(30), true);
+        assert!(m.clock <= 0.016 + MAX_FRAME_S, "a long gap does not fling the dots on");
     }
 }

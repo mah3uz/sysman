@@ -1,7 +1,7 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
@@ -20,6 +20,7 @@ use crate::charts::flow::{End, EnergyFlow, Hub, Link, Sink, Source as FlowSource
 use crate::charts::format::Unit;
 use crate::charts::sparkline::Sparkline;
 use crate::charts::trend::{ChartState, TrendChart, YScale, clock};
+use crate::data::hardware::{Domain, domain_of};
 use crate::data::history::{Bucket, History, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::source::{Combine, Source};
@@ -31,7 +32,7 @@ use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::legend::legend;
 use crate::ui::widgets::panel::{caption_label, section};
 use crate::ui::widgets::range::{Range, range_picker, remember, remembered};
-use crate::ui::widgets::text::{caption, facts, footnote};
+use crate::ui::widgets::text::{caption, facts, footnote, proportion};
 
 const BUCKETS: u32 = 120;
 
@@ -46,6 +47,9 @@ const FLOW_CONSUMERS: usize = 5;
 const MAX_RUNTIME_MIN: f64 = 7. * 24. * 60.;
 /// Dot speed for a line whose watts are unknown; it animates the diagram, it is not a reading.
 const NOMINAL_W: f64 = 12.;
+/// A sensor whose ring has had nothing newer for this long has gone away.
+const STALE_S: f64 = 60.;
+const ROW_SPARK_HEIGHT: gpui::Pixels = px(16.);
 
 /// Which page to show: the system battery's, or the desktop's measured components.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,6 +323,90 @@ pub fn total_measured(readings: &[Option<f64>]) -> Option<(f64, usize)> {
     (!known.is_empty()).then(|| (known.iter().sum(), known.len()))
 }
 
+/// One hwmon sensor's latest value from the live rings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    pub chip: String,
+    pub kind: String,
+    pub label: String,
+    pub path: String,
+    pub value: f64,
+}
+
+/// Splits a `/hwmon/<chip>/<kind>/<label>` series path into its unescaped parts.
+pub fn hwmon_parts(path: &str) -> Option<(String, String, String)> {
+    let unescape = |s: &str| s.replace("~1", "/").replace("~0", "~");
+    let mut parts = path.strip_prefix("/hwmon/")?.split('/');
+    let (chip, kind, label) = (parts.next()?, parts.next()?, parts.next()?);
+    parts
+        .next()
+        .is_none()
+        .then(|| (unescape(chip), kind.to_owned(), unescape(label)))
+}
+
+/// The electrical readings a desktop exposes, sorted into the panel's groups.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Electrical {
+    /// Per GPU PCI slot, the voltage and power sensors of that GPU's own hwmon chip.
+    pub gpu: BTreeMap<String, Vec<Reading>>,
+    /// Motherboard controller `in` pins that read above zero.
+    pub board: Vec<Reading>,
+    /// Fans turning now.
+    pub fans: Vec<Reading>,
+    /// Fan headers reading 0 rpm: stopped or nothing connected.
+    pub idle_fans: usize,
+}
+
+/// `in2` before `in10`.
+fn natural(label: &str) -> (String, u64) {
+    let digits = label.len() - label.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let (stem, n) = label.split_at(label.len() - digits);
+    (stem.to_owned(), n.parse().unwrap_or(0))
+}
+
+pub fn electrical(readings: Vec<Reading>, gpus: &[&str]) -> Electrical {
+    let mut out = Electrical::default();
+    for r in readings {
+        let device = r.chip.split_once('/').map_or("", |(_, d)| d);
+        let gpu = gpus.iter().find(|pci| **pci == device);
+        match (r.kind.as_str(), gpu) {
+            ("in" | "power", Some(pci)) => out.gpu.entry((*pci).to_owned()).or_default().push(r),
+            ("in", None) if domain_of(&r.chip) == Domain::Board && r.value > 0. => out.board.push(r),
+            ("fan", _) if r.value > 0. => out.fans.push(r),
+            ("fan", _) => out.idle_fans += 1,
+            _ => {}
+        }
+    }
+    let order = |a: &Reading, b: &Reading| (&a.chip, natural(&a.label)).cmp(&(&b.chip, natural(&b.label)));
+    out.board.sort_by(order);
+    out.fans.sort_by(order);
+    for rails in out.gpu.values_mut() {
+        // voltages first, then the power sensor
+        rails.sort_by_key(|r| (r.kind != "in", natural(&r.label)));
+    }
+    out
+}
+
+/// The GPU chip's one power sensor, which is where the driver's power reading comes from, so it is shown once.
+/// Matching by kind rather than value keeps the label steady while two reads of a busy GPU differ.
+pub fn power_twin(rails: &[Reading], watts: Option<f64>) -> Option<&Reading> {
+    watts?;
+    let mut power = rails.iter().filter(|r| r.kind == "power");
+    match (power.next(), power.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
+}
+
+pub fn reading_value(r: &Reading) -> String {
+    match r.kind.as_str() {
+        "in" => format!("{:.3} V", r.value),
+        "power" => format!("{:.1} W", r.value),
+        "fan" => format!("{:.0} rpm", r.value),
+        _ => format!("{:.1}", r.value),
+    }
+}
+
 pub fn hours_minutes(minutes: f64) -> String {
     let m = minutes.round() as i64;
     format!("{}:{:02}", m / 60, m % 60)
@@ -350,6 +438,7 @@ struct GpuPower {
     pci: String,
     name: String,
     watts: Option<f64>,
+    limit: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +459,24 @@ struct Snapshot {
     consumers: Vec<(String, f64)>,
     /// When the power module last reported.
     checked: Option<f64>,
+    electrical: Electrical,
+}
+
+/// The hwmon sensors still reporting. Read from the live rings, since a sample omits chips read less often.
+fn readings(live: &Live, now: f64) -> Vec<Reading> {
+    live.paths()
+        .filter_map(|path| {
+            let (chip, kind, label) = hwmon_parts(path)?;
+            let &(t, value) = live.series(path)?.back()?;
+            (now - t <= STALE_S).then(|| Reading {
+                chip,
+                kind,
+                label,
+                path: path.to_owned(),
+                value,
+            })
+        })
+        .collect()
 }
 
 impl Snapshot {
@@ -382,7 +489,7 @@ impl Snapshot {
             .as_ref()
             .and_then(|m| m.modules.get("gpu")?.info.clone())
             .and_then(|info| serde_json::from_value(info).ok());
-        let gpus = sample
+        let gpus: Vec<GpuPower> = sample
             .gpu
             .as_ref()
             .map(|g| {
@@ -395,6 +502,7 @@ impl Snapshot {
                             .and_then(|m| m.devices.get(pci)?.name.clone())
                             .unwrap_or_else(|| pci.clone()),
                         watts: d.power_w,
+                        limit: d.power_limit_w,
                     })
                     .collect()
             })
@@ -426,7 +534,10 @@ impl Snapshot {
                 .filter_map(|p| live.series(p)?.back().map(|v| v.0))
                 .reduce(f64::max)
         });
+        let gpu_slots: Vec<&str> = gpus.iter().map(|g| g.pci.as_str()).collect();
+        let electrical = electrical(readings(live, sample.t), &gpu_slots);
         Self {
+            electrical,
             temp,
             cpu_w: sample.cpu.as_ref().and_then(|c| c.power_w),
             helper_rapl: sample
@@ -481,6 +592,7 @@ fn queries(layout: &Layout, snap: &Snapshot, range: Range) -> Vec<Query> {
             let mut out = vec![
                 q("charge", vec![power_path(name, "capacity")], Combine::Max, span),
                 q("draw", vec![power_path(name, "power_w")], Combine::Max, span),
+                q("voltage", vec![power_path(name, "voltage_v")], Combine::Max, span),
                 q("energy", vec![power_path(name, "energy_wh")], Combine::Max, span),
                 q(
                     "full",
@@ -519,6 +631,10 @@ fn queries(layout: &Layout, snap: &Snapshot, range: Range) -> Vec<Query> {
                 all.push(gpu_power_path(&g.pci));
             }
             out.push(q("total", all, Combine::Sum, span));
+            let e = &snap.electrical;
+            for r in e.gpu.values().flatten().chain(&e.board).chain(&e.fans) {
+                out.push(q(&r.path, vec![r.path.clone()], Combine::Max, span));
+            }
             out
         }
     }
@@ -613,11 +729,14 @@ pub struct Energy {
     version: u64,
     charts: Charts,
     sheet: Option<CardKind>,
-    started: Instant,
     /// The power module reports once a minute, so its last stored reading fills the page until then.
     last_power: Option<(f64, Power)>,
     scroll: gpui::ScrollHandle,
     dev_scroll: Option<f32>,
+    rail_scroll: gpui::ScrollHandle,
+    /// `SYSMAN_DEV_SCROLL=rail:<y>` scrolls the side rail instead of the page.
+    dev_rail: bool,
+    board_open: bool,
 }
 
 impl Energy {
@@ -639,10 +758,12 @@ impl Energy {
             version: 0,
             charts: Charts::default(),
             sheet: None,
-            started: Instant::now(),
             last_power: None,
             scroll: gpui::ScrollHandle::new(),
             dev_scroll: None,
+            rail_scroll: gpui::ScrollHandle::new(),
+            dev_rail: false,
+            board_open: true,
         };
         #[cfg(debug_assertions)]
         {
@@ -653,12 +774,13 @@ impl Energy {
                 Ok("total") => Some(CardKind::Total),
                 _ => None,
             };
-            if let Some(y) = std::env::var("SYSMAN_DEV_SCROLL")
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-            {
+            if let Some(y) = std::env::var("SYSMAN_DEV_SCROLL").ok().and_then(|v| {
+                this.dev_rail = v.starts_with("rail:");
+                v.trim_start_matches("rail:").parse::<f32>().ok()
+            }) {
                 this.dev_scroll = Some(y);
             }
+            this.board_open = std::env::var("SYSMAN_DEV_ENERGY_BOARD").as_deref() != Ok("closed");
         }
         let task = cx.background_executor().spawn(async {
             let (t, json) = History::open(&db_path()).ok()?.snapshot("power").ok()??;
@@ -713,9 +835,15 @@ impl Energy {
                     .read(cx)
                     .reload_due(*at, now, self.range.span_s() as f64, RELOAD_S)
         });
-        if stale && !self.loading {
+        let qs = queries(&layout, &snap, self.range);
+        // a sensor read less often than each sample appears after the first load
+        let unread = self
+            .stored
+            .as_ref()
+            .filter(|(r, l, _)| *r == self.range && *l == layout)
+            .is_some_and(|(_, _, s)| qs.iter().any(|q| !s.contains_key(&q.key)));
+        if (stale || unread) && !self.loading {
             self.attempt = Some((self.range, layout.clone(), now));
-            let qs = queries(&layout, &snap, self.range);
             if self.fake {
                 self.stored = Some((self.range, layout.clone(), fixture::history(&qs, now)));
             } else {
@@ -811,6 +939,22 @@ impl Energy {
         )
     }
 
+    /// A row-sized sparkline of a merged series, or `None` without history.
+    fn row_spark(&self, key: &str, colour: Hsla) -> Option<Sparkline> {
+        let (data, span, w) = self.series(key);
+        (!data.is_empty()).then(|| {
+            Sparkline::new(
+                SharedString::from(format!("energy-row-{key}")),
+                data,
+                colour,
+                span,
+                w as f64,
+                Self::gap_s(w),
+            )
+            .compact(ROW_SPARK_HEIGHT)
+        })
+    }
+
     fn chart(&self, state: &Rc<RefCell<ChartState>>, key: &str) -> TrendChart {
         let (_, span, w) = self.series(key);
         TrendChart::new(state.clone(), self.version, span, w as f64, Self::gap_s(w)).height(px(CHART_HEIGHT))
@@ -825,6 +969,43 @@ impl Energy {
 fn divider(cx: &App) -> Div {
     let t = theme(cx);
     div().h(t.hairline_width).bg(t.hairline)
+}
+
+/// Label, a tiny sparkline where there is history, and the value.
+fn reading_row(
+    label: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    colour: Hsla,
+    spark: Option<Sparkline>,
+    cx: &App,
+) -> Div {
+    let t = theme(cx);
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.))
+        .h(px(18.))
+        .text_size(t.caption)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(t.text_secondary)
+                .child(label.into()),
+        )
+        .child(div().w(px(56.)).flex_shrink_0().children(spark))
+        .child(
+            div()
+                .w(px(66.))
+                .flex_shrink_0()
+                .flex()
+                .justify_end()
+                .font_features(t.numbers.clone())
+                .text_color(colour)
+                .child(value.into()),
+        )
 }
 
 fn big_value(value: impl Into<SharedString>, cx: &App) -> Div {
@@ -1136,7 +1317,6 @@ impl Energy {
             }],
             sinks,
             links,
-            started: self.started,
             animate: true,
         };
         let mut status = Vec::new();
@@ -1204,7 +1384,6 @@ impl Energy {
             hubs,
             sinks,
             links,
-            started: self.started,
             animate: true,
         };
         let status = match (total, snap.cpu_w) {
@@ -1489,21 +1668,182 @@ impl Energy {
             (Some(p), Some(v)) if v > 0. => Some(format!("{:.2} A", p / v)),
             _ => None,
         };
-        section(IconName::Activity, "Electrical", cx).child(facts(
-            vec![
-                ("Power", s.power_w.map(|w| format!("{w:.2} W")), t.orange),
-                ("Voltage", s.voltage_v.map(|v| format!("{v:.2} V")), t.text),
-                ("Current", current, t.text),
-                (
-                    "Temperature",
-                    snap.temp.as_ref().map(|(_, c)| format!("{c:.1}°C")),
-                    t.teal,
-                ),
-                ("Energy now", s.energy_wh.map(|e| format!("{e:.1} Wh")), t.text),
-                ("Status", s.status.clone(), t.text),
-            ],
-            cx,
-        ))
+        let energy = s.energy_wh.map(|e| format!("{e:.1} Wh"));
+        let adapter = on_mains(&snap.power).map(|on| if on { "Connected" } else { "Not connected" }.to_owned());
+        let rows = [
+            (
+                "Power",
+                s.power_w.map(|w| format!("{w:.2} W")),
+                t.orange,
+                self.row_spark("draw", t.orange),
+            ),
+            (
+                "Voltage",
+                s.voltage_v.map(|v| format!("{v:.2} V")),
+                t.text,
+                self.row_spark("voltage", t.blue),
+            ),
+            ("Current", current, t.text, None),
+            (
+                "Temperature",
+                snap.temp.as_ref().map(|(_, c)| format!("{c:.1}°C")),
+                t.teal,
+                self.row_spark("temp", t.teal),
+            ),
+            ("Pack energy", energy, t.text, self.row_spark("energy", t.green)),
+            ("Status", s.status.clone(), t.text, None),
+            ("Adapter", adapter, t.text, None),
+        ];
+        section(IconName::Activity, "Electrical", cx).child(
+            div().flex().flex_col().gap(px(5.)).children(
+                rows.into_iter()
+                    .filter_map(|(label, value, colour, spark)| Some(reading_row(label, value?, colour, spark, cx))),
+            ),
+        )
+    }
+
+    /// What a machine without a battery exposes: the supply, each GPU's power against its limit and its own rails,
+    /// CPU package power, the board controller's pins and the fans.
+    fn desktop_electrical(&self, snap: &Snapshot, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme(cx);
+        let e = &snap.electrical;
+        let (text, orange, purple, green, blue) = (t.text, t.orange, t.purple, t.green, t.blue);
+        let watts = |w: Option<f64>| w.map_or("–".into(), |w| format!("{w:.1} W"));
+        let group = |label: String, cx: &App| {
+            div()
+                .text_size(theme(cx).caption)
+                .font_weight(FontWeight::SEMIBOLD)
+                .truncate()
+                .child(label)
+        };
+        let rows = |gap: f32| div().flex().flex_col().gap(px(gap));
+        let (ac, ac_colour) = match on_mains(&snap.power) {
+            Some(false) => ("Offline", orange),
+            _ => ("Online", green),
+        };
+        let mut p =
+            section(IconName::Activity, "Electrical", cx).child(reading_row("AC power", ac, ac_colour, None, cx));
+        for (i, g) in snap.gpus.iter().enumerate() {
+            let colour = if i == 0 { orange } else { purple };
+            let rails = e.gpu.get(&g.pci).map_or(&[][..], Vec::as_slice);
+            let twin = power_twin(rails, g.watts);
+            let power_label = twin.map_or("Board power".to_owned(), |r| format!("Package power ({})", r.label));
+            let mut block = rows(5.).child(group(g.name.clone(), cx)).child(reading_row(
+                power_label,
+                watts(g.watts),
+                text,
+                self.row_spark(&format!("gpu:{}", g.pci), colour),
+                cx,
+            ));
+            if let (Some(w), Some(limit)) = (g.watts, g.limit.filter(|l| *l > 0.)) {
+                block = block
+                    .child(reading_row("Power limit", format!("{limit:.0} W"), text, None, cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().flex_1().child(proportion(w / limit, colour, cx)))
+                            .child(
+                                caption(format!("{:.0}% of limit", w / limit * 100.), cx)
+                                    .font_features(t.numbers.clone()),
+                            ),
+                    );
+            }
+            for r in rails.iter().filter(|r| twin.is_none_or(|t| t.path != r.path)) {
+                block = block.child(reading_row(
+                    r.label.clone(),
+                    reading_value(r),
+                    text,
+                    self.row_spark(&r.path, colour),
+                    cx,
+                ));
+            }
+            p = p.child(divider(cx)).child(block);
+        }
+        let cpu = rows(5.).child(group("CPU".into(), cx));
+        let cpu = match snap.cpu_power() {
+            CpuPower::Measured => cpu.child(reading_row(
+                "Package power",
+                watts(snap.cpu_w),
+                text,
+                self.row_spark("cpu", green),
+                cx,
+            )),
+            CpuPower::NeedsHelper => cpu.child(helper_hint(
+                "energy-electrical-enable",
+                "Package power needs the privileged helper",
+                cx,
+            )),
+            CpuPower::Unsupported => cpu.child(caption("This CPU has no readable power counter.", cx)),
+        };
+        p = p.child(divider(cx)).child(cpu);
+        if let Some(first) = e.board.first() {
+            let chip = first.chip.split('/').next().unwrap_or(&first.chip).to_owned();
+            let open = self.board_open;
+            let mut block = rows(5.).child(
+                div()
+                    .id("energy-board-toggle")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.board_open = !this.board_open;
+                        cx.notify();
+                    }))
+                    .child(group("Board voltage pins".into(), cx))
+                    .child(div().flex_1())
+                    .child(caption(format!("{} · {}", chip, e.board.len()), cx))
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .xsmall()
+                        .text_color(t.text_secondary),
+                    ),
+            );
+            if open {
+                block = block
+                    .child(caption(
+                        "Raw pin readings, unscaled: the board's voltage dividers are not applied, so these are not the rails' real voltages.",
+                        cx,
+                    ))
+                    .children(e.board.iter().map(|r| {
+                        reading_row(r.label.clone(), reading_value(r), text, self.row_spark(&r.path, blue), cx)
+                    }));
+            }
+            p = p.child(divider(cx)).child(block);
+        }
+        if !e.fans.is_empty() || e.idle_fans > 0 {
+            let block = rows(5.)
+                .child(group("Fans".into(), cx))
+                .children(e.fans.iter().map(|r| {
+                    reading_row(
+                        r.label.clone(),
+                        reading_value(r),
+                        text,
+                        self.row_spark(&r.path, t.teal),
+                        cx,
+                    )
+                }))
+                .when(e.idle_fans > 0, |d| {
+                    let n = e.idle_fans;
+                    d.child(caption(
+                        format!(
+                            "{n} more {} 0 rpm: stopped or not connected.",
+                            if n == 1 { "header reads" } else { "headers read" }
+                        ),
+                        cx,
+                    ))
+                });
+            p = p.child(divider(cx)).child(block);
+        }
+        p
     }
 
     fn sheet(&self, kind: CardKind, snap: &Snapshot, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1708,11 +2048,11 @@ fn short_gpu(name: &str) -> String {
 
 impl Render for Energy {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let handle = if self.dev_rail { &self.rail_scroll } else { &self.scroll };
         if let Some(y) = self.dev_scroll
-            && self.scroll.max_offset().y > px(0.)
+            && handle.max_offset().y > px(0.)
         {
-            self.scroll
-                .set_offset(gpui::point(px(0.), -px(y).min(self.scroll.max_offset().y)));
+            handle.set_offset(gpui::point(px(0.), -px(y).min(handle.max_offset().y)));
             self.dev_scroll = None;
         }
         let snap = self.snapshot(cx);
@@ -1748,6 +2088,8 @@ impl Render for Energy {
             None => self.desktop_cards(&snap, cx).into_any_element(),
         };
         let sheet = self.sheet.map(|k| self.sheet(k, &snap, cx).into_any_element());
+        let desktop_electrical = (battery.is_none() && self.live.read(cx).latest.is_some())
+            .then(|| self.desktop_electrical(&snap, cx).into_any_element());
         let cx: &App = cx;
         let t = theme(cx);
         let waiting = self.live.read(cx).latest.is_none();
@@ -1780,7 +2122,8 @@ impl Render for Energy {
             .when_some(battery.as_ref(), |r, s| {
                 r.child(self.health_panel(s, cx))
                     .child(self.electrical_panel(s, &snap, cx))
-            });
+            })
+            .children(desktop_electrical);
         div()
             .relative()
             .size_full()
@@ -1803,6 +2146,7 @@ impl Render for Energy {
                     .w(t.rail_width + t.gap + t.page_padding)
                     .h_full()
                     .overflow_y_scroll()
+                    .track_scroll(&self.rail_scroll)
                     .child(div().pl(t.gap).pr(t.page_padding).py(t.page_padding).child(rail)),
             )
             .children(sheet)
@@ -1906,6 +2250,7 @@ mod fixture {
                     let v = match q.key.as_str() {
                         "charge" => Some(charge),
                         "draw" => Some(9.6 + 2.2 * wave + if (t / w) % 17 == 0 { 6. } else { 0. }),
+                        "voltage" => Some(11.87 + 0.9 * (charge - 62.) / 38. + 0.02 * wave),
                         "energy" => Some(charge / 100. * 52.),
                         "temp" => Some(TEMP_C - 1.2 * age + 0.3 * wave),
                         "full" => Some(52.0 + 0.8 * age),
@@ -2100,11 +2445,13 @@ mod tests {
                     pci: "0000:01:00.0".into(),
                     name: "NVIDIA GeForce RTX 4090".into(),
                     watts: Some(19.),
+                    limit: None,
                 },
                 GpuPower {
                     pci: "0000:7a:00.0".into(),
                     name: "AMD Radeon Graphics".into(),
                     watts: Some(30.),
+                    limit: None,
                 },
             ],
             ..Snapshot::default()
@@ -2121,6 +2468,99 @@ mod tests {
         assert_eq!(total.source.combine, Combine::Sum);
         assert_eq!(total.source.paths.len(), 3);
         assert_eq!(short_gpu("NVIDIA GeForce RTX 4090"), "RTX 4090");
+    }
+
+    fn reading(path: &str, value: f64) -> Reading {
+        let (chip, kind, label) = hwmon_parts(path).unwrap();
+        Reading {
+            chip,
+            kind,
+            label,
+            path: path.into(),
+            value,
+        }
+    }
+
+    #[test]
+    fn hwmon_paths_unescape_slashes_in_chip_and_label() {
+        assert_eq!(
+            hwmon_parts("/hwmon/nct6799~1nct6775.656/temp/PECI~1TSI Agent 0 Calibration"),
+            Some((
+                "nct6799/nct6775.656".into(),
+                "temp".into(),
+                "PECI/TSI Agent 0 Calibration".into()
+            ))
+        );
+        assert_eq!(hwmon_parts("/gpu/devices/x/power_w"), None);
+        assert_eq!(
+            hwmon_parts("/hwmon/a/b"),
+            None,
+            "a path without a label is not a sensor"
+        );
+    }
+
+    #[test]
+    fn readings_sort_into_gpu_rails_board_pins_and_fans() {
+        // this desktop: an amdgpu iGPU, an nct6799 Super I/O and an EC fan header at 0 rpm
+        let e = electrical(
+            vec![
+                reading("/hwmon/amdgpu~10000:7a:00.0/power/PPT", 37.9),
+                reading("/hwmon/amdgpu~10000:7a:00.0/in/vddnb", 0.905),
+                reading("/hwmon/amdgpu~10000:7a:00.0/in/vddgfx", 0.995),
+                reading("/hwmon/amdgpu~10000:7a:00.0/temp/edge", 45.),
+                reading("/hwmon/nct6799~1nct6775.656/in/in10", 1.056),
+                reading("/hwmon/nct6799~1nct6775.656/in/in2", 3.392),
+                reading("/hwmon/nct6799~1nct6775.656/in/in9", 0.),
+                reading("/hwmon/nct6799~1nct6775.656/fan/fan7", 3161.),
+                reading("/hwmon/nct6799~1nct6775.656/fan/fan1", 0.),
+                reading("/hwmon/asusec~1asus-ec-sensors/fan/CPU_Opt", 0.),
+                reading("/hwmon/nvme~1nvme0/temp/Composite", 40.),
+            ],
+            &["0000:7a:00.0", "0000:01:00.0"],
+        );
+        let labels = |v: &[Reading]| v.iter().map(|r| r.label.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            labels(&e.gpu["0000:7a:00.0"]),
+            ["vddgfx", "vddnb", "PPT"],
+            "the GPU's own rails, voltages before power, temperatures elsewhere"
+        );
+        assert_eq!(
+            labels(&e.board),
+            ["in2", "in10"],
+            "a pin reading 0 V is unconnected, and in2 sorts before in10"
+        );
+        assert_eq!(labels(&e.fans), ["fan7"]);
+        assert_eq!(e.idle_fans, 2, "headers at 0 rpm are counted, not listed");
+    }
+
+    #[test]
+    fn the_igpu_power_sensor_is_shown_once_as_the_package_power() {
+        let rails = [
+            reading("/hwmon/amdgpu~10000:7a:00.0/in/vddgfx", 0.995),
+            reading("/hwmon/amdgpu~10000:7a:00.0/power/PPT", 37.9),
+        ];
+        assert_eq!(power_twin(&rails, Some(38.4)).map(|r| r.label.as_str()), Some("PPT"));
+        assert_eq!(
+            power_twin(&rails, None),
+            None,
+            "without the driver's reading the sensor has its own row"
+        );
+        assert_eq!(reading_value(&rails[0]), "0.995 V");
+        assert_eq!(reading_value(&rails[1]), "37.9 W");
+    }
+
+    #[test]
+    fn desktop_queries_cover_each_sensor_row_for_its_sparkline() {
+        let snap = Snapshot {
+            electrical: electrical(vec![reading("/hwmon/nct6799~1nct6775.656/in/in2", 3.392)], &[]),
+            ..Snapshot::default()
+        };
+        let qs = queries(&Layout::Desktop, &snap, Range::M30);
+        let pin = qs
+            .iter()
+            .find(|q| q.key == "/hwmon/nct6799~1nct6775.656/in/in2")
+            .unwrap();
+        assert_eq!(pin.source.paths, ["/hwmon/nct6799~1nct6775.656/in/in2"]);
     }
 
     #[test]
