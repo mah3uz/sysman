@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
@@ -27,9 +27,11 @@ use crate::data::source::{Combine, Source, matching};
 use crate::ui::shell::Tab;
 use crate::ui::theme::{Theme, theme};
 use crate::ui::widgets::card::metric_card;
+use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
 use crate::ui::widgets::legend::legend;
-use crate::ui::widgets::panel::{caption_label, panel};
+use crate::ui::widgets::panel::{caption_label, panel, section};
 use crate::ui::widgets::range::{Range, range_picker, remember, remembered};
+use crate::ui::widgets::text::caption;
 
 const BUCKETS: u32 = 120;
 /// Stored history is re-read this often; the live rings cover the newest 30 minutes in between.
@@ -114,6 +116,84 @@ impl Metric {
         }
     }
 
+    /// What the metric means, then how it is calculated, for its detail sheet.
+    fn explanation(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Pressure => (
+                "How hard the kernel is working to find memory, from 0 to 100. Near zero, memory is plentiful. A \
+                 sustained rise past Warning means tasks are stalling while pages are reclaimed or read back from \
+                 swap, which is felt as stutter and slow app switching. A nonzero swap balance alone does not raise it.",
+                "From the kernel's pressure stall information: the share of the last 10 seconds in which at least \
+                 one task waited for memory (/proc/pressure/memory, some avg10). 0% maps to 0, 5% to 34 (Warning), \
+                 20% to 67 (Critical) and 50% or more to 100, linearly in between. While more than 1 MB/s is being \
+                 swapped in, the index is held at Warning or above.",
+            ),
+            Self::Cpu => (
+                "The share of all logical CPUs that was busy. Short spikes are normal; a long run near 100% means \
+                 work is queueing for the processor. Compare it with the load average, which also counts tasks \
+                 waiting to run.",
+                "From /proc/stat: the change in busy time across all CPUs between two samples, divided by the change \
+                 in total time. Busy is everything except idle and I/O wait, so 0-100% covers the whole machine.",
+            ),
+            Self::NetDown | Self::NetUp => (
+                "Bytes received and sent per second over all network interfaces except loopback. Virtual interfaces \
+                 such as bridges and VPN tunnels count too, so traffic that crosses one can appear twice.",
+                "From /proc/net/dev: the change in each interface's receive and transmit byte counters between two \
+                 samples, divided by the time between them, then summed across interfaces.",
+            ),
+            Self::DiskRead | Self::DiskWrite => (
+                "Bytes read from and written to the physical disks per second. Partitions, device-mapper and RAID \
+                 layers are left out, since their traffic is already counted on the disks beneath; loop, RAM and \
+                 zram devices are not disk I/O.",
+                "From /proc/diskstats: the change in sectors read and written by each whole disk between two \
+                 samples, times 512 bytes, divided by the time between them, then summed.",
+            ),
+            Self::Swap => (
+                "Memory the kernel has moved out of RAM to make room, onto zram or a swap partition or file. A \
+                 balance that sits still is harmless; what matters is swapping in and out while pressure is high.",
+                "SwapTotal minus SwapFree from /proc/meminfo, across every active swap device. For zram this is the \
+                 uncompressed size of the swapped pages, not the RAM they occupy.",
+            ),
+            Self::CpuTemp | Self::GpuTemp => (
+                "Processor and graphics temperatures. Sustained readings near the chip's limit make it lower its \
+                 clocks to protect itself, which costs performance. The GPU line is the hottest GPU when there is \
+                 more than one.",
+                "Read from the hardware monitoring sensors in /sys/class/hwmon: the CPU package sensor (coretemp or \
+                 k10temp) and each GPU's own sensor as its driver reports it, in degrees Celsius.",
+            ),
+            Self::Available => (
+                "How much memory could be given to new work right now without swapping: free memory plus cache and \
+                 reclaimable kernel memory that can be dropped. It is the best single number for headroom.",
+                "MemAvailable from /proc/meminfo, the kernel's own estimate. It accounts for the low watermarks and \
+                 for cache that must stay resident, so it is less than free plus cached.",
+            ),
+            Self::App => (
+                "Memory that programs have allocated for their own data: heaps, stacks and other anonymous mappings. \
+                 It cannot be dropped, only swapped out, so a steady climb with no matching workload can be a leak.",
+                "AnonPages from /proc/meminfo: anonymous pages mapped into user processes. Shared memory and tmpfs \
+                 are counted under cache by the kernel, so they are not included.",
+            ),
+            Self::Cached => (
+                "File contents the kernel keeps in RAM so they need not be read again. Cache is given back as soon \
+                 as programs need the memory, so a large figure is a sign of a well-used machine, not a shortage.",
+                "Cached plus Buffers plus SReclaimable, minus Shmem, from /proc/meminfo: page cache, block buffers \
+                 and reclaimable kernel caches, less shared memory that cannot simply be dropped.",
+            ),
+            Self::Compressed => (
+                "RAM used by zram to hold compressed swapped-out pages. Each page swapped to zram costs only its \
+                 compressed size, so memory stretches further at the cost of some CPU time.",
+                "The compressed size of the stored data, compr_data_size in each zram device's mm_stat in \
+                 /sys/block, summed over all zram devices.",
+            ),
+            Self::Kernel => (
+                "Memory the kernel uses for itself: object caches, the stacks of every thread and the page tables \
+                 that map process memory. It grows with the number of processes, open files and network buffers.",
+                "Slab plus KernelStack plus PageTables from /proc/meminfo. Part of the slab is reclaimable and is \
+                 also shown in the cache figure.",
+            ),
+        }
+    }
+
     fn module(self) -> &'static str {
         match self {
             Self::Pressure => "pressure",
@@ -179,6 +259,7 @@ struct Charts {
 }
 
 pub struct Dashboard {
+    me: WeakEntity<Self>,
     live: Entity<Live>,
     feed: Entity<ProcessFeed>,
     range: Range,
@@ -193,6 +274,9 @@ pub struct Dashboard {
     version: u64,
     charts: Charts,
     cpu_meta: Option<CpuMeta>,
+    /// A sheet to open once history has loaded, for off-screen captures.
+    #[cfg(debug_assertions)]
+    dev_sheet: Option<Metric>,
 }
 
 fn wall_clock() -> f64 {
@@ -206,6 +290,7 @@ impl Dashboard {
         cx.observe(&live, |this, _, cx| this.refresh(cx)).detach();
         cx.observe(&feed, |_, _, cx| cx.notify()).detach();
         let mut this = Self {
+            me: cx.weak_entity(),
             live,
             feed,
             range: remembered(Tab::Dashboard, cx),
@@ -219,6 +304,12 @@ impl Dashboard {
             version: 0,
             charts: Charts::default(),
             cpu_meta: None,
+            #[cfg(debug_assertions)]
+            dev_sheet: std::env::var("SYSMAN_DEV_SHEET").ok().and_then(|name| {
+                Metric::ALL
+                    .into_iter()
+                    .find(|m| format!("{m:?}").eq_ignore_ascii_case(&name))
+            }),
         };
         this.refresh(cx);
         this
@@ -443,14 +534,6 @@ pub(crate) fn readout(
         )
 }
 
-pub(crate) fn caption(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
-    let t = theme(cx);
-    div()
-        .text_size(t.small_caption)
-        .text_color(t.text_secondary)
-        .child(text.into())
-}
-
 pub(crate) fn top_list(rows: Vec<(String, String)>, empty: &'static str, cx: &App) -> AnyElement {
     let t = theme(cx);
     if rows.is_empty() {
@@ -596,63 +679,228 @@ impl Dashboard {
             .flex()
             .flex_row()
             .gap(px(10.))
-            .child(metric_card(
-                "card-pressure",
-                "Pressure",
-                pressure_colour,
-                index.map_or("–".into(), |i| format!("{i:.0}%")),
-                fixed(self.spark(Metric::Pressure, pressure_colour, cx), 100., "100%"),
-                cx,
-            ))
-            .child(metric_card(
-                "card-available",
-                "Available",
-                t.green,
-                value(memory.map(|m| m.available_bytes)),
-                fixed(self.spark(Metric::Available, t.green, cx), total, &total_label),
-                cx,
-            ))
-            .child(metric_card(
-                "card-app",
-                "App",
-                t.blue,
-                value(memory.and_then(|m| m.anon_bytes)),
-                fixed(self.spark(Metric::App, t.blue, cx), total, &total_label),
-                cx,
-            ))
-            .child(metric_card(
-                "card-cached",
-                "Cached",
-                t.teal,
-                value(memory.and_then(|m| m.cache_bytes)),
-                fixed(self.spark(Metric::Cached, t.teal, cx), total, &total_label),
-                cx,
-            ))
-            .child(metric_card(
-                "card-fourth",
-                fourth_label,
-                fourth_colour,
-                value(fourth_value),
-                fixed(self.spark(fourth_metric, fourth_colour, cx), total, &total_label),
-                cx,
-            ))
-            .child(metric_card(
-                "card-swap",
+            .child(
+                metric_card(
+                    "card-pressure",
+                    "Pressure",
+                    pressure_colour,
+                    index.map_or("–".into(), |i| format!("{i:.0}%")),
+                    fixed(self.spark(Metric::Pressure, pressure_colour, cx), 100., "100%"),
+                    cx,
+                )
+                .on_click(self.expand(Metric::Pressure)),
+            )
+            .child(
+                metric_card(
+                    "card-available",
+                    "Available",
+                    t.green,
+                    value(memory.map(|m| m.available_bytes)),
+                    fixed(self.spark(Metric::Available, t.green, cx), total, &total_label),
+                    cx,
+                )
+                .on_click(self.expand(Metric::Available)),
+            )
+            .child(
+                metric_card(
+                    "card-app",
+                    "App",
+                    t.blue,
+                    value(memory.and_then(|m| m.anon_bytes)),
+                    fixed(self.spark(Metric::App, t.blue, cx), total, &total_label),
+                    cx,
+                )
+                .on_click(self.expand(Metric::App)),
+            )
+            .child(
+                metric_card(
+                    "card-cached",
+                    "Cached",
+                    t.teal,
+                    value(memory.and_then(|m| m.cache_bytes)),
+                    fixed(self.spark(Metric::Cached, t.teal, cx), total, &total_label),
+                    cx,
+                )
+                .on_click(self.expand(Metric::Cached)),
+            )
+            .child(
+                metric_card(
+                    "card-fourth",
+                    fourth_label,
+                    fourth_colour,
+                    value(fourth_value),
+                    fixed(self.spark(fourth_metric, fourth_colour, cx), total, &total_label),
+                    cx,
+                )
+                .on_click(self.expand(fourth_metric)),
+            )
+            .child(
+                metric_card(
+                    "card-swap",
+                    "Swap",
+                    t.indigo,
+                    value(memory.map(|m| m.swap_used_bytes)),
+                    fixed(
+                        self.spark(Metric::Swap, t.indigo, cx),
+                        swap_total.max(1.),
+                        &bytes(swap_total),
+                    ),
+                    cx,
+                )
+                .on_click(self.expand(Metric::Swap)),
+            )
+    }
+
+    fn expand(&self, metric: Metric) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        opener(self.me.clone(), metric, |this, metric, cx| {
+            Some(this.detail(*metric, cx))
+        })
+    }
+
+    /// The sheet behind a card or panel; a panel of two lines opens from either of its metrics.
+    fn detail(&self, metric: Metric, cx: &App) -> Detail {
+        let t = theme(cx);
+        let live = self.live.read(cx);
+        let known: Vec<&str> = self
+            .stored
+            .as_ref()
+            .map(|s| s.known.iter().map(String::as_str).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .chain(live.paths())
+            .collect();
+        let line = |m: Metric, label: &str, color: Hsla| Series {
+            label: label.to_owned().into(),
+            color,
+            source: m.source(known.iter().copied()),
+        };
+        let memory = live.latest.as_ref().and_then(|s| s.memory.as_ref());
+        let total = memory.map_or(0., |m| m.total_bytes as f64);
+        let swap_total = memory.map_or(0., |m| m.swap_total_bytes as f64);
+        let of = |max: f64| {
+            if max > 0. { YScale::Fixed(0., max) } else { YScale::Zero }
+        };
+        let (title, icon, unit, y, lines, rules): (&str, IconName, Unit, YScale, Vec<Series>, Vec<_>) = match metric {
+            Metric::Pressure => (
+                "Memory pressure",
+                IconName::Gauge,
+                Unit::Index,
+                YScale::Fixed(0., 100.),
+                vec![line(Metric::Pressure, "Pressure", t.orange)],
+                vec![
+                    (WARNING, "Warning".into(), t.orange),
+                    (CRITICAL, "Critical".into(), t.red),
+                ],
+            ),
+            Metric::Cpu => (
+                "Processor",
+                IconName::Cpu,
+                Unit::Percent,
+                YScale::Fixed(0., 100.),
+                vec![line(Metric::Cpu, "CPU", t.green)],
+                vec![(60., "Busy".into(), t.orange), (85., "Heavy".into(), t.red)],
+            ),
+            Metric::NetDown | Metric::NetUp => (
+                "Network",
+                IconName::Globe,
+                Unit::BytesPerSec,
+                YScale::Zero,
+                vec![
+                    line(Metric::NetDown, "Download", t.green),
+                    line(Metric::NetUp, "Upload", t.red),
+                ],
+                vec![],
+            ),
+            Metric::DiskRead | Metric::DiskWrite => (
+                "Disk",
+                IconName::HardDrive,
+                Unit::BytesPerSec,
+                YScale::Zero,
+                vec![
+                    line(Metric::DiskRead, "Read", t.blue),
+                    line(Metric::DiskWrite, "Write", t.orange),
+                ],
+                vec![],
+            ),
+            Metric::CpuTemp | Metric::GpuTemp => (
+                "Thermals",
+                IconName::Thermometer,
+                Unit::Celsius,
+                YScale::Fit(10.),
+                vec![
+                    line(Metric::CpuTemp, "CPU", t.orange),
+                    line(Metric::GpuTemp, "GPU", t.red),
+                ],
+                vec![],
+            ),
+            Metric::Swap => (
                 "Swap",
-                t.indigo,
-                value(memory.map(|m| m.swap_used_bytes)),
-                fixed(
-                    self.spark(Metric::Swap, t.indigo, cx),
-                    swap_total.max(1.),
-                    &bytes(swap_total),
-                ),
-                cx,
-            ))
+                IconName::Database,
+                Unit::Bytes,
+                of(swap_total),
+                vec![line(Metric::Swap, "Swap", t.indigo)],
+                vec![],
+            ),
+            Metric::Available => (
+                "Available",
+                IconName::MemoryStick,
+                Unit::Bytes,
+                of(total),
+                vec![line(Metric::Available, "Available", t.green)],
+                vec![],
+            ),
+            Metric::App => (
+                "App memory",
+                IconName::MemoryStick,
+                Unit::Bytes,
+                of(total),
+                vec![line(Metric::App, "App", t.blue)],
+                vec![],
+            ),
+            Metric::Cached => (
+                "Cached",
+                IconName::MemoryStick,
+                Unit::Bytes,
+                of(total),
+                vec![line(Metric::Cached, "Cached", t.teal)],
+                vec![],
+            ),
+            Metric::Compressed => (
+                "Compressed",
+                IconName::MemoryStick,
+                Unit::Bytes,
+                of(total),
+                vec![line(Metric::Compressed, "Compressed", t.orange)],
+                vec![],
+            ),
+            Metric::Kernel => (
+                "Kernel memory",
+                IconName::MemoryStick,
+                Unit::Bytes,
+                of(total),
+                vec![line(Metric::Kernel, "Kernel", t.purple)],
+                vec![],
+            ),
+        };
+        let (meaning, method) = metric.explanation();
+        Detail {
+            title: title.into(),
+            icon,
+            unit,
+            y,
+            fill: !matches!(unit, Unit::Index | Unit::Percent | Unit::Celsius),
+            lines,
+            rules,
+            meaning,
+            method,
+            range: self.range,
+            live: self.live.clone(),
+        }
     }
 
     fn pressure_panel(&self, cx: &App) -> impl IntoElement {
         let t = theme(cx);
-        panel(IconName::Gauge, "Memory pressure", cx)
+        panel(IconName::Gauge, "Memory pressure", self.expand(Metric::Pressure), cx)
             .child(
                 self.chart(&self.charts.pressure, Metric::Pressure, cx)
                     .line(self.data(Metric::Pressure), t.orange, "Pressure")
@@ -702,7 +950,7 @@ impl Dashboard {
             )
             .into_any_element(),
         );
-        panel(IconName::Cpu, "Processor", cx)
+        panel(IconName::Cpu, "Processor", self.expand(Metric::Cpu), cx)
             .child(
                 self.chart(&self.charts.cpu, Metric::Cpu, cx)
                     .line(self.data(Metric::Cpu), t.green, "CPU")
@@ -736,7 +984,7 @@ impl Dashboard {
         for (metric, label, colour, _, _) in &lines {
             chart = chart.line(self.data(*metric), *colour, label.to_string());
         }
-        panel(icon, title.to_owned(), cx)
+        panel(icon, title.to_owned(), self.expand(lines[0].0), cx)
             .child(div().flex().flex_row().gap(px(28.)).children(lines.iter().map(
                 |(_, label, colour, arrow, value)| {
                     readout(
@@ -864,7 +1112,7 @@ impl Dashboard {
             .flex_col()
             .gap(t.gap)
             .child(
-                panel(IconName::Cpu, "CPU cores", cx)
+                section(IconName::Cpu, "CPU cores", cx)
                     .child(core_bars(bars, px(48.), cx))
                     .child(group_legend)
                     .child(caption(
@@ -873,7 +1121,7 @@ impl Dashboard {
                     )),
             )
             .child(
-                panel(IconName::ChartColumnStacked, "Memory composition", cx)
+                section(IconName::ChartColumnStacked, "Memory composition", cx)
                     .children(composition)
                     .child(caption(
                         "Current RAM breakdown, not a range average. Hover a segment for exact values.",
@@ -881,7 +1129,7 @@ impl Dashboard {
                     )),
             )
             .child(
-                panel(IconName::Database, "Swap", cx)
+                panel(IconName::Database, "Swap", self.expand(Metric::Swap), cx)
                     .child(
                         self.chart(&self.charts.swap, Metric::Swap, cx)
                             .line(self.data(Metric::Swap), t.indigo, "Swap")
@@ -902,7 +1150,7 @@ impl Dashboard {
                     )),
             )
             .child(
-                panel(IconName::Thermometer, "Thermals", cx)
+                panel(IconName::Thermometer, "Thermals", self.expand(Metric::CpuTemp), cx)
                     .child(
                         self.chart(&self.charts.thermals, Metric::CpuTemp, cx)
                             .line(self.data(Metric::CpuTemp), t.orange, "CPU")
@@ -913,13 +1161,24 @@ impl Dashboard {
                     )
                     .child(legend(self.width_s, cx)),
             )
-            .child(panel(IconName::Activity, "Top CPU", cx).child(top_list(top_cpu, "No processes reported", cx)))
-            .child(panel(IconName::HardDrive, "Top disk", cx).child(top_list(top_disk, "No disk activity", cx)))
+            .child(section(IconName::Activity, "Top CPU", cx).child(top_list(top_cpu, "No processes reported", cx)))
+            .child(section(IconName::HardDrive, "Top disk", cx).child(top_list(top_disk, "No disk activity", cx)))
     }
 }
 
 impl Render for Dashboard {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(debug_assertions)]
+        if self.stored.is_some()
+            && let Some(metric) = self.dev_sheet.take()
+        {
+            let detail = self.detail(metric, cx);
+            window.defer(cx, move |window, cx| {
+                crate::ui::widgets::detail_sheet::open(detail, window, cx)
+            });
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = window;
         let sample = self.live.read(cx).latest.clone();
         let sample = sample.as_ref();
         let (net_down, net_up) = sample.and_then(|s| s.net.as_ref()).map_or((0., 0.), |net| {

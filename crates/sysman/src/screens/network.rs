@@ -25,14 +25,17 @@ use crate::data::live::Live;
 use crate::data::net::{self, Kind, counted, primary_route, retransmits_high, signal_quality, split_addresses};
 use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source, matching};
-use crate::screens::processes::{Icons, process_icon};
+use crate::screens::processes::Icons;
 use crate::ui::shell::Tab;
 use crate::ui::theme::theme;
+use crate::ui::widgets::app_icon::app_icon;
+use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
 use crate::ui::widgets::hairline;
 use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::legend::legend;
-use crate::ui::widgets::panel::{caption_label, panel};
+use crate::ui::widgets::panel::{caption_label, panel, section};
 use crate::ui::widgets::range::{Range, range_picker, remember, remembered};
+use crate::ui::widgets::text::{caption, key_value};
 
 const BUCKETS: u32 = 120;
 /// Stored history is re-read this often; the live rings cover the newest 30 minutes in between.
@@ -131,6 +134,7 @@ struct Charts {
 }
 
 pub struct Network {
+    me: WeakEntity<Self>,
     live: Entity<Live>,
     feed: Entity<ProcessFeed>,
     icons_requested: bool,
@@ -159,6 +163,7 @@ impl Network {
         cx.observe(&live, |this, _, cx| this.refresh(cx)).detach();
         cx.observe(&feed, |_, _, cx| cx.notify()).detach();
         let mut this = Self {
+            me: cx.weak_entity(),
             live,
             feed,
             icons_requested: false,
@@ -317,14 +322,6 @@ fn per_sec(v: Option<f64>) -> String {
     v.map_or("–".into(), |v| format!("{v:.0}/s"))
 }
 
-fn caption(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
-    let t = theme(cx);
-    div()
-        .text_size(t.small_caption)
-        .text_color(t.text_secondary)
-        .child(text.into())
-}
-
 fn badge(text: &'static str, color: Hsla, cx: &App) -> impl IntoElement {
     let t = theme(cx);
     div()
@@ -379,33 +376,6 @@ fn stat(label: &str, value: String, color: Hsla, cx: &App) -> impl IntoElement +
                 .text_color(color)
                 .child(value),
         )
-}
-
-fn key_value(label: &str, value: impl Into<SharedString>, cx: &App) -> AnyElement {
-    let t = theme(cx);
-    div()
-        .flex()
-        .flex_row()
-        .gap(px(16.))
-        .py(px(6.))
-        .text_size(t.panel_title)
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_color(t.text_secondary)
-                .child(label.to_owned()),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .justify_end()
-                .text_right()
-                .font_features(t.numbers.clone())
-                .child(value.into()),
-        )
-        .into_any_element()
 }
 
 /// One adapter as the screen shows it, joined from the live counters and the configuration snapshot.
@@ -533,7 +503,7 @@ impl Network {
                 bytes(tx as f64)
             )
         });
-        panel(IconName::ChartLine, "Throughput", cx)
+        panel(IconName::ChartLine, "Throughput", self.expand(Key::Down), cx)
             .child(
                 self.chart(&self.charts.throughput)
                     .line(self.data(&Key::Down), t.green, "Download")
@@ -605,7 +575,7 @@ impl Network {
                             .flex_row()
                             .items_center()
                             .gap(px(8.))
-                            .child(process_icon(p, &icons, 16., cx))
+                            .child(app_icon(&p.comm, &p.cmdline, &icons, 16., cx))
                             .child(
                                 div()
                                     .flex_1()
@@ -625,7 +595,7 @@ impl Network {
                 caption("TCP and UDP bytes per process, loopback excluded.", cx).into_any_element(),
             ]
         };
-        panel(IconName::AppWindow, "Per-app traffic", cx).children(body)
+        section(IconName::AppWindow, "Per-app traffic", cx).children(body)
     }
 
     fn adapters_panel(&self, sample: Option<&Sample>, this: &WeakEntity<Self>, cx: &App) -> impl IntoElement {
@@ -641,7 +611,7 @@ impl Network {
             .map(|(i, a)| self.adapter_row(i, a, i + 1 < count, this.clone(), cx))
             .collect();
         let empty = rows.is_empty();
-        panel(IconName::Network, "Adapters", cx)
+        section(IconName::Network, "Adapters", cx)
             .child(div().flex().flex_col().children(rows))
             .child(caption(
                 if empty {
@@ -831,6 +801,93 @@ impl Network {
             .into_any_element()
     }
 
+    fn expand(&self, key: Key) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        opener(self.me.clone(), key, |this, key, cx| Some(this.detail(key, cx)))
+    }
+
+    fn detail(&self, key: &Key, cx: &App) -> Detail {
+        let t = theme(cx);
+        let live = self.live.read(cx);
+        let known: Vec<&str> = self
+            .stored
+            .as_ref()
+            .map(|s| s.known.iter().map(String::as_str).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .chain(live.paths())
+            .collect();
+        let line = |key: Key, label: &str, color: Hsla| Series {
+            label: label.to_owned().into(),
+            color,
+            source: key.source(known.iter().copied()),
+        };
+        let (title, icon, unit, lines, meaning, method) = match key {
+            Key::SegIn | Key::SegOut | Key::Retrans => (
+                "TCP".to_owned(),
+                IconName::ArrowLeftRight,
+                Unit::Count,
+                vec![
+                    line(Key::SegIn, "Segments in", t.blue),
+                    line(Key::SegOut, "Segments out", t.teal),
+                    line(Key::Retrans, "Retransmits", t.orange),
+                ],
+                "TCP segments received and sent per second over every connection, and how many sent segments \
+                 had to be sent again. Retransmits above about 1% of segments sent point to loss or congestion \
+                 somewhere on the path.",
+                "From the Tcp counters in /proc/net/snmp: the change in InSegs, OutSegs and RetransSegs between \
+                 two samples, divided by the time between them.",
+            ),
+            Key::TcpSockets | Key::UdpSockets => (
+                "Sockets".to_owned(),
+                IconName::Plug,
+                Unit::Count,
+                vec![
+                    line(Key::TcpSockets, "TCP", t.blue),
+                    line(Key::UdpSockets, "UDP", t.teal),
+                ],
+                "Open TCP and UDP sockets across the whole system, in every state. A count that only grows can \
+                 mean a program is leaking connections.",
+                "The inuse counts of the TCP and UDP lines in /proc/net/sockstat, read at each sample.",
+            ),
+            Key::Rx(seg) | Key::Tx(seg) => (
+                format!("Adapter {}", seg.replace("%2F", "/")),
+                IconName::Network,
+                Unit::BytesPerSec,
+                vec![
+                    line(Key::Rx(seg.clone()), "Download", t.green),
+                    line(Key::Tx(seg.clone()), "Upload", t.red),
+                ],
+                "Bytes received and sent per second on this interface alone.",
+                "From /proc/net/dev: the change in the interface's receive and transmit byte counters between two \
+                 samples, divided by the time between them.",
+            ),
+            Key::Down | Key::Up => (
+                "Throughput".to_owned(),
+                IconName::ChartLine,
+                Unit::BytesPerSec,
+                vec![line(Key::Down, "Download", t.green), line(Key::Up, "Upload", t.red)],
+                "Bytes received and sent per second over the machine's own interfaces. Loopback and container or \
+                 VM plumbing (veth, docker and libvirt bridges) are left out, since their bytes are already counted \
+                 on the physical link they leave by.",
+                "From /proc/net/dev: the change in each counted interface's receive and transmit byte counters \
+                 between two samples, divided by the time between them, then summed.",
+            ),
+        };
+        Detail {
+            title: title.into(),
+            icon,
+            unit,
+            y: YScale::Zero,
+            fill: unit == Unit::BytesPerSec,
+            lines,
+            rules: vec![],
+            meaning,
+            method,
+            range: self.range,
+            live: self.live.clone(),
+        }
+    }
+
     fn adapter_detail(&self, a: &Adapter, cx: &App) -> impl IntoElement {
         let t = theme(cx);
         let l = a.live;
@@ -887,6 +944,24 @@ impl Network {
                 })),
         )
         .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(caption_label("Throughput", cx))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("adapter-expand")
+                        .p(px(3.))
+                        .rounded(px(4.))
+                        .text_color(t.text_tertiary)
+                        .hover(|d| d.bg(t.card_hover).text_color(t.text))
+                        .child(Icon::new(IconName::Maximize2).xsmall())
+                        .on_click(self.expand(Key::Rx(seg.clone()))),
+                ),
+        )
+        .child(
             self.chart(&self.charts.adapter)
                 .line(self.data(&Key::Rx(seg.clone())), t.green, "Download")
                 .line(self.data(&Key::Tx(seg)), t.red, "Upload")
@@ -909,16 +984,17 @@ impl Network {
         let netinfo = self.netinfo(cx);
         let primary = netinfo.and_then(|n| primary_route(&n.default_routes));
         let mut rows = vec![
-            key_value("Host name", host.unwrap_or_else(|| "–".into()), cx),
+            key_value("Host name", host.unwrap_or_else(|| "–".into()), t.text, cx),
             key_value(
                 "Primary interface",
                 primary.and_then(|r| r.interface.clone()).unwrap_or_else(|| "–".into()),
+                t.text,
                 cx,
             ),
         ];
         let routes = netinfo.map_or(&[][..], |n| n.default_routes.as_slice());
         if routes.is_empty() {
-            rows.push(key_value("Default route", "–", cx));
+            rows.push(key_value("Default route", "–", t.text, cx));
         }
         for r in routes {
             let mut value = r.gateway.clone().unwrap_or_else(|| "on link".into());
@@ -928,19 +1004,19 @@ impl Network {
             if let Some(metric) = r.metric {
                 value.push_str(&format!(" · metric {metric}"));
             }
-            rows.push(key_value("Default route", value, cx));
+            rows.push(key_value("Default route", value, t.text, cx));
         }
         let dns = netinfo
             .map(|n| n.dns.join(", "))
             .filter(|d| !d.is_empty())
             .unwrap_or_else(|| "–".into());
-        rows.push(key_value("DNS servers", dns, cx));
+        rows.push(key_value("DNS servers", dns, t.text, cx));
         let count = rows.len();
-        panel(IconName::Settings, "Configuration", cx).child(div().flex().flex_col().children(
+        section(IconName::Settings, "Configuration", cx).child(div().flex().flex_col().children(
             rows.into_iter().enumerate().map(|(i, row)| {
                 div()
                     .when(i + 1 < count, |d| d.border_b_1().border_color(t.hairline))
-                    .child(row)
+                    .child(row.py(px(6.)).text_size(t.panel_title))
             }),
         ))
     }
@@ -966,7 +1042,7 @@ impl Network {
             .flex_col()
             .gap(t.gap)
             .child(
-                panel(IconName::ArrowLeftRight, "TCP", cx)
+                panel(IconName::ArrowLeftRight, "TCP", self.expand(Key::SegIn), cx)
                     .child(
                         row()
                             .child(stat(
@@ -1000,7 +1076,7 @@ impl Network {
                     )),
             )
             .child(
-                panel(IconName::Plug, "Sockets", cx)
+                panel(IconName::Plug, "Sockets", self.expand(Key::TcpSockets), cx)
                     .child(
                         row()
                             .child(stat(

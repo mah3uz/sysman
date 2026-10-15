@@ -30,13 +30,16 @@ use crate::data::history::{Bucket, History, ProcField, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::process::ProcessFeed;
 use crate::data::source::top_up;
-use crate::screens::processes::{Icons, process_icon};
+use crate::screens::processes::Icons;
 use crate::ui::shell::Tab;
 use crate::ui::theme::{Theme, theme};
+use crate::ui::widgets::app_icon::app_icon;
 use crate::ui::widgets::hairline;
-use crate::ui::widgets::panel::caption_label;
+use crate::ui::widgets::panel::{caption_label, frame, heading};
 use crate::ui::widgets::range::{Range, range_picker, remember, remembered};
+use crate::ui::widgets::segmented::segmented;
 use crate::ui::widgets::sidebar::{self, Side, Sidebar, Widths};
+use crate::ui::widgets::text::{caption, proportion};
 
 const BUCKETS: u32 = 120;
 const RELOAD_S: f64 = 60.;
@@ -569,14 +572,6 @@ fn icon_index(cx: &App) -> Arc<IconIndex> {
     cx.try_global::<Icons>().map(|i| i.0.clone()).unwrap_or_default()
 }
 
-fn caption(text: impl Into<SharedString>, cx: &App) -> Div {
-    let t = theme(cx);
-    div()
-        .text_size(t.small_caption)
-        .text_color(t.text_secondary)
-        .child(text.into())
-}
-
 fn dot(color: Hsla, size: f32) -> Div {
     div().flex_shrink_0().size(px(size)).rounded_full().bg(color)
 }
@@ -586,86 +581,6 @@ fn share(part: f64, whole: Option<u64>) -> String {
         Some(whole) => format!("{:.1}%", part / whole as f64 * 100.),
         None => "–".into(),
     }
-}
-
-/// A small segmented switch in the range picker's style.
-fn segmented<T: Copy + PartialEq + 'static>(
-    id: &'static str,
-    options: &[(T, &'static str)],
-    current: T,
-    on_select: impl Fn(T, &mut Window, &mut App) + 'static,
-    cx: &App,
-) -> impl IntoElement {
-    let t = theme(cx);
-    let on_select = Rc::new(on_select);
-    div()
-        .flex()
-        .flex_row()
-        .p(px(2.))
-        .rounded(px(6.))
-        .bg(t.card)
-        .text_size(t.caption)
-        .children(options.iter().enumerate().map(|(k, &(value, label))| {
-            let on_select = on_select.clone();
-            let selected = value == current;
-            div()
-                .id((id, k))
-                .h(px(20.))
-                .px(px(8.))
-                .flex()
-                .items_center()
-                .rounded(px(4.))
-                .when(selected, |d| d.bg(t.card_hover).text_color(t.text))
-                .when(!selected, |d| {
-                    d.text_color(t.text_secondary).hover(|d| d.text_color(t.text))
-                })
-                .child(label)
-                .on_click(move |_, window, cx| on_select(value, window, cx))
-        }))
-}
-
-fn frame(cx: &App) -> Div {
-    let t = theme(cx);
-    hairline(
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(12.))
-            .p(t.panel_padding)
-            .rounded(t.panel_radius)
-            .bg(t.panel)
-            .border_color(t.hairline),
-        t.hairline_width,
-    )
-}
-
-fn panel_title(icon: IconName, title: &str, cx: &App) -> Div {
-    let t = theme(cx);
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(7.))
-        .child(Icon::new(icon).small().text_color(t.text_secondary))
-        .child(
-            div()
-                .text_size(t.panel_title)
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(title.to_owned()),
-        )
-        .child(div().flex_1())
-}
-
-fn proportion(fraction: f64, color: Hsla, cx: &App) -> impl IntoElement {
-    let t = theme(cx);
-    div().h(px(5.)).w_full().rounded_full().bg(t.card_hover).child(
-        div()
-            .h_full()
-            .rounded_full()
-            .bg(color)
-            .w(gpui::relative(fraction.clamp(0., 1.) as f32))
-            .min_w(px(4.)),
-    )
 }
 
 impl Groups {
@@ -1122,12 +1037,13 @@ impl Groups {
         };
         let over_time = frame(cx)
             .child(
-                panel_title(IconName::ChartLine, "Over time", cx)
+                heading(IconName::ChartLine, "Over time", cx)
+                    .child(div().flex_1())
                     .gap(px(8.))
                     .child(segmented(
                         "lens",
-                        &[(Lens::Average, "Average"), (Lens::Peak, "Peak")],
-                        self.lens,
+                        [(Lens::Average, "Average"), (Lens::Peak, "Peak")].iter().copied(),
+                        &self.lens,
                         move |lens, _, cx| {
                             on_lens
                                 .update(cx, |g, cx| {
@@ -1140,8 +1056,8 @@ impl Groups {
                     ))
                     .child(segmented(
                         "metric",
-                        &[(Metric::Memory, "Memory"), (Metric::Cpu, "CPU")],
-                        self.metric,
+                        [(Metric::Memory, "Memory"), (Metric::Cpu, "CPU")].iter().copied(),
+                        &self.metric,
                         move |metric, _, cx| {
                             on_metric
                                 .update(cx, |g, cx| {
@@ -1293,7 +1209,7 @@ impl Groups {
                         .flex_row()
                         .items_center()
                         .gap(px(6.))
-                        .child(process_icon(p, &self.icons, 16., cx))
+                        .child(app_icon(&p.comm, &p.cmdline, &self.icons, 16., cx))
                         .child(
                             div()
                                 .min_w_0()
@@ -1335,7 +1251,7 @@ impl Groups {
         };
         frame(cx)
             .child(
-                panel_title(IconName::List, "Members", cx).child(
+                heading(IconName::List, "Members", cx).child(div().flex_1()).child(
                     caption(
                         format!("{count} running · {} · share of the group's memory", bytes(sum as f64)),
                         cx,
@@ -1727,7 +1643,7 @@ impl Editor {
                             .text_size(px(12.))
                             .font_features(t.numbers.clone())
                             .when(k % 2 == 1, |d| d.bg(gpui::white().opacity(0.03)))
-                            .child(process_icon(p, &icons, 14., cx))
+                            .child(app_icon(&p.comm, &p.cmdline, &icons, 14., cx))
                             .child(
                                 div()
                                     .w(px(130.))
@@ -1829,8 +1745,8 @@ impl Render for Editor {
                             .gap(px(8.))
                             .child(segmented(
                                 "combine",
-                                &[(Combine::Any, "ANY of"), (Combine::All, "ALL of")],
-                                self.combine,
+                                [(Combine::Any, "ANY of"), (Combine::All, "ALL of")].iter().copied(),
+                                &self.combine,
                                 move |combine, _, cx| {
                                     editor
                                         .update(cx, |e, cx| {

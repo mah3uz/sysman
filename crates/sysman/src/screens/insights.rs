@@ -6,11 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, Context, Div, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, img, prelude::FluentBuilder, px,
-    relative,
+    AnyElement, App, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
-use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 use rusqlite::{Connection, params};
@@ -33,8 +31,12 @@ use crate::data::source::{Combine, Source};
 use crate::screens::processes::Icons;
 use crate::ui::shell::{Focus, Tab, navigate};
 use crate::ui::theme::{Theme, theme};
-use crate::ui::widgets::hairline;
+use crate::ui::widgets::app_icon::app_icon;
+use crate::ui::widgets::hint::helper_hint;
+use crate::ui::widgets::panel::{heading, section_with};
 use crate::ui::widgets::range::{Range, range_picker_of, remember, remembered};
+use crate::ui::widgets::segmented::segmented;
+use crate::ui::widgets::text::{footnote, proportion};
 
 const WINDOWS: [Range; 4] = [Range::H1, Range::H6, Range::H24, Range::D7];
 /// Rules re-read stored history this often; the pressure chart is topped up from the live rings in between.
@@ -618,153 +620,6 @@ fn destination(i: &Insight) -> (Tab, Option<Focus>) {
     }
 }
 
-/// An app icon from its `.desktop` file, else a generic glyph.
-fn app_icon(comm: &str, cmdline: &str, icons: &IconIndex, size: f32, cx: &App) -> AnyElement {
-    let glyph = if cmdline.is_empty() {
-        IconName::Cpu
-    } else {
-        IconName::AppWindow
-    };
-    let color = theme(cx).text_tertiary;
-    let generic = move || {
-        Icon::new(glyph)
-            .size(px(size))
-            .text_color(color)
-            .flex_shrink_0()
-            .into_any_element()
-    };
-    match icons.lookup(comm, cmdline) {
-        Some(path) => img(path.clone())
-            .size(px(size))
-            .flex_shrink_0()
-            .with_fallback(generic)
-            .into_any_element(),
-        None => generic(),
-    }
-}
-
-fn heading(icon: IconName, title: &'static str, cx: &App) -> Div {
-    let t = theme(cx);
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(7.))
-        .child(Icon::new(icon).small().text_color(t.text_secondary))
-        .child(
-            div()
-                .text_size(t.panel_title)
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(title),
-        )
-}
-
-/// A titled panel with a one-line explanation under the title.
-fn section(icon: IconName, title: &'static str, subtitle: impl Into<SharedString>, cx: &App) -> Div {
-    let t = theme(cx);
-    hairline(
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(12.))
-            .p(t.panel_padding)
-            .rounded(t.panel_radius)
-            .bg(t.panel)
-            .border_color(t.hairline),
-        t.hairline_width,
-    )
-    .child(
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(2.))
-            .child(heading(icon, title, cx))
-            .child(
-                div()
-                    .text_size(t.caption)
-                    .text_color(t.text_secondary)
-                    .child(subtitle.into()),
-            ),
-    )
-}
-
-fn note(text: impl Into<SharedString>, cx: &App) -> Div {
-    let t = theme(cx);
-    div()
-        .py(px(6.))
-        .text_size(t.caption)
-        .text_color(t.text_secondary)
-        .child(text.into())
-}
-
-fn segmented<T: Copy + PartialEq + 'static>(
-    id: &'static str,
-    items: &[(T, &'static str)],
-    current: T,
-    on_select: impl Fn(T, &mut Window, &mut App) + 'static,
-    cx: &App,
-) -> impl IntoElement {
-    let t = theme(cx);
-    let on_select = Rc::new(on_select);
-    div()
-        .id(id)
-        .flex()
-        .flex_row()
-        .p(px(2.))
-        .rounded(px(6.))
-        .bg(t.card)
-        .text_size(t.caption)
-        .children(items.iter().enumerate().map(|(i, &(item, label))| {
-            let on_select = on_select.clone();
-            let selected = item == current;
-            div()
-                .id((id, i))
-                .h(px(20.))
-                .px(px(8.))
-                .flex()
-                .items_center()
-                .rounded(px(4.))
-                .when(selected, |d| d.bg(t.card_hover).text_color(t.text))
-                .when(!selected, |d| {
-                    d.text_color(t.text_secondary).hover(|d| d.text_color(t.text))
-                })
-                .child(label)
-                .on_click(move |_, window, cx| on_select(item, window, cx))
-        }))
-}
-
-fn proportion_bar(fraction: f64, color: Hsla, cx: &App) -> impl IntoElement {
-    let t = theme(cx);
-    div().w_full().h(px(5.)).rounded_full().bg(t.card_hover).child(
-        div()
-            .h_full()
-            .min_w(px(4.))
-            .w(relative(fraction.clamp(0., 1.) as f32))
-            .rounded_full()
-            .bg(color),
-    )
-}
-
-fn helper_hint(text: &'static str, cx: &App) -> impl IntoElement {
-    let t = theme(cx);
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(8.))
-        .text_size(t.caption)
-        .text_color(t.text_secondary)
-        .child(Icon::new(IconName::Info).xsmall())
-        .child(text)
-        .child(
-            Button::new("enable-helper")
-                .ghost()
-                .xsmall()
-                .label("Enable…")
-                .on_click(|_, _, cx| crate::ui::open_settings(cx)),
-        )
-}
-
 impl Insights {
     fn callout(&self, i: usize, insight: &Insight, cx: &mut Context<Self>) -> AnyElement {
         let t = theme(cx);
@@ -890,7 +745,7 @@ impl Insights {
         }
         let now = self.span.1;
         let body: AnyElement = if self.events.is_empty() {
-            note(
+            footnote(
                 "No pressure events in the last 2 hours. Memory has stayed comfortable.",
                 cx,
             )
@@ -955,7 +810,7 @@ impl Insights {
                 }))
                 .into_any_element()
         };
-        section(
+        section_with(
             IconName::Activity,
             "Pressure events",
             "The last 2 hours of memory pressure, with each spike marked.",
@@ -972,7 +827,7 @@ impl Insights {
             .enumerate()
             .map(|(i, g)| self.growth_card(i, g, cx))
             .collect();
-        section(
+        section_with(
             IconName::TrendingUp,
             "Memory growth",
             "Processes growing steadily over the last 2 hours, with their growth curves. Growth alone does not \
@@ -1107,10 +962,8 @@ impl Insights {
             .unwrap_or_default();
         let has = |f: &str| features.get(f).copied().unwrap_or(false);
         let hint = match metric {
-            Metric::DiskIo if !has("proc_io") => {
-                Some("Disk I/O of other users' processes needs the privileged helper.")
-            }
-            Metric::Network if !has("net") => Some("Per-process network needs the privileged helper."),
+            Metric::DiskIo if !has("proc_io") => Some("Disk I/O of other users' processes needs the privileged helper"),
+            Metric::Network if !has("net") => Some("Per-process network needs the privileged helper"),
             _ => None,
         };
         let t = theme(cx);
@@ -1145,7 +998,7 @@ impl Insights {
         } else {
             "No data logged for this window yet."
         };
-        section(IconName::ChartColumn, "Top consumers", metric.subtitle(), cx)
+        section_with(IconName::ChartColumn, "Top consumers", metric.subtitle(), cx)
             .child(
                 div()
                     .flex()
@@ -1156,18 +1009,18 @@ impl Insights {
                     .child(div().flex_1())
                     .child(segmented(
                         "metric",
-                        &items,
-                        metric,
+                        items.iter().copied(),
+                        &metric,
                         move |m, _, cx| {
                             this2.update(cx, |this, cx| this.set_metric(m, cx)).ok();
                         },
                         cx,
                     )),
             )
-            .when_some(hint, |d, hint| d.child(helper_hint(hint, cx)))
+            .when_some(hint, |d, hint| d.child(helper_hint("insights-enable", hint, cx)))
             .map(|d| {
                 if rows.is_empty() {
-                    d.child(note(empty, cx))
+                    d.child(footnote(empty, cx))
                 } else {
                     d.child(div().flex().flex_col().children(rows))
                 }
@@ -1244,7 +1097,7 @@ impl Insights {
                                     .child(primary(value(c, metric).unwrap_or(0.), metric)),
                             ),
                     )
-                    .child(proportion_bar(fraction, if growing { t.orange } else { t.blue }, cx))
+                    .child(proportion(fraction, if growing { t.orange } else { t.blue }, cx))
                     .child(
                         div()
                             .text_size(t.small_caption)

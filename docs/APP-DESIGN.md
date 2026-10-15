@@ -47,8 +47,13 @@ crates/sysman/src/
 ## 3. Shell
 
 - Client-side title bar holding a centred segmented tab strip and, on the
-  right, the refresh control. Under Hyprland tiling, the title bar still drags
-  floating windows and shows no shadow or inset when tiled.
+  right, the refresh control and a Settings button. Under Hyprland tiling, the
+  title bar still drags floating windows and shows no shadow or inset when tiled.
+- Settings opens as a modal dialog over the window (collector and helper
+  services, refresh interval), never as a tab.
+- Side panes (Explorer, Hardware, Groups, Disk Map rail, the process inspector)
+  are resizable by dragging their edge and collapsible; widths and collapsed
+  state are remembered.
 - Tabs and Lucide icons: Dashboard `gauge`, Processes `list`, GPU `monitor`,
   Energy `zap`, Network `network`, Disk `hard-drive`, Hardware `cpu`, Explorer
   `activity`, Insights `lightbulb`, Groups `layers`. Disk Map is a sub-tab of
@@ -59,16 +64,20 @@ crates/sysman/src/
 
 ## 4. Visual tokens
 
-Dark first; light is derived from the same tokens.
+Dark only for now; every token lives in `ui/theme.rs`, so a light theme is
+another constructor.
 
-| Token | Dark | Light |
-| --- | --- | --- |
-| window | `#21232F` | `#F5F5F7` |
-| panel fill | white 5% over window | black 4% |
-| card fill / hover | white 5% / 8% | black 4% / 6% |
-| hairline | white 8%, 0.5 px | black 8% |
-| text / secondary / tertiary | white 92% / 60% / 38% | black 88% / 55% / 35% |
-| green orange red blue teal purple pink indigo | `30D158 FF9F0A FF453A 0A84FF 40C8E0 BF5AF2 FF375F 5E5CE6` | `34C759 FF9500 FF3B30 007AFF 30B0C7 AF52DE FF2D55 5856D6` |
+| Token | Dark |
+| --- | --- |
+| window | `#21232F` (blue-grey, not black) |
+| panel fill | white 5% over window |
+| card fill / hover | white 5% / 8% |
+| hairline | white 8%, 0.5 px |
+| text / secondary / tertiary | white 92% / 60% / 38% |
+| green orange red blue teal purple pink indigo | `30D158 FF9F0A FF453A 0A84FF 40C8E0 BF5AF2 FF375F 5E5CE6` |
+
+Selected segments of every segmented control and range picker are filled with
+the accent blue.
 
 Metric colours: CPU green with 60/85 bands, memory pressure orange, app memory
 blue, cache teal, kernel purple, swap indigo, download green, upload red, disk
@@ -99,6 +108,17 @@ One `TrendChart` element used everywhere:
 Sparkline (card strip, 57 px, 1.5 px line, end dot), core bars, stacked bar,
 treemap and energy flow are separate small elements.
 
+Shared widgets (`ui/widgets/`): `panel` (titled, with an expand arrow) and
+`section` / `section_with` (no arrow, optional subtitle); `card`; `segmented`;
+`range_picker`; `legend`; `text` (`caption`, `footnote`, `key_value`, `facts`,
+`proportion`); `helper_hint` (lock glyph, one line, "Enable…" opens Settings);
+`app_icon`; `sidebar`; `detail_sheet`.
+
+Detail sheet: every chart panel's expand arrow, and every metric card, opens a
+modal with the chart at 260 px and its own range picker, window statistics per
+line (average, minimum, maximum, latest, stored sample count), "What this
+means" and "How it is calculated". Panels without a chart have no arrow.
+
 ## 6. Screens
 
 ### 6.1 Dashboard
@@ -114,21 +134,26 @@ treemap and energy flow are separate small elements.
 - Rail: CPU cores (one bar per logical CPU, coloured by CCD or by core type on
   Intel hybrid), Memory composition (Kernel / App / Compressed / Cached / Free,
   plus "Other" so the bar sums to total), Swap, Thermals (CPU `temp_c` orange,
-  GPU `temp_c` red), Top CPU, Top disk.
+  GPU `temp_c` red), Top CPU, Top disk (live).
+- Clicking a card, or a chart panel's arrow, opens its detail sheet.
 
 ### 6.2 Processes
 - Header cards: CPU USAGE (user/sys split, peak), CORES, LOAD AVERAGE, CPU
-  TEMPERATURE.
-- Table, from socket `processes` every refresh (the full table): Process (icon
-  from the `.desktop` file matched by executable, else a generic glyph), Memory
-  labelled RSS (counts shared pages in full), CPU (% of one core), Threads,
-  FDs, User, PID. Default sort Memory descending. Search filter; Hierarchy
-  toggle (tree by ppid, flattened into rows); selection kept by pid + start
-  time across re-sorts.
-- Inspector: name, PID, user, start time, command line; range picker; charts
-  Memory, CPU, File descriptors, Disk I/O from `proc_points` /
-  `proc_rollup_1m`, sharing a cursor. Earlier runs of the same command can be
-  overlaid.
+  TEMPERATURE; each opens its detail sheet.
+- Table, from socket `processes` every refresh (the full table). Columns,
+  chosen from a Columns menu and remembered: Process (icon from the `.desktop`
+  file matched by executable, else a generic glyph), Command, Path, Memory
+  (RSS, shared pages counted in full), Mem % (two decimals below 1%, "<0.01%"
+  below that), Virtual, CPU % (of one core), CPU time, Threads, FDs, Read/s,
+  Write/s, Net ↓, Net ↑, User, State, Nice, Priority, Started, PID, PPID.
+  Default sort Memory descending; the whole header cell sorts. Search filter;
+  Hierarchy toggle (tree by ppid, flattened into rows); selection kept by
+  pid + start time across re-sorts.
+- Inspector (resizable, collapsible): name, PID, user, start time, command
+  line; range picker; charts Memory, CPU, File descriptors, Disk I/O from
+  `proc_points` / `proc_rollup_1m`, sharing a cursor. Earlier runs of the same
+  command (same name and command line, started before this one) are summed and
+  drawn as dashed lines on the Memory, CPU and FD charts.
 - Context menu: Copy name/PID/command line; End process (SIGTERM) and Force end
   (SIGKILL), each confirmed; disabled for other users' processes.
 - Values the collector may not read (other users' I/O and FDs) show "–" with a
@@ -140,7 +165,9 @@ treemap and energy flow are separate small elements.
   (encode/decode or `video_busy_pct`).
 - Panels: utilisation (green area), VRAM used, power with the power-limit rule.
 - Rail: Device (name, driver, backend, PCIe current/max, power limit, fan,
-  power state, throttle reasons as capsules); Processes (name, util, VRAM); By
+  power state, clock states as residency bars of the performance states seen
+  since the screen opened, throttle reasons as capsules); Processes (name,
+  util, VRAM); By
   category, classified from a small name list (ollama, llama, python with torch,
   compositors, media tools).
 
@@ -155,18 +182,22 @@ treemap and energy flow are separate small elements.
 - Collector gap: `energy_full_design` is not collected yet (needed for health).
 
 ### 6.5 Network
-Header "Primary: <iface> · Router <gateway>"; big DOWNLOAD/UPLOAD; throughput
-chart; session totals; Adapters (glyph, name, Primary/Connected/No address
-capsules, IPv4/IPv6, MAC, rates, Wi-Fi signal); Configuration (host name,
-default routes, DNS); rail with TCP and sockets. Per-app traffic is not
-available without root.
+Header "Primary: <iface> · Router <gateway>"; big DOWNLOAD/UPLOAD; range
+picker; throughput chart; session totals; Per-app traffic (needs the helper's
+eBPF counters, else a helper hint); Adapters (glyph, name, Primary/Connected/No
+address capsules, IPv4/IPv6, MAC, rates, Wi-Fi signal; the chevron expands MTU,
+link speed, packets, errors, drops, state and the adapter's own chart, whose
+arrow opens its detail sheet); Configuration (host name, primary interface,
+default routes, DNS); rail with TCP and Sockets charts.
 
 ### 6.6 Disk and Disk Map
 - Disk: device picker; cards READ, WRITE, IOPS, FREE SPACE; panels Throughput,
   Operations and latency (await, busy % with 60/90 tint, queue depth); Devices
   list (model, serial, firmware, state). Rail: Health (NVMe temperature from
-  hwmon, controller state, btrfs error counters and missing devices; SMART wear
-  needs root), Free space per filesystem, Top disk processes.
+  hwmon, controller state, btrfs error counters and missing devices; SMART
+  health through the privileged helper), Free space per filesystem with the
+  used-space chart, Top disk processes (other users' I/O through the helper).
+- Overview / Disk Map view switch in the header.
 - Disk Map: an in-app scanner (background threads, `openat`/`statx`, stays on
   one filesystem, skips unreadable directories and counts them); squarified
   treemap; modes Map / Largest / Oldest / Kinds; one colour per file kind;

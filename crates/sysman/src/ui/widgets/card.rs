@@ -1,6 +1,4 @@
-use gpui::{
-    App, Div, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString, Stateful, Styled, div, px,
-};
+use gpui::{App, Div, FontWeight, Hsla, InteractiveElement, ParentElement, SharedString, Stateful, Styled, div, px};
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 
@@ -16,7 +14,7 @@ pub fn metric_card(
     value: impl Into<SharedString>,
     spark: Sparkline,
     cx: &App,
-) -> impl IntoElement {
+) -> Stateful<Div> {
     let t = theme(cx);
     card(id, label, color, cx)
         .child(

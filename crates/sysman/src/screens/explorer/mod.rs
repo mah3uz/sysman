@@ -33,7 +33,10 @@ use crate::data::history::{Bucket, History, Proc, ProcPoint, bucket_width, db_pa
 use crate::data::live::Live;
 use crate::data::source::Source;
 use crate::ui::theme::{Theme, theme};
+use crate::ui::widgets::hint::helper_hint;
+use crate::ui::widgets::segmented::segmented;
 use crate::ui::widgets::sidebar::{self, Side, Sidebar, Toggled, Widths};
+use crate::ui::widgets::text::key_value;
 use catalog::{CHARTS, ChartDef, Group, HELPER_CHART, Hue, Preset, Scope, chart};
 use model::{CsvLine, MAX_PROCESSES, SPANS, View, ZOOM_IN, ZOOM_OUT};
 
@@ -732,62 +735,8 @@ fn hairline_top<E: Styled>(mut e: E, t: &Theme) -> E {
     e.border_color(t.hairline)
 }
 
-/// A segmented switch with the selected segment filled in the accent colour.
-fn segmented<T: Copy + PartialEq + 'static>(
-    id: &'static str,
-    options: &[(T, &'static str)],
-    current: T,
-    on_select: impl Fn(T, &mut Window, &mut App) + 'static,
-    cx: &App,
-) -> impl IntoElement {
-    let t = theme(cx);
-    let on_select = Rc::new(on_select);
-    div()
-        .id(id)
-        .flex()
-        .flex_row()
-        .p(px(2.))
-        .rounded(px(6.))
-        .bg(t.card)
-        .text_size(px(12.))
-        .children(options.iter().enumerate().map(|(i, &(value, label))| {
-            let on_select = on_select.clone();
-            let selected = value == current;
-            div()
-                .id((id, i))
-                .flex_1()
-                .h(px(22.))
-                .px(px(10.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(4.))
-                .when(selected, |d| d.bg(t.blue).text_color(gpui::white()))
-                .when(!selected, |d| {
-                    d.text_color(t.text_secondary).hover(|d| d.text_color(t.text))
-                })
-                .child(label)
-                .on_click(move |_, window, cx| on_select(value, window, cx))
-        }))
-}
-
 fn dot(color: Hsla, size: f32) -> impl IntoElement {
     div().size(px(size)).rounded_full().bg(color).flex_shrink_0()
-}
-
-fn key_value(label: impl Into<SharedString>, value: impl Into<SharedString>, cx: &App) -> impl IntoElement {
-    let t = theme(cx);
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(2.))
-        .child(
-            div()
-                .text_size(t.small_caption)
-                .text_color(t.text_secondary)
-                .child(label.into()),
-        )
-        .child(div().text_size(t.caption).child(value.into()))
 }
 
 fn stat_row(label: &'static str, value: String, cx: &App) -> impl IntoElement {
@@ -1004,8 +953,8 @@ impl Explorer {
         let entity = cx.entity().downgrade();
         let tabs = segmented(
             "source-tabs",
-            &[(SourceTab::Metrics, "Metrics"), (SourceTab::Processes, "Processes")],
-            self.source_tab,
+            [(SourceTab::Metrics, "Metrics"), (SourceTab::Processes, "Processes")],
+            &self.source_tab,
             move |tab, _, cx| {
                 entity
                     .update(cx, |this, cx| {
@@ -1091,21 +1040,11 @@ impl Explorer {
                             .on_click(cx.listener(move |this, _, _, cx| this.toggle_chart(id, cx)))
                     }))
                     .when(helper_missing, |d| {
-                        d.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(4.))
-                                .text_size(t.small_caption)
-                                .text_color(t.text_secondary)
-                                .child("CPU package power needs the privileged helper.")
-                                .child(
-                                    Button::new("enable-helper")
-                                        .xsmall()
-                                        .label("Enable…")
-                                        .on_click(|_, _, cx| crate::ui::open_settings(cx)),
-                                ),
-                        )
+                        d.child(helper_hint(
+                            "explorer-enable",
+                            "CPU package power needs the privileged helper",
+                            cx,
+                        ))
                     }),
             );
         }
@@ -1565,12 +1504,12 @@ impl Explorer {
         let entity = cx.entity().downgrade();
         let tabs = segmented(
             "inspector-tabs",
-            &[
+            [
                 (InspectorTab::Values, "Values"),
                 (InspectorTab::Processes, "Processes"),
                 (InspectorTab::Hardware, "Hardware"),
             ],
-            self.inspector_tab,
+            &self.inspector_tab,
             move |tab, _, cx| {
                 entity
                     .update(cx, |this, cx| {
@@ -1989,7 +1928,7 @@ impl Explorer {
                         .child("Waiting for the collector's machine description"),
                 )
             })
-            .children(rows.into_iter().map(|(k, v)| key_value(k, v, cx)))
+            .children(rows.into_iter().map(|(k, v)| key_value(k, v, t.text, cx)))
     }
 
     fn status_bar(&self, now: f64, cx: &Context<Self>) -> impl IntoElement {

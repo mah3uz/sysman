@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
@@ -26,16 +26,19 @@ use crate::data::history::{Bucket, History, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source};
-use crate::screens::dashboard::{caption, readout, top_list, whole_disk};
+use crate::screens::dashboard::{readout, top_list, whole_disk};
 use crate::screens::disk_map::DiskMap;
 use crate::ui::shell::{Focus, Tab, take_focus};
 use crate::ui::theme::{Theme, theme};
 use crate::ui::widgets::card::card;
+use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
 use crate::ui::widgets::hairline;
 use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::legend::legend;
-use crate::ui::widgets::panel::{caption_label, panel};
+use crate::ui::widgets::panel::{caption_label, panel, section};
 use crate::ui::widgets::range::{Range, range_picker_of, remember, remembered};
+use crate::ui::widgets::segmented::segmented;
+use crate::ui::widgets::text::{caption, key_value};
 
 const BUCKETS: u32 = 120;
 /// Stored history is re-read this often; the live rings cover the newest 30 minutes in between.
@@ -267,6 +270,7 @@ struct Charts {
 }
 
 pub struct Disk {
+    me: WeakEntity<Self>,
     live: Entity<Live>,
     feed: Entity<ProcessFeed>,
     view: View,
@@ -313,6 +317,7 @@ impl Disk {
             .filter(|r| RANGES.contains(r))
             .unwrap_or(Range::H1);
         let mut this = Self {
+            me: cx.weak_entity(),
             live,
             feed,
             view: initial_view(),
@@ -522,41 +527,6 @@ impl Disk {
     }
 }
 
-/// A segmented control in the range picker's style.
-pub(crate) fn segmented(
-    id: &'static str,
-    items: Vec<(SharedString, bool)>,
-    on_select: impl Fn(usize, &mut Window, &mut App) + 'static,
-    cx: &App,
-) -> impl IntoElement {
-    let t = theme(cx);
-    let on_select = Rc::new(on_select);
-    div()
-        .id(id)
-        .flex()
-        .flex_row()
-        .p(px(2.))
-        .rounded(px(6.))
-        .bg(t.card)
-        .text_size(t.caption)
-        .children(items.into_iter().enumerate().map(|(i, (label, selected))| {
-            let on_select = on_select.clone();
-            div()
-                .id((id, i))
-                .h(px(20.))
-                .px(px(9.))
-                .flex()
-                .items_center()
-                .rounded(px(4.))
-                .when(selected, |d| d.bg(t.card_hover).text_color(t.text))
-                .when(!selected, |d| {
-                    d.text_color(t.text_secondary).hover(|d| d.text_color(t.text))
-                })
-                .child(label)
-                .on_click(move |_, window, cx| on_select(i, window, cx))
-        }))
-}
-
 fn capsule(text: impl Into<SharedString>, color: Hsla, cx: &App) -> impl IntoElement {
     let t = theme(cx);
     div()
@@ -582,22 +552,6 @@ fn bar(fraction: f64, color: Hsla, cx: &App) -> gpui::Div {
     )
 }
 
-/// Label at the left, value at the right.
-fn kv(label: impl Into<SharedString>, value: impl Into<SharedString>, color: Hsla, cx: &App) -> gpui::Div {
-    let t = theme(cx);
-    div()
-        .flex()
-        .flex_row()
-        .text_size(t.caption)
-        .child(div().flex_1().text_color(t.text_secondary).child(label.into()))
-        .child(
-            div()
-                .text_color(color)
-                .font_features(t.numbers.clone())
-                .child(value.into()),
-        )
-}
-
 fn smart_block(s: &Smart, cx: &App) -> AnyElement {
     let t = theme(cx);
     let (verdict, verdict_tint) = if s.passed {
@@ -613,20 +567,20 @@ fn smart_block(s: &Smart, cx: &App) -> AnyElement {
         } else {
             t.text
         };
-        kv(label, value, tint, cx)
+        key_value(label, value, tint, cx)
     });
     div()
         .flex()
         .flex_col()
         .gap(px(6.))
-        .child(kv("Verdict", verdict, verdict_tint, cx).font_weight(FontWeight::SEMIBOLD))
+        .child(key_value("Verdict", verdict, verdict_tint, cx).font_weight(FontWeight::SEMIBOLD))
         .when_some(s.percent_used, |d, used| {
             let tint = match helper::wear(used) {
                 Wear::Fine => t.green,
                 Wear::Worn => t.orange,
                 Wear::Spent => t.red,
             };
-            d.child(kv("Life used", format!("{used}%"), tint, cx))
+            d.child(key_value("Life used", format!("{used}%"), tint, cx))
                 .child(bar(f64::from(used) / 100., tint, cx))
         })
         .children(rows)
@@ -674,17 +628,13 @@ impl Disk {
         let this = cx.entity().downgrade();
         let picker = {
             let this = this.clone();
-            let items = disks
-                .iter()
-                .map(|d| (SharedString::from(d.clone()), Some(d.as_str()) == disk))
-                .collect();
+            let items: Vec<(String, SharedString)> = disks.iter().map(|d| (d.clone(), d.clone().into())).collect();
             segmented(
                 "device-picker",
                 items,
-                move |i, _, cx| {
-                    if let Some(disk) = disks.get(i).cloned() {
-                        this.update(cx, |d, cx| d.select(disk, cx)).ok();
-                    }
+                &disk.unwrap_or_default().to_owned(),
+                move |disk, _, cx| {
+                    this.update(cx, |d, cx| d.select(disk, cx)).ok();
                 },
                 cx,
             )
@@ -772,7 +722,8 @@ impl Disk {
             .flex()
             .flex_row()
             .gap(px(10.))
-            .child(detail_card(
+            .child(self.detail_card(
+                Metric::Read,
                 "card-read",
                 "Read",
                 t.blue,
@@ -781,7 +732,8 @@ impl Disk {
                 self.spark(Metric::Read, t.blue, cx),
                 cx,
             ))
-            .child(detail_card(
+            .child(self.detail_card(
+                Metric::Write,
                 "card-write",
                 "Write",
                 t.orange,
@@ -790,7 +742,8 @@ impl Disk {
                 self.spark(Metric::Write, t.orange, cx),
                 cx,
             ))
-            .child(detail_card(
+            .child(self.detail_card(
+                Metric::Iops,
                 "card-iops",
                 "IOPS",
                 t.text,
@@ -799,7 +752,8 @@ impl Disk {
                 self.spark(Metric::Iops, t.text, cx),
                 cx,
             ))
-            .child(detail_card(
+            .child(self.detail_card(
+                Metric::Free,
                 "card-free",
                 "Free space",
                 t.blue,
@@ -812,7 +766,7 @@ impl Disk {
 
     fn throughput_panel(&self, cx: &App) -> impl IntoElement {
         let t = theme(cx);
-        panel(IconName::HardDrive, "Throughput", cx)
+        panel(IconName::HardDrive, "Throughput", self.expand(Metric::Read), cx)
             .child(
                 self.chart(&self.charts.throughput, Metric::Read, cx)
                     .line(self.data(Metric::Write), t.orange, "Write")
@@ -861,71 +815,76 @@ impl Disk {
                 .child(caption_label(label, cx))
                 .child(chart)
         };
-        panel(IconName::Activity, "Operations and latency", cx)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(28.))
-                    .child(readout(
-                        "Read latency",
-                        ms(device.map(|d| d.read_await_ms)),
-                        t.blue,
-                        None,
-                        cx,
-                    ))
-                    .child(readout(
-                        "Write latency",
-                        ms(device.map(|d| d.write_await_ms)),
-                        t.orange,
-                        None,
-                        cx,
-                    ))
-                    .child(utilisation)
-                    .child(readout(
-                        "Queue depth",
-                        device.map_or("–".into(), |d| format!("{:.2}", d.queue_depth)),
-                        t.text,
-                        None,
-                        cx,
-                    ))
-                    .child(readout(
-                        "In flight",
-                        device.map_or("–".into(), |d| d.in_flight.to_string()),
-                        t.text,
-                        None,
-                        cx,
-                    )),
-            )
-            .child(sub(
-                "Operations per second",
-                self.chart(&self.charts.iops, Metric::ReadIops, cx)
-                    .line(self.data(Metric::WriteIops), t.orange, "Write")
-                    .line(self.data(Metric::ReadIops), t.blue, "Read")
-                    .unit(Unit::Count)
-                    .y(YScale::Zero)
-                    .fill()
-                    .height(px(SMALL_CHART_HEIGHT)),
-            ))
-            .child(sub(
-                "Service time per operation",
-                self.chart(&self.charts.latency, Metric::ReadAwait, cx)
-                    .line(self.data(Metric::WriteAwait), t.orange, "Write")
-                    .line(self.data(Metric::ReadAwait), t.blue, "Read")
-                    .unit(Unit::Millis)
-                    .y(YScale::Zero)
-                    .height(px(SMALL_CHART_HEIGHT)),
-            ))
-            .child(sub(
-                "Queue depth",
-                self.chart(&self.charts.queue, Metric::Queue, cx)
-                    .line(self.data(Metric::Queue), t.purple, "Queue depth")
-                    .unit(Unit::Count)
-                    .y(YScale::Zero)
-                    .height(px(SMALL_CHART_HEIGHT)),
-            ))
-            .child(legend(self.width_s, cx))
-            .child(caption(LATENCY_CAPTION, cx))
+        panel(
+            IconName::Activity,
+            "Operations and latency",
+            self.expand(Metric::Iops),
+            cx,
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(28.))
+                .child(readout(
+                    "Read latency",
+                    ms(device.map(|d| d.read_await_ms)),
+                    t.blue,
+                    None,
+                    cx,
+                ))
+                .child(readout(
+                    "Write latency",
+                    ms(device.map(|d| d.write_await_ms)),
+                    t.orange,
+                    None,
+                    cx,
+                ))
+                .child(utilisation)
+                .child(readout(
+                    "Queue depth",
+                    device.map_or("–".into(), |d| format!("{:.2}", d.queue_depth)),
+                    t.text,
+                    None,
+                    cx,
+                ))
+                .child(readout(
+                    "In flight",
+                    device.map_or("–".into(), |d| d.in_flight.to_string()),
+                    t.text,
+                    None,
+                    cx,
+                )),
+        )
+        .child(sub(
+            "Operations per second",
+            self.chart(&self.charts.iops, Metric::ReadIops, cx)
+                .line(self.data(Metric::WriteIops), t.orange, "Write")
+                .line(self.data(Metric::ReadIops), t.blue, "Read")
+                .unit(Unit::Count)
+                .y(YScale::Zero)
+                .fill()
+                .height(px(SMALL_CHART_HEIGHT)),
+        ))
+        .child(sub(
+            "Service time per operation",
+            self.chart(&self.charts.latency, Metric::ReadAwait, cx)
+                .line(self.data(Metric::WriteAwait), t.orange, "Write")
+                .line(self.data(Metric::ReadAwait), t.blue, "Read")
+                .unit(Unit::Millis)
+                .y(YScale::Zero)
+                .height(px(SMALL_CHART_HEIGHT)),
+        ))
+        .child(sub(
+            "Queue depth",
+            self.chart(&self.charts.queue, Metric::Queue, cx)
+                .line(self.data(Metric::Queue), t.purple, "Queue depth")
+                .unit(Unit::Count)
+                .y(YScale::Zero)
+                .height(px(SMALL_CHART_HEIGHT)),
+        ))
+        .child(legend(self.width_s, cx))
+        .child(caption(LATENCY_CAPTION, cx))
     }
 
     fn devices_panel(&self, sample: Option<&Sample>, cx: &mut Context<Self>) -> impl IntoElement {
@@ -949,7 +908,7 @@ impl Disk {
             })
             .collect();
         let cx: &App = cx;
-        panel(IconName::HardDrive, "Devices", cx).map(|p| {
+        section(IconName::HardDrive, "Devices", cx).map(|p| {
             if rows.is_empty() {
                 p.child(caption("No disks reported", cx))
             } else {
@@ -1125,8 +1084,8 @@ impl Disk {
                     label.clone()
                 };
                 match value {
-                    Some(c) => kv(name, format!("{c:.0} °C"), temp_colour(*c, crit_of(label), t), cx),
-                    None => kv(name, "–", t.text_tertiary, cx),
+                    Some(c) => key_value(name, format!("{c:.0} °C"), temp_colour(*c, crit_of(label), t), cx),
+                    None => key_value(name, "–", t.text_tertiary, cx),
                 }
                 .into_any_element()
             })
@@ -1159,20 +1118,20 @@ impl Disk {
                 .collect();
             btrfs.push(
                 if nonzero.is_empty() {
-                    kv(name, "No errors", t.green, cx)
+                    key_value(name, "No errors", t.green, cx)
                 } else {
-                    kv(name, nonzero.join(", "), t.red, cx)
+                    key_value(name, nonzero.join(", "), t.red, cx)
                 }
                 .into_any_element(),
             );
             for (devid, errors) in &fs.device_errors {
                 if errors.missing == Some(1) {
-                    btrfs.push(kv(format!("  device {devid}"), "missing", t.red, cx).into_any_element());
+                    btrfs.push(key_value(format!("  device {devid}"), "missing", t.red, cx).into_any_element());
                 }
             }
         }
 
-        panel(IconName::HeartPulse, "Health", cx)
+        section(IconName::HeartPulse, "Health", cx)
             .child(status)
             .child(
                 div()
@@ -1181,7 +1140,7 @@ impl Disk {
                     .gap(px(6.))
                     .map(|d| {
                         if temps.is_empty() {
-                            d.child(kv("Temperature", "–", t.text_tertiary, cx))
+                            d.child(key_value("Temperature", "–", t.text_tertiary, cx))
                         } else {
                             d.children(temps)
                         }
@@ -1189,7 +1148,7 @@ impl Disk {
                     .when_some(
                         chip.as_ref()
                             .and_then(|_| limits.get("Composite")?.get("crit").copied()),
-                        |d, crit| d.child(kv("Critical at", format!("{crit:.0} °C"), t.text_secondary, cx)),
+                        |d, crit| d.child(key_value("Critical at", format!("{crit:.0} °C"), t.text_secondary, cx)),
                     ),
             )
             .child(div().h(t.hairline_width).bg(t.hairline))
@@ -1294,7 +1253,7 @@ impl Disk {
                 .into_any_element(),
             None => caption(format!("No mounted filesystem on {}", disk.unwrap_or("this disk")), cx).into_any_element(),
         };
-        panel(IconName::ChartArea, "Free space", cx)
+        panel(IconName::ChartArea, "Free space", self.expand(Metric::Used), cx)
             .child(div().flex().flex_col().gap(px(10.)).map(|d| {
                 if rows.is_empty() {
                     d.child(caption("No filesystems reported", cx))
@@ -1320,12 +1279,16 @@ impl Disk {
             .take(TOP_ROWS)
             .map(|(r, n)| (r.comm.clone(), Unit::BytesPerSec.format(n as f64)))
             .collect();
-        panel(IconName::List, "Top disk processes", cx)
+        section(IconName::List, "Top disk processes", cx)
             .child(top_list(top, "No disk activity", cx))
-            .child(caption(
-                "Read plus write, own processes only; other users' I/O needs root.",
-                cx,
-            ))
+            .child(caption("Read plus write per process.", cx))
+            .when(!helper::running(self.live.read(cx).latest.as_ref()), |d| {
+                d.child(helper_hint(
+                    "disk-processes-enable",
+                    "Disk I/O of other users' processes needs the privileged helper",
+                    cx,
+                ))
+            })
     }
 
     fn overview(&self, sample: Option<&Sample>, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1384,56 +1347,171 @@ impl Disk {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn detail_card(
-    id: &'static str,
-    label: &str,
-    color: Hsla,
-    value: String,
-    detail: Option<String>,
-    spark: Sparkline,
-    cx: &App,
-) -> impl IntoElement {
-    let t = theme(cx);
-    card(id, label, color, cx)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_end()
-                .gap(px(5.))
-                .child(
-                    div()
-                        .text_size(t.card_value)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .font_features(t.numbers.clone())
-                        .child(value),
-                )
-                .when_some(detail, |d, detail| {
-                    d.child(
-                        div()
-                            .pb(px(2.))
-                            .text_size(t.small_caption)
-                            .text_color(t.text_secondary)
-                            .font_features(t.numbers.clone())
-                            .child(detail),
-                    )
-                }),
-        )
-        .child(spark)
-}
-
 impl Disk {
+    #[allow(clippy::too_many_arguments)]
+    fn detail_card(
+        &self,
+        metric: Metric,
+        id: &'static str,
+        label: &str,
+        color: Hsla,
+        value: String,
+        detail: Option<String>,
+        spark: Sparkline,
+        cx: &App,
+    ) -> impl IntoElement {
+        let t = theme(cx);
+        card(id, label, color, cx)
+            .on_click(self.expand(metric))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_end()
+                    .gap(px(5.))
+                    .child(
+                        div()
+                            .text_size(t.card_value)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_features(t.numbers.clone())
+                            .child(value),
+                    )
+                    .when_some(detail, |d, detail| {
+                        d.child(
+                            div()
+                                .pb(px(2.))
+                                .text_size(t.small_caption)
+                                .text_color(t.text_secondary)
+                                .font_features(t.numbers.clone())
+                                .child(detail),
+                        )
+                    }),
+            )
+            .child(spark)
+    }
+
+    fn expand(&self, metric: Metric) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        opener(self.me.clone(), metric, |this, metric, cx| this.detail(*metric, cx))
+    }
+
+    /// A panel or card's sheet; the throughput card opens both directions, as the panel does.
+    fn detail(&self, metric: Metric, cx: &App) -> Option<Detail> {
+        let t = theme(cx);
+        let disk = self.selected.clone()?;
+        let mount = self.mount(&disk, cx);
+        let line = |m: Metric, label: &str, color: Hsla| {
+            Some(Series {
+                label: label.to_owned().into(),
+                color,
+                source: m.source(&disk, mount.as_deref())?,
+            })
+        };
+        let total = || {
+            let fs = self.live.read(cx).latest.as_ref()?.fs.clone()?;
+            Some(fs.get(mount.as_deref()?)?.total_bytes as f64)
+        };
+        let (title, icon, unit, y, fill, lines, meaning, method) = match metric {
+            Metric::Read | Metric::Write => (
+                format!("Throughput · {disk}"),
+                IconName::HardDrive,
+                Unit::BytesPerSec,
+                YScale::Zero,
+                true,
+                vec![
+                    line(Metric::Read, "Read", t.blue)?,
+                    line(Metric::Write, "Write", t.orange)?,
+                ],
+                "Bytes read from and written to this disk per second, partitions and everything stacked on it \
+                 included. Page cache flushes, filesystem metadata and swap are disk traffic too.",
+                "From /proc/diskstats: the change in sectors read and written between two samples, times 512 \
+                 bytes, divided by the time between them.",
+            ),
+            Metric::ReadIops | Metric::WriteIops | Metric::Iops => (
+                format!("Operations · {disk}"),
+                IconName::Activity,
+                Unit::Count,
+                YScale::Zero,
+                true,
+                vec![
+                    line(Metric::ReadIops, "Read", t.blue)?,
+                    line(Metric::WriteIops, "Write", t.orange)?,
+                ],
+                "Read and write requests the disk completed per second. Many small operations can keep a disk \
+                 busy while moving few bytes, which is why this can be high when throughput is low.",
+                "From /proc/diskstats: the change in completed reads and writes between two samples, divided by \
+                 the time between them. Merged requests count once.",
+            ),
+            Metric::ReadAwait | Metric::WriteAwait => (
+                format!("Service time · {disk}"),
+                IconName::Timer,
+                Unit::Millis,
+                YScale::Zero,
+                false,
+                vec![
+                    line(Metric::ReadAwait, "Read", t.blue)?,
+                    line(Metric::WriteAwait, "Write", t.orange)?,
+                ],
+                "The average time a completed request spent waiting and being served. Rising service time with \
+                 steady traffic means the disk is falling behind.",
+                "From /proc/diskstats: the change in time spent on reads (or writes) divided by the change in \
+                 completed reads (or writes) between two samples, in milliseconds.",
+            ),
+            Metric::Queue => (
+                format!("Queue depth · {disk}"),
+                IconName::Layers,
+                Unit::Count,
+                YScale::Zero,
+                false,
+                vec![line(Metric::Queue, "Queue depth", t.purple)?],
+                "How many requests were outstanding on average. Solid-state disks serve many at once; a deep queue \
+                 on a spinning disk means requests are waiting.",
+                "From /proc/diskstats: the change in weighted time spent doing I/O between two samples, divided by \
+                 the time between them.",
+            ),
+            Metric::Free | Metric::Used => {
+                let mount = mount.clone()?;
+                let (used, label, color) = if metric == Metric::Used {
+                    (true, "Used", t.blue)
+                } else {
+                    (false, "Free", t.blue)
+                };
+                (
+                    format!("{} on {mount}", if used { "Used space" } else { "Free space" }),
+                    IconName::ChartArea,
+                    Unit::Bytes,
+                    total().map_or(YScale::Zero, |total| YScale::Fixed(0., total.max(1.))),
+                    true,
+                    vec![line(metric, label, color)?],
+                    "Space taken and space left on the filesystem mounted from this disk. A filesystem that fills \
+                     up stops accepting writes, and most behave worse in the last few percent.",
+                    "From statvfs on the mount point every 30 seconds: used is blocks in use times the block size, \
+                     and free is the blocks available to ordinary users, so space reserved for root is not counted \
+                     as free.",
+                )
+            }
+        };
+        Some(Detail {
+            title: title.into(),
+            icon,
+            unit,
+            y,
+            fill,
+            lines,
+            rules: vec![],
+            meaning,
+            method,
+            range: self.range,
+            live: self.live.clone(),
+        })
+    }
+
     fn view_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
         let switch = segmented(
             "disk-view",
-            vec![
-                ("Overview".into(), self.view == View::Overview),
-                ("Disk Map".into(), self.view == View::Map),
-            ],
-            move |i, _, cx| {
-                let view = if i == 0 { View::Overview } else { View::Map };
+            [(View::Overview, "Overview"), (View::Map, "Disk Map")],
+            &self.view,
+            move |view, _, cx| {
                 this.update(cx, |d, cx| {
                     d.view = view;
                     cx.notify();

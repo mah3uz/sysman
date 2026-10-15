@@ -27,9 +27,11 @@ use crate::ui::shell::Tab;
 use crate::ui::theme::{Theme, theme};
 use crate::ui::widgets::card::card;
 use crate::ui::widgets::hairline;
+use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::legend::legend;
-use crate::ui::widgets::panel::caption_label;
+use crate::ui::widgets::panel::{caption_label, section};
 use crate::ui::widgets::range::{Range, range_picker, remember, remembered};
+use crate::ui::widgets::text::{caption, facts, footnote};
 
 const BUCKETS: u32 = 120;
 
@@ -819,22 +821,6 @@ impl Energy {
     }
 }
 
-fn caption(text: impl Into<SharedString>, cx: &App) -> Div {
-    let t = theme(cx);
-    div()
-        .text_size(t.small_caption)
-        .text_color(t.text_secondary)
-        .child(text.into())
-}
-
-fn footnote(text: impl Into<SharedString>, cx: &App) -> Div {
-    let t = theme(cx);
-    div()
-        .text_size(t.caption)
-        .text_color(t.text_secondary)
-        .child(text.into())
-}
-
 fn divider(cx: &App) -> Div {
     let t = theme(cx);
     div().h(t.hairline_width).bg(t.hairline)
@@ -847,85 +833,6 @@ fn big_value(value: impl Into<SharedString>, cx: &App) -> Div {
         .font_weight(FontWeight::SEMIBOLD)
         .font_features(t.numbers.clone())
         .child(value.into())
-}
-
-/// Key on the left, value on the right; a row with no value is left out.
-fn key_values(rows: Vec<(&'static str, Option<String>, Hsla)>, cx: &App) -> impl IntoElement {
-    let t = theme(cx);
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(9.))
-        .text_size(t.caption)
-        .children(rows.into_iter().filter_map(|(key, value, color)| {
-            Some(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(12.))
-                    .child(div().flex_shrink_0().text_color(t.text_secondary).child(key))
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(color)
-                            .font_features(t.numbers.clone())
-                            .child(value?),
-                    ),
-            )
-        }))
-}
-
-/// A titled panel; unlike the shared one it has no maximise glyph, since nothing here expands.
-fn section(icon: IconName, title: &'static str, cx: &App) -> Div {
-    let t = theme(cx);
-    hairline(
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(14.))
-            .p(t.panel_padding)
-            .rounded(t.panel_radius)
-            .bg(t.panel)
-            .border_color(t.hairline),
-        t.hairline_width,
-    )
-    .child(
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(7.))
-            .child(Icon::new(icon).small().text_color(t.text_secondary))
-            .child(
-                div()
-                    .text_size(t.panel_title)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
-            ),
-    )
-}
-
-fn helper_hint(cx: &App) -> impl IntoElement {
-    let t = theme(cx);
-    div()
-        .flex()
-        .flex_col()
-        .items_start()
-        .gap(px(6.))
-        .child(
-            div()
-                .text_size(t.small_caption)
-                .text_color(t.text_secondary)
-                .child("CPU package power needs the privileged helper."),
-        )
-        .child(
-            Button::new("enable-helper")
-                .xsmall()
-                .label("Enable…")
-                .on_click(|_, _, cx| crate::ui::open_settings(cx)),
-        )
 }
 
 impl Energy {
@@ -1107,7 +1014,14 @@ impl Energy {
         let cpu = snap.cpu_power();
         let cpu_body = match cpu {
             CpuPower::Measured => self.spark("cpu", green).into_any_element(),
-            CpuPower::NeedsHelper => div().h(px(57.)).child(helper_hint(cx)).into_any_element(),
+            CpuPower::NeedsHelper => div()
+                .h(px(57.))
+                .child(helper_hint(
+                    "energy-enable",
+                    "CPU package power needs the privileged helper",
+                    cx,
+                ))
+                .into_any_element(),
             CpuPower::Unsupported => div()
                 .h(px(57.))
                 .child(caption("This CPU has no readable power counter.", cx))
@@ -1551,7 +1465,7 @@ impl Energy {
                     .child(caption("max capacity", cx)),
             )
             .child(divider(cx))
-            .child(key_values(
+            .child(facts(
                 vec![
                     ("Cycle count", s.cycle_count.map(|c| c.to_string()), t.text),
                     ("Condition", Some(condition.into()), condition_colour),
@@ -1574,7 +1488,7 @@ impl Energy {
             (Some(p), Some(v)) if v > 0. => Some(format!("{:.2} A", p / v)),
             _ => None,
         };
-        section(IconName::Activity, "Electrical", cx).child(key_values(
+        section(IconName::Activity, "Electrical", cx).child(facts(
             vec![
                 ("Power", s.power_w.map(|w| format!("{w:.2} W")), t.orange),
                 ("Voltage", s.voltage_v.map(|v| format!("{v:.2} V")), t.text),

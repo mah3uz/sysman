@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use gpui::{
     AnyElement, App, Context, Div, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, relative,
+    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::tooltip::Tooltip;
 use gpui_kit_assets::IconName;
@@ -23,9 +23,12 @@ use crate::screens::dashboard::cpu_colour;
 use crate::ui::shell::Tab;
 use crate::ui::theme::{Theme, theme};
 use crate::ui::widgets::card::card;
+use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
 use crate::ui::widgets::legend::legend;
-use crate::ui::widgets::panel::{caption_label, panel};
+use crate::ui::widgets::panel::{caption_label, panel, section};
 use crate::ui::widgets::range::{Range, range_picker, remember, remembered};
+use crate::ui::widgets::segmented::segmented;
+use crate::ui::widgets::text::{caption, facts, proportion};
 
 const BUCKETS: u32 = 120;
 /// Stored history is re-read this often; the live rings cover the newest 30 minutes in between.
@@ -268,6 +271,7 @@ struct Charts {
 }
 
 pub struct Gpu {
+    me: WeakEntity<Self>,
     live: Entity<Live>,
     range: Range,
     pci: Option<String>,
@@ -285,6 +289,42 @@ pub struct Gpu {
     meta: Option<GpuMeta>,
     /// Command lines of Python processes, read once per pid.
     cmdlines: HashMap<u32, Option<String>>,
+    residency: Residency,
+}
+
+/// Samples seen in each performance state of one device, since the screen opened or the device changed.
+#[derive(Default)]
+struct Residency {
+    pci: String,
+    last_t: f64,
+    counts: BTreeMap<String, u32>,
+}
+
+impl Residency {
+    fn record(&mut self, pci: &str, t: f64, state: Option<&str>) {
+        if self.pci != pci {
+            *self = Self {
+                pci: pci.to_owned(),
+                ..Self::default()
+            };
+        }
+        if t <= self.last_t {
+            return;
+        }
+        self.last_t = t;
+        if let Some(state) = state {
+            *self.counts.entry(state.to_owned()).or_default() += 1;
+        }
+    }
+
+    /// Each state and its share of the samples, fastest state first.
+    fn shares(&self) -> Vec<(&str, f64)> {
+        let total: u32 = self.counts.values().sum();
+        self.counts
+            .iter()
+            .map(|(state, n)| (state.as_str(), f64::from(*n) / f64::from(total.max(1))))
+            .collect()
+    }
 }
 
 fn wall_clock() -> f64 {
@@ -297,6 +337,7 @@ impl Gpu {
     pub fn new(live: Entity<Live>, cx: &mut Context<Self>) -> Self {
         cx.observe(&live, |this, _, cx| this.refresh(cx)).detach();
         let mut this = Self {
+            me: cx.weak_entity(),
             live,
             range: remembered(Tab::Gpu, cx),
             pci: None,
@@ -312,6 +353,7 @@ impl Gpu {
             charts: Charts::default(),
             meta: None,
             cmdlines: HashMap::new(),
+            residency: Residency::default(),
         };
         this.refresh(cx);
         this
@@ -370,6 +412,11 @@ impl Gpu {
             self.load(now, pci.clone(), cx);
         }
         self.merge(now, &pci, cx);
+        let (t, state) = self.live.read(cx).latest.as_ref().map_or((0., None), |s| {
+            let state = s.gpu.as_ref().and_then(|g| g.devices.get(&pci)?.pstate.clone());
+            (s.t, state)
+        });
+        self.residency.record(&pci, t, state.as_deref());
         cx.notify();
     }
 
@@ -482,44 +529,23 @@ impl Gpu {
     }
 }
 
-fn caption(text: impl Into<SharedString>, cx: &App) -> Div {
-    let t = theme(cx);
-    div()
-        .text_size(t.small_caption)
-        .text_color(t.text_secondary)
-        .child(text.into())
-}
-
 fn value_row(value: String, detail: Option<String>, cx: &App) -> impl IntoElement {
     let t = theme(cx);
     div()
         .flex()
         .flex_row()
         .items_baseline()
+        .gap(px(6.))
         .child(
             div()
+                .flex_shrink_0()
                 .text_size(t.card_value)
                 .font_weight(FontWeight::SEMIBOLD)
                 .font_features(t.numbers.clone())
                 .child(value),
         )
         .child(div().flex_1())
-        .children(detail.map(|d| caption(d, cx).font_features(t.numbers.clone())))
-}
-
-fn stat_card(
-    id: &'static str,
-    label: &str,
-    color: Hsla,
-    value: String,
-    detail: Option<String>,
-    spark: Sparkline,
-    cx: &App,
-) -> AnyElement {
-    card(id, label, color, cx)
-        .child(value_row(value, detail, cx))
-        .child(spark)
-        .into_any_element()
+        .children(detail.map(|d| caption(d, cx).min_w_0().truncate().font_features(t.numbers.clone())))
 }
 
 fn readout(label: &str, value: String, color: Hsla, cx: &App) -> impl IntoElement {
@@ -537,67 +563,6 @@ fn readout(label: &str, value: String, color: Hsla, cx: &App) -> impl IntoElemen
                 .text_color(color)
                 .child(value),
         )
-}
-
-/// Key on the left, value on the right; a row with no value is left out.
-fn key_values(rows: Vec<(&'static str, Option<String>, Hsla)>, cx: &App) -> impl IntoElement {
-    let t = theme(cx);
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(7.))
-        .text_size(t.caption)
-        .children(rows.into_iter().filter_map(|(key, value, color)| {
-            Some(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(12.))
-                    .child(div().text_color(t.text_secondary).child(key))
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .min_w_0()
-                            .text_color(color)
-                            .font_features(t.numbers.clone())
-                            .child(value?),
-                    ),
-            )
-        }))
-}
-
-fn segmented(
-    items: Vec<(String, SharedString)>,
-    current: Option<&str>,
-    on_select: impl Fn(String, &mut Window, &mut App) + 'static,
-    cx: &App,
-) -> impl IntoElement {
-    let t = theme(cx);
-    let on_select = Rc::new(on_select);
-    div()
-        .flex()
-        .flex_row()
-        .p(px(2.))
-        .rounded(px(6.))
-        .bg(t.card)
-        .text_size(t.caption)
-        .children(items.into_iter().map(|(key, label)| {
-            let on_select = on_select.clone();
-            let selected = current == Some(key.as_str());
-            div()
-                .id(SharedString::from(format!("device-{key}")))
-                .h(px(20.))
-                .px(px(8.))
-                .flex()
-                .items_center()
-                .rounded(px(4.))
-                .when(selected, |d| d.bg(t.card_hover).text_color(t.text))
-                .when(!selected, |d| {
-                    d.text_color(t.text_secondary).hover(|d| d.text_color(t.text))
-                })
-                .child(label)
-                .on_click(move |_, window, cx| on_select(key.clone(), window, cx))
-        }))
 }
 
 impl Gpu {
@@ -663,8 +628,9 @@ impl Gpu {
                 d.child(control(
                     "Device",
                     segmented(
+                        "gpu-device",
                         items,
-                        self.pci.as_deref(),
+                        &self.pci.clone().unwrap_or_default(),
                         move |pci, _, cx| {
                             pick.update(cx, |g, cx| g.select(pci, cx)).ok();
                         },
@@ -686,13 +652,150 @@ impl Gpu {
             ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn stat_card(
+        &self,
+        field: Field,
+        id: &'static str,
+        label: &str,
+        color: Hsla,
+        value: String,
+        detail: Option<String>,
+        spark: Sparkline,
+        cx: &App,
+    ) -> AnyElement {
+        card(id, label, color, cx)
+            .child(value_row(value, detail, cx))
+            .child(spark)
+            .on_click(self.expand(field))
+            .into_any_element()
+    }
+
+    fn expand(&self, field: Field) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        opener(self.me.clone(), field, |this, field, cx| this.detail(*field, cx))
+    }
+
+    fn detail(&self, field: Field, cx: &App) -> Option<Detail> {
+        let t = theme(cx);
+        let pci = self.pci.clone()?;
+        let device = self
+            .live
+            .read(cx)
+            .latest
+            .as_ref()
+            .and_then(|s| s.gpu.as_ref()?.devices.get(&pci).cloned());
+        let limit = |max: Option<f64>| match max {
+            Some(max) => YScale::Fixed(0., max * RULE_HEADROOM),
+            None => YScale::Zero,
+        };
+        let vram_total = device.as_ref().and_then(|d| d.vram_total_bytes).map(|b| b as f64);
+        let power_limit = device.as_ref().and_then(|d| d.power_limit_w);
+        let (title, icon, unit, y, color, rules, meaning, method) = match field {
+            Field::Util => (
+                "GPU utilization",
+                IconName::Monitor,
+                Unit::Percent,
+                YScale::Fixed(0., 100.),
+                t.green,
+                vec![],
+                "The share of time the GPU was running work. It is a busy-time measure, not a measure of how much \
+                 of the chip was in use, so a light task that keeps the GPU awake can read high.",
+                "As the device's backend reports it: NVML's utilization rate on NVIDIA, gpu_busy_percent in sysfs \
+                 on AMD, and on Intel the engine busy time in DRM fdinfo, which covers only your own processes.",
+            ),
+            Field::Vram => (
+                "VRAM used",
+                IconName::MemoryStick,
+                Unit::Bytes,
+                limit(vram_total),
+                t.teal,
+                vram_total
+                    .map(|v| (v, SharedString::from("Total"), t.teal))
+                    .into_iter()
+                    .collect(),
+                "Video memory held by every process and the driver on this device. When it runs out, textures and \
+                 buffers spill into system memory and rendering or compute slows sharply.",
+                "Used bytes as the driver reports them: NVML memory info on NVIDIA and mem_info_vram_used in sysfs \
+                 on AMD. Integrated GPUs share system RAM and report only their reserved carve-out.",
+            ),
+            Field::Power => (
+                "Power",
+                IconName::Zap,
+                Unit::Watts,
+                limit(power_limit),
+                t.blue,
+                power_limit
+                    .map(|l| (l, SharedString::from("Limit"), t.orange))
+                    .into_iter()
+                    .collect(),
+                "Electrical power the graphics card is drawing. Holding at the limit means the card is lowering its \
+                 clocks to stay within its power budget.",
+                "The board power reading from NVML on NVIDIA, or the hwmon power1_average or power1_input sensor \
+                 on AMD, in watts. The limit is the current enforced power cap.",
+            ),
+            Field::Temp => (
+                "Temperature",
+                IconName::Thermometer,
+                Unit::Celsius,
+                YScale::Fit(10.),
+                t.red,
+                vec![],
+                "How hot the GPU is. Sustained readings near the chip's limit make it throttle its clocks.",
+                "NVML's core temperature on NVIDIA, or the driver's hwmon sensor (edge on AMD, package on Intel), \
+                 in degrees Celsius.",
+            ),
+            Field::Clock => (
+                "Core clock, MHz",
+                IconName::Activity,
+                Unit::Count,
+                YScale::Zero,
+                t.orange,
+                vec![],
+                "How fast the graphics core is running. It rises under load and drops when idle, hot or at the \
+                 power limit.",
+                "The graphics clock from NVML on NVIDIA, hwmon freq1_input on AMD, or the actual GT frequency on \
+                 Intel, in MHz.",
+            ),
+            Field::Video => (
+                "Video engines",
+                IconName::Monitor,
+                Unit::Percent,
+                YScale::Fixed(0., 100.),
+                t.purple,
+                vec![],
+                "How busy the fixed-function video encoder and decoder are. Video playback, screen recording and \
+                 streaming use them instead of the main GPU cores.",
+                "Encoder and decoder utilization from NVML on NVIDIA, or vcn_busy_percent in sysfs on AMD; the \
+                 busier engine is plotted.",
+            ),
+        };
+        Some(Detail {
+            title: title.into(),
+            icon,
+            unit,
+            y,
+            fill: matches!(field, Field::Util | Field::Vram),
+            lines: vec![Series {
+                label: title.into(),
+                color,
+                source: field.source(&pci, &self.known),
+            }],
+            rules,
+            meaning,
+            method,
+            range: self.range,
+            live: self.live.clone(),
+        })
+    }
+
     fn cards(&self, d: &Device, cx: &App) -> impl IntoElement {
         let t = theme(cx);
         let pct = |v: Option<f64>| v.map_or("–".into(), |v| format!("{v:.0}%"));
         let mut cards = Vec::new();
         if self.reported(Field::Util) {
             let colour = cpu_colour(d.util_pct.unwrap_or(0.), t);
-            cards.push(stat_card(
+            cards.push(self.stat_card(
+                Field::Util,
                 "card-gpu",
                 "GPU",
                 colour,
@@ -704,7 +807,8 @@ impl Gpu {
         }
         if self.reported(Field::Power) {
             let spark = self.spark(Field::Power, t.blue, cx);
-            cards.push(stat_card(
+            cards.push(self.stat_card(
+                Field::Power,
                 "card-power",
                 "Power",
                 t.blue,
@@ -719,7 +823,8 @@ impl Gpu {
         }
         if self.reported(Field::Vram) {
             let spark = self.spark(Field::Vram, t.teal, cx);
-            cards.push(stat_card(
+            cards.push(self.stat_card(
+                Field::Vram,
                 "card-vram",
                 "VRAM",
                 t.teal,
@@ -738,7 +843,8 @@ impl Gpu {
                 .iter()
                 .max_by(|a, b| a.1.total_cmp(b.1))
                 .map(|(label, c)| format!("{label} {c:.0}°C"));
-            cards.push(stat_card(
+            cards.push(self.stat_card(
+                Field::Temp,
                 "card-temp",
                 "Temperature",
                 t.red,
@@ -749,7 +855,8 @@ impl Gpu {
             ));
         }
         if self.reported(Field::Clock) {
-            cards.push(stat_card(
+            cards.push(self.stat_card(
+                Field::Clock,
                 "card-clock",
                 "Clock",
                 t.orange,
@@ -769,7 +876,8 @@ impl Gpu {
                 (None, None, None) => None,
                 (enc, dec, _) => Some(format!("enc {} · dec {}", pct(enc), pct(dec))),
             };
-            cards.push(stat_card(
+            cards.push(self.stat_card(
+                Field::Video,
                 "card-video",
                 "Video",
                 t.purple,
@@ -787,7 +895,7 @@ impl Gpu {
         let source = info
             .and_then(|i| i.util_source.as_deref())
             .unwrap_or(d.backend.as_str());
-        panel(IconName::Monitor, "GPU utilization", cx)
+        panel(IconName::Monitor, "GPU utilization", self.expand(Field::Util), cx)
             .child(
                 self.chart(&self.charts.util, cx)
                     .line(self.data(Field::Util), t.green, "GPU")
@@ -834,7 +942,7 @@ impl Gpu {
                 .y(YScale::Fixed(0., total as f64 * RULE_HEADROOM)),
             None => chart.y(YScale::Zero),
         };
-        panel(IconName::MemoryStick, "VRAM used", cx)
+        panel(IconName::MemoryStick, "VRAM used", self.expand(Field::Vram), cx)
             .child(chart)
             .child(legend(self.width_s, cx))
     }
@@ -851,14 +959,14 @@ impl Gpu {
                 .y(YScale::Fixed(0., limit * RULE_HEADROOM)),
             None => chart.y(YScale::Zero),
         };
-        panel(IconName::Zap, "Power", cx)
+        panel(IconName::Zap, "Power", self.expand(Field::Power), cx)
             .child(chart)
             .child(legend(self.width_s, cx))
     }
 
     fn suspended_panel(&self, d: &Device, cx: &App) -> impl IntoElement {
         let t = theme(cx);
-        panel(IconName::Monitor, "Device", cx).child(
+        section(IconName::Monitor, "Device", cx).child(
             div()
                 .flex()
                 .flex_col()
@@ -901,8 +1009,8 @@ impl Gpu {
             None => s.clone(),
         });
         let throttles = throttle_labels(d.throttle_reasons.as_deref());
-        panel(IconName::Info, "Device", cx)
-            .child(key_values(
+        section(IconName::Info, "Device", cx)
+            .child(facts(
                 vec![
                     ("PCI slot", Some(pci.to_owned()), t.text),
                     ("Driver", Some(d.driver.clone()), t.text),
@@ -920,6 +1028,39 @@ impl Gpu {
                 ],
                 cx,
             ))
+            .when(self.residency.pci == pci && !self.residency.counts.is_empty(), |p| {
+                p.child(caption_label("Clock states", cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(5.))
+                            .children(self.residency.shares().into_iter().map(|(state, share)| {
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .text_size(t.caption)
+                                    .font_features(t.numbers.clone())
+                                    .child(div().w(px(24.)).flex_shrink_0().child(state.to_owned()))
+                                    .child(div().flex_1().child(proportion(share, t.blue, cx)))
+                                    .child(
+                                        div()
+                                            .w(px(34.))
+                                            .flex()
+                                            .justify_end()
+                                            .text_color(t.text_secondary)
+                                            .child(format!("{:.0}%", share * 100.)),
+                                    )
+                            })),
+                    )
+                    .child(caption(
+                        "Share of samples in each performance state since this screen opened. P0 is the fastest; \
+                         higher numbers are lower-power states.",
+                        cx,
+                    ))
+            })
             .when(!throttles.is_empty(), |p| {
                 p.child(caption_label("Throttle reasons", cx)).child(
                     div()
@@ -982,11 +1123,13 @@ impl Gpu {
                 .items_center()
                 .gap(px(7.))
                 .text_size(t.caption)
-                .child(div().size(px(9.)).rounded(px(2.)).bg(c.colour(t)))
-                .child(c.label())
+                .child(div().flex_shrink_0().size(px(9.)).rounded(px(2.)).bg(c.colour(t)))
+                .child(div().flex_shrink_0().child(c.label()))
                 .child(div().flex_1())
                 .child(
                     div()
+                        .min_w_0()
+                        .truncate()
                         .text_color(t.text_secondary)
                         .font_features(t.numbers.clone())
                         .child(detail),
@@ -999,7 +1142,7 @@ impl Gpu {
             "Each process's VRAM, grouped by what it is: AI and ML runtimes, display and UI, media, and everything \
              else. No process on this device reports GPU time, so the split is by memory."
         };
-        panel(IconName::ChartColumnStacked, "By category", cx)
+        section(IconName::ChartColumnStacked, "By category", cx)
             .child(bar)
             .child(div().flex().flex_col().gap(px(6.)).children(rows))
             .child(caption(explain, cx))
@@ -1054,7 +1197,7 @@ impl Gpu {
                 }))
                 .into_any_element()
         };
-        panel(IconName::List, "Processes on this GPU", cx)
+        section(IconName::List, "Processes on this GPU", cx)
             .child(body)
             .child(caption(
                 "Ranked by GPU time, then VRAM. A dash means the driver does not report that process's share.",
@@ -1103,9 +1246,8 @@ impl Render for Gpu {
             .py(t.page_padding)
             .child(header);
         let main = match device {
-            None => {
-                main.child(panel(IconName::Monitor, "GPU", cx).child(caption("No GPU reported by the collector.", cx)))
-            }
+            None => main
+                .child(section(IconName::Monitor, "GPU", cx).child(caption("No GPU reported by the collector.", cx))),
             Some(d) if suspended(d) => main.child(self.suspended_panel(d, cx)),
             Some(d) => main
                 .child(self.cards(d, cx))

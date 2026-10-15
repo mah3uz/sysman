@@ -7,11 +7,10 @@ use std::sync::{Arc, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use gpui::StyledImage;
 use gpui::{
     Anchor, AnyElement, App, AppContext, ClipboardItem, Context, Div, DragMoveEvent, EmptyView, Entity, FontWeight,
     Global, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, Window, div, img, prelude::FluentBuilder, px,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -40,11 +39,14 @@ use crate::data::source::{Combine, Source, top_up};
 use crate::screens::dashboard::{Groups, cpu_colour};
 use crate::ui::shell::{Focus, Tab, take_focus};
 use crate::ui::theme::theme;
+use crate::ui::widgets::app_icon::app_icon;
 use crate::ui::widgets::card::card;
+use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
 use crate::ui::widgets::hairline;
 use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::panel::caption_label;
 use crate::ui::widgets::range::{Range, range_picker, remember, remembered};
+use crate::ui::widgets::text::caption;
 
 const BUCKETS: u32 = 120;
 const RELOAD_S: f64 = 60.;
@@ -628,31 +630,6 @@ fn signal_name(signal: Signal) -> &'static str {
     }
 }
 
-/// An app icon from its `.desktop` file, else a generic glyph; kernel threads have no command line.
-pub(crate) fn process_icon(p: &Process, icons: &IconIndex, size: f32, cx: &App) -> AnyElement {
-    let glyph = if p.cmdline.is_empty() {
-        IconName::Cpu
-    } else {
-        IconName::AppWindow
-    };
-    let color = theme(cx).text_tertiary;
-    let generic = move || {
-        Icon::new(glyph)
-            .size(px(size))
-            .text_color(color)
-            .flex_shrink_0()
-            .into_any_element()
-    };
-    match icons.lookup(&p.comm, &p.cmdline) {
-        Some(path) => img(path.clone())
-            .size(px(size))
-            .flex_shrink_0()
-            .with_fallback(generic)
-            .into_any_element(),
-        None => generic(),
-    }
-}
-
 pub struct ProcessTable {
     pub model: Model,
     cols: Vec<Col>,
@@ -835,7 +812,7 @@ impl TableDelegate for ProcessTable {
                     .min_w_0()
                     .pl(px(f32::from(line.depth) * INDENT))
                     .when(self.model.hierarchy, |d| d.child(disclosure))
-                    .child(process_icon(p, &self.icons, 16., cx))
+                    .child(app_icon(&p.comm, &p.cmdline, &self.icons, 16., cx))
                     .child(
                         div()
                             .min_w_0()
@@ -856,7 +833,7 @@ impl TableDelegate for ProcessTable {
                 .map_or_else(|| unreadable("exe"), |exe| text(exe, t.text_secondary)),
             Col::Memory => number(bytes(p.rss_bytes as f64)),
             Col::MemPct => self.mem_total.filter(|&total| total > 0).map_or_else(dash, |total| {
-                number(format!("{:.1}%", 100. * p.rss_bytes as f64 / total as f64))
+                number(memory_share(100. * p.rss_bytes as f64 / total as f64))
             }),
             Col::Virtual => p.vsize_bytes.map_or_else(dash, |v| number(bytes(v as f64))),
             Col::Cpu => number(format!("{:.1}%", p.cpu_pct)),
@@ -959,6 +936,19 @@ impl Card {
     }
 }
 
+/// Below 1% a second decimal, so a small process on a large machine does not read as nothing.
+fn memory_share(pct: f64) -> String {
+    if pct >= 1. {
+        format!("{pct:.1}%")
+    } else if pct >= 0.01 {
+        format!("{pct:.2}%")
+    } else if pct > 0. {
+        "<0.01%".into()
+    } else {
+        "0%".into()
+    }
+}
+
 /// History read for one range and one selected process.
 struct Stored {
     range: Range,
@@ -967,9 +957,35 @@ struct Stored {
     proc_id: Option<i64>,
     cards: HashMap<Card, Vec<Bucket>>,
     fields: HashMap<ProcField, Vec<Bucket>>,
+    /// Earlier runs of the same program in the range, summed, and how many there were.
+    earlier: HashMap<ProcField, Vec<Bucket>>,
+    earlier_runs: usize,
 }
 
-fn load(range: Range, to: i64, selected: Option<Key>) -> Result<Stored> {
+/// Same name and command line, started before `start`, and seen inside the range.
+fn earlier_runs(
+    history: &History,
+    name: &(String, String),
+    start: u64,
+    from: i64,
+    current: Option<i64>,
+) -> Result<Vec<i64>> {
+    let (comm, cmdline) = name;
+    Ok(history
+        .find_procs(comm)?
+        .into_iter()
+        .filter(|p| {
+            &p.comm == comm
+                && p.cmdline.as_deref().unwrap_or_default() == cmdline
+                && Some(p.id) != current
+                && p.start_time < start as i64
+                && p.last_t >= from
+        })
+        .map(|p| p.id)
+        .collect())
+}
+
+fn load(range: Range, to: i64, selected: Option<Key>, name: Option<(String, String)>) -> Result<Stored> {
     let history = History::open(&db_path())?;
     let from = to - range.span_s();
     let mut cards = HashMap::new();
@@ -986,12 +1002,24 @@ fn load(range: Range, to: i64, selected: Option<Key>) -> Result<Stored> {
             fields.insert(field, history.proc_series(id, field, from, to, BUCKETS)?);
         }
     }
+    let ids = match (selected, &name) {
+        (Some((_, start)), Some(name)) => earlier_runs(&history, name, start, from, proc_id)?,
+        _ => Vec::new(),
+    };
+    let mut earlier = HashMap::new();
+    if !ids.is_empty() {
+        for field in [ProcField::Rss, ProcField::Cpu, ProcField::Fds] {
+            earlier.insert(field, history.procs_sum(&ids, field, from, to, BUCKETS)?);
+        }
+    }
     Ok(Stored {
         range,
         key: selected,
         proc_id,
         cards,
         fields,
+        earlier,
+        earlier_runs: ids.len(),
     })
 }
 
@@ -1013,6 +1041,7 @@ fn wall_clock() -> f64 {
 }
 
 pub struct Processes {
+    me: WeakEntity<Self>,
     live: Entity<Live>,
     feed: Entity<ProcessFeed>,
     table: Option<Entity<TableState<ProcessTable>>>,
@@ -1084,6 +1113,7 @@ impl Processes {
             (model.sort, model.descending) = (col, descending);
         }
         let mut this = Self {
+            me: cx.weak_entity(),
             live,
             feed,
             table: None,
@@ -1302,9 +1332,10 @@ impl Processes {
         self.loading = true;
         self.attempt = Some((self.range, selected, now));
         let range = self.range;
+        let name = self.inspected.as_ref().map(|p| (p.comm.clone(), p.cmdline.clone()));
         let task = cx
             .background_executor()
-            .spawn(async move { load(range, now as i64, selected) });
+            .spawn(async move { load(range, now as i64, selected, name) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
@@ -1382,14 +1413,6 @@ impl Processes {
     }
 }
 
-fn caption(text: impl Into<SharedString>, cx: &App) -> Div {
-    let t = theme(cx);
-    div()
-        .text_size(t.small_caption)
-        .text_color(t.text_secondary)
-        .child(text.into())
-}
-
 /// A captioned monospace value with a Copy button, or `absent` dimmed when there is nothing to copy.
 fn copyable(id: &'static str, label: &str, value: Option<String>, absent: &str, cx: &App) -> impl IntoElement {
     let t = theme(cx);
@@ -1440,6 +1463,63 @@ fn value_row(value: String, detail: Option<String>, cx: &App) -> impl IntoElemen
 }
 
 impl Processes {
+    fn expand(&self, card: Card) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        opener(self.me.clone(), card, |this, card, cx| Some(this.detail(*card, cx)))
+    }
+
+    fn detail(&self, card: Card, cx: &App) -> Detail {
+        let t = theme(cx);
+        let (title, icon, unit, y, color, meaning, method) = match card {
+            Card::Cpu => (
+                "CPU usage",
+                IconName::Cpu,
+                Unit::Percent,
+                YScale::Fixed(0., 100.),
+                t.green,
+                "The share of all logical CPUs that was busy. A long run near 100% means work is queueing for \
+                 the processor.",
+                "From /proc/stat: the change in busy time across all CPUs between two samples, divided by the \
+                 change in total time. Busy is everything except idle and I/O wait.",
+            ),
+            Card::Load => (
+                "Load average",
+                IconName::Activity,
+                Unit::Count,
+                YScale::Zero,
+                t.orange,
+                "The average number of tasks running or waiting to run, plus those in uninterruptible sleep, \
+                 usually waiting for disk. Above the number of logical CPUs, work is queueing.",
+                "The kernel's exponentially damped 1-minute load average from /proc/loadavg, read at each sample.",
+            ),
+            Card::Temp => (
+                "CPU temperature",
+                IconName::Thermometer,
+                Unit::Celsius,
+                YScale::Fit(10.),
+                t.orange,
+                "The processor package temperature. Sustained readings near its limit make it lower its clocks.",
+                "The CPU package sensor (coretemp or k10temp) from /sys/class/hwmon, in degrees Celsius.",
+            ),
+        };
+        Detail {
+            title: title.into(),
+            icon,
+            unit,
+            y,
+            fill: card == Card::Cpu,
+            lines: vec![Series {
+                label: title.into(),
+                color,
+                source: card.source(),
+            }],
+            rules: vec![],
+            meaning,
+            method,
+            range: self.range,
+            live: self.live.clone(),
+        }
+    }
+
     fn header(&self, sample: Option<&Sample>, cx: &App) -> impl IntoElement {
         let t = theme(cx);
         let cpu = sample.and_then(|s| s.cpu.as_ref());
@@ -1516,6 +1596,7 @@ impl Processes {
                     .gap(px(10.))
                     .child(
                         card("card-cpu", "CPU usage", cpu_color, cx)
+                            .on_click(self.expand(Card::Cpu))
                             .child(value_row(total.map_or("–".into(), |v| format!("{v:.0}%")), split, cx))
                             .child(with_peak(
                                 self.spark(Card::Cpu, cpu_color).fixed(100., "100%"),
@@ -1524,11 +1605,13 @@ impl Processes {
                     )
                     .child(
                         card("card-cores", "Cores", t.blue, cx)
+                            .on_click(self.expand(Card::Cpu))
                             .child(core_bars(bars, px(58.), cx))
                             .child(core_legend),
                     )
                     .child(
                         card("card-load", "Load average", t.orange, cx)
+                            .on_click(self.expand(Card::Load))
                             .child(value_row(
                                 load.map_or("–".into(), |l| format!("{:.2}", l[0])),
                                 load.map(|l| format!("5 min {:.2} · 15 min {:.2}", l[1], l[2])),
@@ -1541,6 +1624,7 @@ impl Processes {
                     )
                     .child(
                         card("card-temp", "CPU temperature", t.orange, cx)
+                            .on_click(self.expand(Card::Temp))
                             .child(value_row(
                                 temp.map_or("–".into(), |v| Unit::Celsius.format(v)),
                                 None,
@@ -1771,6 +1855,16 @@ impl Processes {
                 .child(label)
         };
         let field = |f: ProcField| Self::data(&self.fields, f);
+        let earlier_of = self
+            .stored
+            .as_ref()
+            .filter(|s| s.range == self.range && s.key == Some(key(p)) && s.earlier_runs > 0);
+        let earlier = |f: ProcField| -> Rc<[Bucket]> {
+            earlier_of
+                .and_then(|s| s.earlier.get(&f))
+                .map_or_else(|| Rc::from(Vec::new()), |b| Rc::from(b.as_slice()))
+        };
+        let runs = earlier_of.map_or(0, |s| s.earlier_runs);
         let fds_note = if p.fds.is_some() {
             "Open files, sockets and pipes. A steady climb can signal a handle leak."
         } else {
@@ -1787,7 +1881,7 @@ impl Processes {
                 .flex_row()
                 .items_center()
                 .gap(px(10.))
-                .child(process_icon(p, &icons, 32., cx))
+                .child(app_icon(&p.comm, &p.cmdline, &icons, 32., cx))
                 .child(
                     div()
                         .flex()
@@ -1814,11 +1908,23 @@ impl Processes {
             },
             cx,
         ))
+        .when(runs > 0, |d| {
+            let runs = if runs == 1 {
+                "1 earlier run".to_owned()
+            } else {
+                format!("{runs} earlier runs")
+            };
+            d.child(caption(
+                format!("Dashed lines: {runs} of the same command in this range, summed."),
+                cx,
+            ))
+        })
         .child(
             self.chart_section(
                 IconName::MemoryStick,
                 "Memory (RSS)",
                 self.chart(0)
+                    .dashed(earlier(ProcField::Rss), t.blue.opacity(0.5), "Earlier runs")
                     .line(field(ProcField::Rss), t.blue, "RSS")
                     .unit(Unit::Bytes),
                 None,
@@ -1831,6 +1937,7 @@ impl Processes {
                 IconName::Cpu,
                 "CPU",
                 self.chart(1)
+                    .dashed(earlier(ProcField::Cpu), t.green.opacity(0.5), "Earlier runs")
                     .line(field(ProcField::Cpu), t.green, "CPU")
                     .unit(Unit::Percent),
                 None,
@@ -1843,6 +1950,7 @@ impl Processes {
                 IconName::FileText,
                 "File descriptors",
                 self.chart(2)
+                    .dashed(earlier(ProcField::Fds), t.purple.opacity(0.5), "Earlier runs")
                     .line(field(ProcField::Fds), t.purple, "FDs")
                     .unit(Unit::Index),
                 None,
@@ -2029,6 +2137,15 @@ impl Render for Processes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_small_process_on_a_large_machine_still_shows_its_memory_share() {
+        let pct = 100. * (47 << 20) as f64 / (128u64 << 30) as f64;
+        assert_eq!(memory_share(pct), "0.04%", "47 MB of 128 GB is not 0.0%");
+        assert_eq!(memory_share(0.004), "<0.01%");
+        assert_eq!(memory_share(0.), "0%", "kernel threads own no memory");
+        assert_eq!(memory_share(12.34), "12.3%");
+    }
 
     fn proc(pid: u32, ppid: u32, comm: &str, rss: u64) -> Process {
         Process {
