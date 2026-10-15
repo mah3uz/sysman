@@ -65,7 +65,7 @@ checks its checksum, enables `sysmand` for your user and warns about missing
 shared libraries. It refuses to run over a pacman or dpkg install.
 
 ```bash
-curl -fsSL https://github.com/mah3uz/sysman/releases/latest/download/install.sh | sh
+curl -fsSL https://sysman.asmechanics.com/install.sh | sh
 ```
 
 Use `sh -s -- --version X.Y.Z` for another release, or run the script inside an
@@ -75,7 +75,7 @@ stop the services, run the script again with `--uninstall`. It keeps
 `~/.local/share/sysman` (history and crash log) unless you add `--purge`:
 
 ```bash
-curl -fsSL https://github.com/mah3uz/sysman/releases/latest/download/install.sh | sh -s -- --uninstall
+curl -fsSL https://sysman.asmechanics.com/install.sh | sh -s -- --uninstall
 ```
 
 ### The helper

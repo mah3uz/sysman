@@ -1,10 +1,34 @@
+import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import tailwindcss from '@tailwindcss/vite'
 
+const installScript = fileURLToPath(new URL('../../dist/install.sh', import.meta.url))
+
+// dist/install.sh stays the only copy; the site serves it at /install.sh
+function installSh() {
+  const serve = (req, res, next) => {
+    if (req.url?.split('?')[0] !== '/install.sh') return next()
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    res.end(readFileSync(installScript))
+  }
+  return {
+    name: 'install-sh',
+    configureServer(server) {
+      server.middlewares.use(serve)
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use(serve)
+    },
+    generateBundle() {
+      this.emitFile({ type: 'asset', fileName: 'install.sh', source: readFileSync(installScript) })
+    },
+  }
+}
+
 export default defineConfig({
-  plugins: [vue(), tailwindcss()],
+  plugins: [vue(), tailwindcss(), installSh()],
   resolve: {
     alias: { '@repo': fileURLToPath(new URL('../..', import.meta.url)) },
   },

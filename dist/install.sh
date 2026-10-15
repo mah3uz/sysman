@@ -1,6 +1,6 @@
 #!/bin/sh
 # Installs or removes sysman under /usr/local on distributions without a sysman package.
-#   curl -fsSL https://github.com/mah3uz/sysman/releases/latest/download/install.sh | sh
+#   curl -fsSL https://sysman.asmechanics.com/install.sh | sh
 #   ./install.sh [--version X.Y.Z]        from an extracted release tarball, or downloading it
 #   ./install.sh --uninstall [--purge]
 set -eu

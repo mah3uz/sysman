@@ -24,8 +24,8 @@ systemctl --user enable --now sysmand`,
   {
     id: 'other',
     label: 'Other distros',
-    intro: 'The install script puts the prebuilt x86-64 release under /usr/local with sudo, checks its checksum and starts the collector for you. Run it again with --uninstall to remove exactly what it installed.',
-    code: `curl -fsSL https://github.com/mah3uz/sysman/releases/latest/download/install.sh | sh`,
+    intro: 'The install script downloads the prebuilt x86-64 release from GitHub, verifies its checksums, installs it under /usr/local with sudo and starts the collector for you. Pass --version X.Y.Z for another release, or --uninstall to remove exactly what it installed.',
+    code: `curl -fsSL https://sysman.asmechanics.com/install.sh | sh`,
   },
   {
     id: 'source',

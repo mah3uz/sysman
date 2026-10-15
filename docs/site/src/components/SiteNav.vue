@@ -1,6 +1,7 @@
 <script setup>
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import Icon from './Icon.vue'
+import ThemeToggle from './ThemeToggle.vue'
 import logo from '@repo/assets/logo.svg'
 
 const links = [
@@ -36,7 +37,8 @@ onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
           <a :href="l.href" class="rounded-md px-3 py-1.5 transition hover:bg-line hover:text-ink">{{ l.label }}</a>
         </li>
       </ul>
-      <div class="ml-auto flex items-center gap-2">
+      <div class="ml-auto flex items-center gap-1.5 sm:gap-2">
+        <ThemeToggle />
         <a
           href="https://github.com/mah3uz/sysman"
           class="inline-flex h-9 items-center gap-2 rounded-lg px-2.5 text-sm text-muted transition hover:bg-line hover:text-ink"
