@@ -123,3 +123,11 @@ logs:
 # Remove build output, including packages
 clean:
     cargo clean
+
+# Run the website's dev server
+site:
+    cd docs/site && npm install && npm run dev
+
+# Build and deploy the website to Cloudflare (needs `npx wrangler login` once)
+site-deploy:
+    cd docs/site && npm ci && npm run deploy

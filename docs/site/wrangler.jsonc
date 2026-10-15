@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sysman-site",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./dist"
+  },
+  "routes": [{ "pattern": "sysman.asmechanics.com", "custom_domain": true }],
+  "workers_dev": false
+}
