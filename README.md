@@ -12,9 +12,8 @@ your machine is doing, and a native app that shows it live and as history.
   Unix socket.
 - **`sysman`** is a GPUI desktop app that reads that data.
 
-No root is needed for either. Status: the collector is complete and in daily
-use; the app has its Dashboard, Processes, GPU, Network and Disk tabs, with
-Energy, Hardware, Explorer, Insights, Groups and Disk Map still to come.
+No root is needed for either. The app has ten tabs: Dashboard, Processes, GPU,
+Energy, Network, Disk (with a Disk Map), Hardware, Explorer, Insights and Groups.
 
 ## Hardware support
 
