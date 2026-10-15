@@ -21,6 +21,7 @@ pub struct Sparkline {
     width_s: f64,
     gap_s: f64,
     fixed: Option<(f64, SharedString)>,
+    caption: Option<SharedString>,
 }
 
 impl Sparkline {
@@ -32,12 +33,19 @@ impl Sparkline {
             width_s,
             gap_s,
             fixed: None,
+            caption: None,
         }
     }
 
     /// Scale from zero to `max` instead of to the data, and say so.
     pub fn fixed(mut self, max: f64, label: impl Into<SharedString>) -> Self {
         self.fixed = Some((max, label.into()));
+        self
+    }
+
+    /// Top-right caption in place of the fixed axis note, such as "peak 97%".
+    pub fn caption(mut self, caption: impl Into<SharedString>) -> Self {
+        self.caption = Some(caption.into());
         self
     }
 
@@ -90,7 +98,10 @@ impl Sparkline {
 impl RenderOnce for Sparkline {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let t = theme(cx);
-        let caption = self.fixed.as_ref().map(|(_, label)| format!("Axis max {label}"));
+        let caption = self
+            .caption
+            .clone()
+            .or_else(|| self.fixed.as_ref().map(|(_, label)| format!("Axis max {label}").into()));
         let (size, color, numbers) = (t.small_caption, t.text_tertiary, t.numbers.clone());
         div()
             .relative()

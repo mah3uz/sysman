@@ -131,6 +131,30 @@ pub fn clock(t: f64, pattern: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Seconds before now for each label, now included, at most `max` of them on a round step.
+pub fn relative_ticks(span: f64, max: usize) -> Vec<f64> {
+    let step = TIME_STEPS
+        .iter()
+        .copied()
+        .find(|&s| span / s as f64 <= max as f64 - 1.)
+        .unwrap_or(TIME_STEPS[TIME_STEPS.len() - 1]) as f64;
+    (0..).map(|i| i as f64 * step).take_while(|&ago| ago <= span).collect()
+}
+
+/// `now`, `10m`, `3h`, `2d`.
+pub fn ago_label(ago: f64) -> String {
+    let s = ago.round() as i64;
+    if s == 0 {
+        "now".into()
+    } else if s % 86400 == 0 {
+        format!("{}d", s / 86400)
+    } else if s % 3600 == 0 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}m", s / 60)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum YScale {
     Fixed(f64, f64),
@@ -155,10 +179,11 @@ fn domain(y: YScale, unit: Unit, lo: f64, hi: f64) -> (f64, f64, Vec<f64>) {
             return (a, b, ticks);
         }
         YScale::Zero => {
-            let floor = if matches!(unit, Unit::Bytes | Unit::BytesPerSec) {
-                1024.
-            } else {
-                1.
+            // Percent ticks are whole numbers, so an idle percent axis still needs room for distinct labels.
+            let floor = match unit {
+                Unit::Bytes | Unit::BytesPerSec => 1024.,
+                Unit::Percent => 10.,
+                _ => 1.,
             };
             scaled_ticks(unit, 0., if hi.is_finite() { hi.max(floor) } else { floor })
         }
@@ -231,6 +256,7 @@ pub struct TrendChart {
     unit: Unit,
     y: YScale,
     fill: bool,
+    relative: bool,
     height: Pixels,
 }
 
@@ -249,6 +275,7 @@ impl TrendChart {
             unit: Unit::Percent,
             y: YScale::Zero,
             fill: false,
+            relative: false,
             height: px(150.),
         }
     }
@@ -283,6 +310,12 @@ impl TrendChart {
 
     pub fn fill(mut self) -> Self {
         self.fill = true;
+        self
+    }
+
+    /// X labels count back from now ("30m 20m 10m now") instead of showing clock times.
+    pub fn relative_axis(mut self) -> Self {
+        self.relative = true;
         self
     }
 
@@ -345,10 +378,17 @@ impl TrendChart {
         } else {
             "%H:%M"
         };
-        built.x_ticks = time_ticks(self.from, self.to, max_ticks, local_offset(self.to))
-            .into_iter()
-            .map(|tick| (self.x_of(&plot, tick), clock(tick, pattern).into()))
-            .collect();
+        built.x_ticks = if self.relative {
+            relative_ticks(self.to - self.from, (f32::from(plot.size.width) / 60.).max(3.) as usize)
+                .into_iter()
+                .map(|ago| (self.x_of(&plot, self.to - ago), ago_label(ago).into()))
+                .collect()
+        } else {
+            time_ticks(self.from, self.to, max_ticks, local_offset(self.to))
+                .into_iter()
+                .map(|tick| (self.x_of(&plot, tick), clock(tick, pattern).into()))
+                .collect()
+        };
 
         for line in &self.lines {
             let buckets: Vec<&Bucket> = self.visible(line).collect();
@@ -368,12 +408,18 @@ impl TrendChart {
                 }
                 let mut lower = at(|b| b.min);
                 lower.reverse();
+                // Straight and faint, so the recorded range reads as backdrop to the bold mean.
                 let mut band = PathBuilder::fill();
-                trace(&mut band, &at(|b| b.max), true);
-                trace(&mut band, &lower, false);
+                for (i, &(x, y)) in at(|b| b.max).iter().chain(&lower).enumerate() {
+                    if i == 0 {
+                        band.move_to(point(px(x), px(y)));
+                    } else {
+                        band.line_to(point(px(x), px(y)));
+                    }
+                }
                 band.close();
                 if let Ok(path) = band.build() {
-                    built.under.push((path, line.color.opacity(0.2).into()));
+                    built.under.push((path, line.color.opacity(0.1).into()));
                 }
                 if self.fill {
                     let mut area = PathBuilder::fill();
@@ -744,6 +790,14 @@ mod tests {
         assert_eq!(ticks.len(), 6);
         let shifted = time_ticks(from, from + 86400., 8, 3600);
         assert!(shifted.iter().all(|t| (*t as i64 + 3600) % 10800 == 0), "{shifted:?}");
+    }
+
+    #[test]
+    fn relative_labels_count_back_from_now() {
+        let labels: Vec<String> = relative_ticks(1800., 4).into_iter().map(ago_label).collect();
+        assert_eq!(labels, ["now", "10m", "20m", "30m"]);
+        let labels: Vec<String> = relative_ticks(7. * 86400., 5).into_iter().map(ago_label).collect();
+        assert_eq!(labels, ["now", "2d", "4d", "6d"]);
     }
 
     #[test]

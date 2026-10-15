@@ -1,4 +1,6 @@
-use gpui::{App, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, div, px};
+use gpui::{
+    App, Div, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString, Stateful, Styled, div, px,
+};
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 
@@ -15,6 +17,20 @@ pub fn metric_card(
     spark: Sparkline,
     cx: &App,
 ) -> impl IntoElement {
+    let t = theme(cx);
+    card(id, label, color, cx)
+        .child(
+            div()
+                .text_size(t.card_value)
+                .font_weight(FontWeight::SEMIBOLD)
+                .font_features(t.numbers.clone())
+                .child(value.into()),
+        )
+        .child(spark)
+}
+
+/// The card frame and its dotted caption row; callers add the body.
+pub fn card(id: &'static str, label: &str, color: Hsla, cx: &App) -> Stateful<Div> {
     let t = theme(cx);
     let hover = (t.card_hover, color.opacity(0.45));
     hairline(
@@ -44,12 +60,4 @@ pub fn metric_card(
             .child(div().flex_1())
             .child(Icon::new(IconName::Info).xsmall().text_color(t.text_tertiary)),
     )
-    .child(
-        div()
-            .text_size(t.card_value)
-            .font_weight(FontWeight::SEMIBOLD)
-            .font_features(t.numbers.clone())
-            .child(value.into()),
-    )
-    .child(spark)
 }

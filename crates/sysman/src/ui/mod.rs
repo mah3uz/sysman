@@ -29,7 +29,15 @@ gpui_kit_assets::icon_assets!(
         ArrowDown,
         ArrowUp,
         Database,
-        Flame
+        Flame,
+        Search,
+        ListTree,
+        ChevronRight,
+        ChevronDown,
+        MemoryStick,
+        FileText,
+        AppWindow,
+        SquareTerminal
     ]
 );
 

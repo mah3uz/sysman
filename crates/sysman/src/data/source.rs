@@ -81,50 +81,62 @@ impl Source {
                 rows.entry(ms).or_insert_with(|| vec![None; self.paths.len()])[i] = Some(v);
             }
         }
-        if !start.is_finite() {
-            return stored.to_vec();
-        }
-        let w = width.max(1);
-        // The first bucket the ring covers whole; history keeps everything before it.
-        let cut = ((start.ceil() as i64) + w - 1).div_euclid(w) * w;
-        let mut out: Vec<Bucket> = stored.iter().copied().filter(|b| b.t < cut).collect();
-        let mut current: Option<(Bucket, u32)> = None;
-        for (ms, row) in rows {
-            let Some(v) = self.combine.apply(&row) else {
-                continue;
-            };
-            let b = ms.div_euclid(1000).div_euclid(w) * w;
-            if b < cut || b < from {
-                continue;
-            }
-            match &mut current {
-                Some((bucket, n)) if bucket.t == b => {
-                    bucket.min = bucket.min.min(v);
-                    bucket.max = bucket.max.max(v);
-                    bucket.avg += v;
-                    *n += 1;
-                }
-                _ => {
-                    if let Some((done, n)) = current.take() {
-                        out.push(average(done, n));
-                    }
-                    current = Some((
-                        Bucket {
-                            t: b,
-                            min: v,
-                            avg: v,
-                            max: v,
-                        },
-                        1,
-                    ));
-                }
-            }
-        }
-        if let Some((done, n)) = current {
-            out.push(average(done, n));
-        }
-        out
+        let points = rows
+            .into_iter()
+            .filter_map(|(ms, row)| Some((ms, self.combine.apply(&row)?)));
+        top_up(stored, start, points, from, width)
     }
+}
+
+/// `stored` up to the first bucket that `points` (ms, value; oldest first, starting at `start` s) cover whole,
+/// then the points bucketed on the same grid.
+pub fn top_up(
+    stored: &[Bucket],
+    start: f64,
+    points: impl IntoIterator<Item = (i64, f64)>,
+    from: i64,
+    width: i64,
+) -> Vec<Bucket> {
+    if !start.is_finite() {
+        return stored.to_vec();
+    }
+    let w = width.max(1);
+    // The first bucket the points cover whole; history keeps everything before it.
+    let cut = ((start.ceil() as i64) + w - 1).div_euclid(w) * w;
+    let mut out: Vec<Bucket> = stored.iter().copied().filter(|b| b.t < cut).collect();
+    let mut current: Option<(Bucket, u32)> = None;
+    for (ms, v) in points {
+        let b = ms.div_euclid(1000).div_euclid(w) * w;
+        if b < cut || b < from {
+            continue;
+        }
+        match &mut current {
+            Some((bucket, n)) if bucket.t == b => {
+                bucket.min = bucket.min.min(v);
+                bucket.max = bucket.max.max(v);
+                bucket.avg += v;
+                *n += 1;
+            }
+            _ => {
+                if let Some((done, n)) = current.take() {
+                    out.push(average(done, n));
+                }
+                current = Some((
+                    Bucket {
+                        t: b,
+                        min: v,
+                        avg: v,
+                        max: v,
+                    },
+                    1,
+                ));
+            }
+        }
+    }
+    if let Some((done, n)) = current {
+        out.push(average(done, n));
+    }
+    out
 }
 
 fn average(mut bucket: Bucket, n: u32) -> Bucket {

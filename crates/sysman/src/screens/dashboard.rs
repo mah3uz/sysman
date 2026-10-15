@@ -12,6 +12,7 @@ use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 use schema::Sample;
 use schema::cpu::CpuMeta;
+use schema::processes::Process;
 
 use crate::charts::core_bars::{CoreBar, core_bars};
 use crate::charts::format::{Unit, bytes, duration};
@@ -21,6 +22,7 @@ use crate::charts::trend::{ChartState, TrendChart, YScale, clock};
 use crate::data::history::{Bucket, History, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::pressure::{self, Band, CRITICAL, WARNING};
+use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source, matching};
 use crate::ui::shell::Tab;
 use crate::ui::theme::{Theme, theme};
@@ -178,6 +180,7 @@ struct Charts {
 
 pub struct Dashboard {
     live: Entity<Live>,
+    feed: Entity<ProcessFeed>,
     range: Range,
     stored: Option<Stored>,
     loading: bool,
@@ -199,10 +202,12 @@ fn wall_clock() -> f64 {
 }
 
 impl Dashboard {
-    pub fn new(live: Entity<Live>, cx: &mut Context<Self>) -> Self {
+    pub fn new(live: Entity<Live>, feed: Entity<ProcessFeed>, cx: &mut Context<Self>) -> Self {
         cx.observe(&live, |this, _, cx| this.refresh(cx)).detach();
+        cx.observe(&feed, |_, _, cx| cx.notify()).detach();
         let mut this = Self {
             live,
+            feed,
             range: remembered(Tab::Dashboard, cx),
             stored: None,
             loading: false,
@@ -223,6 +228,7 @@ impl Dashboard {
     #[cfg(debug_assertions)]
     pub fn ready(&self, cx: &App) -> bool {
         self.live.read(cx).latest.is_some()
+            && self.feed.read(cx).latest.is_some()
             && !self.loading
             && self.attempt.is_some_and(|(range, _)| range == self.range)
     }
@@ -345,13 +351,13 @@ impl Dashboard {
     }
 }
 
-struct Groups {
+pub(crate) struct Groups {
     /// Label, colour and the logical CPUs in each group, in display order.
-    groups: Vec<(SharedString, Hsla, Vec<u32>)>,
+    pub(crate) groups: Vec<(SharedString, Hsla, Vec<u32>)>,
 }
 
 impl Groups {
-    fn new(meta: Option<&CpuMeta>, t: &Theme) -> Self {
+    pub(crate) fn new(meta: Option<&CpuMeta>, t: &Theme) -> Self {
         let colours = [t.blue, t.teal, t.purple, t.indigo, t.pink];
         let Some(topology) = meta.map(|m| &m.topology) else {
             return Self { groups: Vec::new() };
@@ -371,17 +377,17 @@ impl Groups {
         Self { groups }
     }
 
-    fn of(&self, cpu: u32) -> Option<&(SharedString, Hsla, Vec<u32>)> {
+    pub(crate) fn of(&self, cpu: u32) -> Option<&(SharedString, Hsla, Vec<u32>)> {
         self.groups.iter().find(|g| g.2.contains(&cpu))
     }
 
-    fn mean(cores: &[f64], cpus: &[u32]) -> f64 {
+    pub(crate) fn mean(cores: &[f64], cpus: &[u32]) -> f64 {
         let values: Vec<f64> = cpus.iter().filter_map(|&c| cores.get(c as usize).copied()).collect();
         values.iter().sum::<f64>() / values.len().max(1) as f64
     }
 }
 
-fn cpu_colour(pct: f64, t: &Theme) -> Hsla {
+pub(crate) fn cpu_colour(pct: f64, t: &Theme) -> Hsla {
     if pct >= 85. {
         t.red
     } else if pct >= 60. {
@@ -830,32 +836,22 @@ impl Dashboard {
         });
 
         let swap_total = memory.map_or(0., |m| m.swap_total_bytes as f64);
-        let processes = sample.and_then(|s| s.processes.as_ref());
-        let top_cpu = processes
-            .map(|p| {
-                p.top_cpu
-                    .iter()
-                    .take(TOP_ROWS)
-                    .map(|r| (r.comm.clone(), format!("{:.1}%", r.cpu_pct)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let top_disk = processes
-            .and_then(|p| p.top_io.as_ref())
-            .map(|rows| {
-                rows.iter()
-                    .map(|r| {
-                        (
-                            r.comm.clone(),
-                            (r.read_bps.unwrap_or(0) + r.write_bps.unwrap_or(0)) as f64,
-                        )
-                    })
-                    .filter(|(_, bps)| *bps > 0.)
-                    .take(TOP_ROWS)
-                    .map(|(comm, bps)| (comm, Unit::BytesPerSec.format(bps)))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let rows = self.feed.read(cx).table().map_or(&[][..], |t| t.rows.as_slice());
+        let mut by_cpu: Vec<&Process> = rows.iter().collect();
+        by_cpu.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
+        let top_cpu = by_cpu
+            .into_iter()
+            .take(TOP_ROWS)
+            .map(|r| (r.comm.clone(), format!("{:.1}%", r.cpu_pct)))
+            .collect();
+        let io = |r: &Process| (r.read_bps.unwrap_or(0) + r.write_bps.unwrap_or(0)) as f64;
+        let mut by_io: Vec<&Process> = rows.iter().filter(|r| io(r) > 0.).collect();
+        by_io.sort_by(|a, b| io(b).total_cmp(&io(a)));
+        let top_disk = by_io
+            .into_iter()
+            .take(TOP_ROWS)
+            .map(|r| (r.comm.clone(), Unit::BytesPerSec.format(io(r))))
+            .collect();
 
         div()
             .flex()

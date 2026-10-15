@@ -6788,6 +6788,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-platform",
  "jiff",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

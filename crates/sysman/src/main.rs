@@ -17,6 +17,21 @@ fn main() {
             let component = gpui_component::Theme::global_mut(cx);
             component.font_family = theme.font.clone();
             component.mono_font_family = theme.mono.clone();
+            macro_rules! table_colour {
+                ($($field:ident = $value:expr),*) => {$(
+                    component.colors.$field = $value;
+                    component.tokens.$field = $value.into();
+                )*};
+            }
+            let clear = gpui::transparent_black();
+            table_colour!(
+                table = clear,
+                table_head = clear,
+                table_row_border = clear,
+                table_even = gpui::white().opacity(0.03),
+                table_hover = gpui::white().opacity(0.05),
+                table_active = theme.selection
+            );
             cx.set_global(theme);
 
             let shell = cx.new(Shell::new);
@@ -33,7 +48,12 @@ fn main() {
 #[cfg(debug_assertions)]
 fn open_when_ready(shell: Entity<Shell>, cx: &mut App) {
     cx.spawn(async move |cx| {
+        let started = std::time::Instant::now();
         while !cx.update(|cx| shell.read(cx).ready(cx)) {
+            if started.elapsed() > std::time::Duration::from_secs(20) {
+                eprintln!("SYSMAN_DEV_OPEN_AFTER_DATA: not ready after 20 s (no daemon, or SYSMAN_DEV_SELECT matches nothing); opening anyway");
+                break;
+            }
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(100))
                 .await;

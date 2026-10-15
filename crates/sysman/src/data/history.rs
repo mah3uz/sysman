@@ -42,7 +42,7 @@ impl Tier {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProcField {
     Cpu,
     Rss,
@@ -156,6 +156,18 @@ impl History {
             ),
         };
         self.bucketed(table, "proc_id", proc_id, &aggregates, from, to, w)
+    }
+
+    /// The recorded process instance `(pid, start_time)`, if the daemon has stored it yet.
+    pub fn proc_id(&self, pid: u32, start_time: u64) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM procs WHERE pid = ?1 AND start_time = ?2",
+                params![pid, start_time as i64],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Processes whose command name contains `name`, ignoring case, most recently seen first.
@@ -341,6 +353,8 @@ mod tests {
         assert_eq!((cpu[0].min, cpu[0].max), (20.0, 80.0));
         assert_eq!(h.proc_series(1, ProcField::Fds, 0, DAY, 1).unwrap()[0].max, 12.0);
 
+        assert_eq!(h.proc_id(42, 100).unwrap(), Some(1));
+        assert_eq!(h.proc_id(42, 101).unwrap(), None, "a reused pid is another process");
         let found = h.find_procs("FIRE").unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!((found[0].pid, found[0].cmdline.as_deref()), (42, Some("firefox --x")));

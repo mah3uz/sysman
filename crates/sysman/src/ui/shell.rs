@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,9 @@ use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 
 use crate::data::live::{self, Conn, Event, Live};
+use crate::data::process::{self, Interval, ProcessFeed};
 use crate::screens::dashboard::Dashboard;
+use crate::screens::processes::Processes;
 use crate::ui::theme::{Theme, theme};
 
 const TITLE_BAR_HEIGHT: Pixels = px(38.);
@@ -123,6 +126,9 @@ pub struct Shell {
     active: AnyView,
     live: Entity<Live>,
     events: Option<Receiver<Event>>,
+    feed: Entity<ProcessFeed>,
+    feed_events: Option<Receiver<process::Event>>,
+    feed_interval: Interval,
     refresh: Refresh,
     drawn: Instant,
     pending: bool,
@@ -141,28 +147,65 @@ impl Shell {
             }
         })
         .detach();
+        let feed = cx.new(|_| ProcessFeed::default());
+        let feed_interval = Interval::default();
+        #[cfg(debug_assertions)]
+        let tab = std::env::var("SYSMAN_DEV_TAB")
+            .ok()
+            .and_then(|name| Tab::ALL.into_iter().find(|t| t.label().eq_ignore_ascii_case(&name)))
+            .unwrap_or(Tab::Dashboard);
+        #[cfg(not(debug_assertions))]
         let tab = Tab::Dashboard;
-        Self {
+        let shell = Self {
             tab,
-            active: mount(tab, &live, cx),
+            active: mount(tab, &live, &feed, cx),
             events: live::socket_path().map(live::spawn),
+            feed_events: live::socket_path().map(|path| process::spawn(path, feed_interval.clone())),
+            feed_interval,
+            feed,
             live,
             refresh: Refresh::CHOICES[0],
             drawn: Instant::now(),
             pending: false,
-        }
+        };
+        shell.sync_feed();
+        shell
+    }
+
+    /// Only the tabs that show the process table pay for the daemon's scan.
+    fn sync_feed(&self) {
+        let ms = match self.tab {
+            Tab::Dashboard | Tab::Processes => self.refresh.0.as_millis() as u64,
+            _ => 0,
+        };
+        self.feed_interval.store(ms, Ordering::Relaxed);
     }
 
     /// For the first-frame aid: the mounted Dashboard has a sample and its history.
     #[cfg(debug_assertions)]
     pub fn ready(&self, cx: &App) -> bool {
-        self.active
-            .clone()
-            .downcast::<Dashboard>()
-            .is_ok_and(|dashboard| dashboard.read(cx).ready(cx))
+        let active = self.active.clone();
+        match active.downcast::<Dashboard>() {
+            Ok(dashboard) => dashboard.read(cx).ready(cx),
+            Err(active) => active
+                .downcast::<Processes>()
+                .is_ok_and(|processes| processes.read(cx).ready(cx)),
+        }
     }
 
     fn drain(&mut self, cx: &mut Context<Self>) {
+        if let Some(events) = &self.feed_events {
+            self.feed.update(cx, |feed, cx| {
+                let mut changed = false;
+                for event in events.try_iter() {
+                    changed = true;
+                    feed.apply(event);
+                }
+                if changed {
+                    cx.notify();
+                }
+            });
+        }
         let Some(events) = &self.events else {
             return;
         };
@@ -188,7 +231,8 @@ impl Shell {
     fn select(&mut self, tab: Tab, cx: &mut Context<Self>) {
         if tab != self.tab {
             self.tab = tab;
-            self.active = mount(tab, &self.live, cx);
+            self.sync_feed();
+            self.active = mount(tab, &self.live, &self.feed, cx);
             cx.notify();
         }
     }
@@ -291,6 +335,7 @@ impl Shell {
                             shell
                                 .update(cx, |shell, cx| {
                                     shell.refresh = choice;
+                                    shell.sync_feed();
                                     cx.notify();
                                 })
                                 .ok();
@@ -319,10 +364,11 @@ impl Render for Shell {
     }
 }
 
-fn mount(tab: Tab, live: &Entity<Live>, cx: &mut App) -> AnyView {
-    let live = live.clone();
+fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App) -> AnyView {
+    let (live, feed) = (live.clone(), feed.clone());
     match tab {
-        Tab::Dashboard => cx.new(|cx| Dashboard::new(live, cx)).into(),
+        Tab::Dashboard => cx.new(|cx| Dashboard::new(live, feed, cx)).into(),
+        Tab::Processes => cx.new(|cx| Processes::new(live, feed, cx)).into(),
         _ => cx.new(|_| Placeholder { tab, live }).into(),
     }
 }
