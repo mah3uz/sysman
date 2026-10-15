@@ -32,7 +32,7 @@ use crate::data::process::ProcessFeed;
 use crate::data::source::top_up;
 use crate::screens::processes::Icons;
 use crate::ui::shell::Tab;
-use crate::ui::theme::{Theme, theme};
+use crate::ui::theme::{Theme, rem_px, theme};
 use crate::ui::widgets::app_icon::app_icon;
 use crate::ui::widgets::hairline;
 use crate::ui::widgets::panel::{caption_label, frame, heading};
@@ -490,11 +490,12 @@ impl Groups {
             .collect();
         let editor = cx.new(|cx| Editor::new(target, &group, others, live, screen, feed, window, cx));
         let title = if target.is_some() { "Edit group" } else { "New group" };
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, window, _| {
+            let rem = window.rem_size();
             dialog
                 .title(title)
-                .w(px(EDITOR_WIDTH))
-                .margin_top(px(40.))
+                .w(rem_px(EDITOR_WIDTH).to_pixels(rem))
+                .margin_top(rem_px(40.).to_pixels(rem))
                 .child(editor.clone())
         });
     }
@@ -513,8 +514,11 @@ impl Groups {
         let screen = cx.entity().downgrade();
         let name = group.name.clone();
         let renamer = cx.new(|cx| Renamer::new(i, &name, others, screen, window, cx));
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title("Rename group").w(px(380.)).child(renamer.clone())
+        window.open_dialog(cx, move |dialog, window, _| {
+            dialog
+                .title("Rename group")
+                .w(rem_px(380.).to_pixels(window.rem_size()))
+                .child(renamer.clone())
         });
     }
 
@@ -573,7 +577,7 @@ fn icon_index(cx: &App) -> Arc<IconIndex> {
 }
 
 fn dot(color: Hsla, size: f32) -> Div {
-    div().flex_shrink_0().size(px(size)).rounded_full().bg(color)
+    div().flex_shrink_0().size(rem_px(size)).rounded_full().bg(color)
 }
 
 fn share(part: f64, whole: Option<u64>) -> String {
@@ -591,10 +595,10 @@ impl Groups {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(10.))
+            .gap(rem_px(10.))
             .px(t.page_padding)
-            .pt(px(14.))
-            .pb(px(12.))
+            .pt(rem_px(14.))
+            .pb(rem_px(12.))
             .child(
                 div()
                     .flex()
@@ -605,8 +609,8 @@ impl Groups {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.))
-                            .child(div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child("Groups"))
+                            .gap(rem_px(6.))
+                            .child(div().text_size(rem_px(17.)).font_weight(t.weight_semibold).child("Groups"))
                             .child(
                                 div()
                                     .id("groups-info")
@@ -698,7 +702,7 @@ impl Groups {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(7.))
+                .gap(rem_px(7.))
                 .child(dot(tint, 8.))
                 .child(
                     div()
@@ -707,14 +711,14 @@ impl Groups {
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(t.panel_title)
+                        .font_weight(t.weight_semibold)
                         .child(group.name.clone()),
                 )
                 .child(
                     div()
                         .text_size(t.card_value)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(t.weight_semibold)
                         .font_features(t.numbers.clone())
                         .child(now.map_or("–".into(), |n| share(n.rss as f64, total))),
                 ),
@@ -723,7 +727,7 @@ impl Groups {
             div()
                 .flex()
                 .flex_row()
-                .gap(px(6.))
+                .gap(rem_px(6.))
                 .child(
                     caption(detail, cx)
                         .flex_1()
@@ -769,7 +773,7 @@ impl Groups {
             .map(|&i| self.disabled_row(i, cx).into_any_element())
             .collect();
         let t = theme(cx);
-        let section = |label: &str, cx: &App| div().pt(px(10.)).pb(px(2.)).child(caption_label(label, cx));
+        let section = |label: &str, cx: &App| div().pt(rem_px(10.)).pb(rem_px(2.)).child(caption_label(label, cx));
         div()
             .id("groups-list")
             .size_full()
@@ -780,20 +784,20 @@ impl Groups {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(8.))
-                    .p(px(12.))
+                    .gap(rem_px(8.))
+                    .p(rem_px(12.))
                     .when(cards.is_empty(), |d| {
                         d.child(
                             div()
-                                .py(px(18.))
-                                .px(px(6.))
+                                .py(rem_px(18.))
+                                .px(rem_px(6.))
                                 .flex()
                                 .flex_col()
                                 .gap(px(4.))
                                 .child(
                                     div()
-                                        .text_size(px(13.))
-                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(t.panel_title)
+                                        .font_weight(t.weight_semibold)
                                         .child("No groups yet"),
                                 )
                                 .child(caption(
@@ -834,9 +838,9 @@ impl Groups {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(8.))
-                .py(px(7.))
-                .px(px(10.))
+                .gap(rem_px(8.))
+                .py(rem_px(7.))
+                .px(rem_px(10.))
                 .rounded(t.sub_radius)
                 .border_color(t.hairline),
             t.hairline_width,
@@ -851,7 +855,7 @@ impl Groups {
                 .flex_col()
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(rem_px(12.))
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
@@ -881,15 +885,15 @@ impl Groups {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.))
-            .py(px(4.))
-            .px(px(10.))
+            .gap(rem_px(8.))
+            .py(rem_px(4.))
+            .px(rem_px(10.))
             .child(dot(colour(group.colour, t).opacity(0.4), 7.))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(12.))
+                    .text_size(rem_px(12.))
                     .text_color(t.text_secondary)
                     .overflow_hidden()
                     .text_ellipsis()
@@ -965,8 +969,8 @@ impl Groups {
                 .items_end()
                 .child(
                     div()
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(t.panel_title)
+                        .font_weight(t.weight_semibold)
                         .font_features(t.numbers.clone())
                         .child(value),
                 )
@@ -985,14 +989,14 @@ impl Groups {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(5.))
+                            .gap(rem_px(5.))
                             .child(dot(tint, 6.))
                             .child(caption_label(headline_label, cx)),
                     )
                     .child(
                         div()
-                            .text_size(px(34.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(rem_px(34.))
+                            .font_weight(t.weight_semibold)
                             .font_features(t.numbers.clone())
                             .child(headline),
                     )
@@ -1003,7 +1007,7 @@ impl Groups {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(8.))
+                    .gap(rem_px(8.))
                     .child(metric(
                         memory.map_or("–".into(), bytes),
                         &format!("Memory ({lens_word})"),
@@ -1039,7 +1043,7 @@ impl Groups {
             .child(
                 heading(IconName::ChartLine, "Over time", cx)
                     .child(div().flex_1())
-                    .gap(px(8.))
+                    .gap(rem_px(8.))
                     .child(segmented(
                         "lens",
                         [(Lens::Average, "Average"), (Lens::Peak, "Peak")].iter().copied(),
@@ -1094,7 +1098,7 @@ impl Groups {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.))
+            .gap(rem_px(6.))
             .child(dot(colour(group.colour, t), 10.))
             .child(
                 div()
@@ -1103,8 +1107,8 @@ impl Groups {
                     .min_w_0()
                     .child(
                         div()
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(t.card_value)
+                            .font_weight(t.weight_semibold)
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
@@ -1172,20 +1176,20 @@ impl Groups {
         ];
         let cell = |w: f32, right: bool| {
             div()
-                .w(px(w))
+                .w(rem_px(w))
                 .flex_shrink_0()
                 .flex()
                 .when(right, |d| d.justify_end())
-                .px(px(6.))
+                .px(rem_px(6.))
         };
         let head = div()
             .flex()
             .flex_row()
             .items_center()
-            .h(px(24.))
-            .px(px(6.))
-            .text_size(px(12.))
-            .font_weight(FontWeight::SEMIBOLD)
+            .h(rem_px(24.))
+            .px(rem_px(6.))
+            .text_size(rem_px(12.))
+            .font_weight(t.weight_semibold)
             .border_b_1()
             .border_color(t.hairline)
             .child(div().flex_1().min_w_0().child("Process"))
@@ -1196,9 +1200,9 @@ impl Groups {
                 .flex()
                 .flex_row()
                 .items_center()
-                .h(px(26.))
-                .px(px(6.))
-                .text_size(px(12.))
+                .h(rem_px(26.))
+                .px(rem_px(6.))
+                .text_size(rem_px(12.))
                 .font_features(t.numbers.clone())
                 .when(k % 2 == 1, |d| d.bg(gpui::white().opacity(0.03)))
                 .child(
@@ -1208,7 +1212,7 @@ impl Groups {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(6.))
+                        .gap(rem_px(6.))
                         .child(app_icon(&p.comm, &p.cmdline, &self.icons, 16., cx))
                         .child(
                             div()
@@ -1233,11 +1237,11 @@ impl Groups {
                 .child(
                     cell(cols[5].1, false)
                         .items_center()
-                        .gap(px(6.))
+                        .gap(rem_px(6.))
                         .child(div().flex_1().child(proportion(fraction, tint, cx)))
                         .child(
                             div()
-                                .w(px(34.))
+                                .w(rem_px(34.))
                                 .flex()
                                 .justify_end()
                                 .child(format!("{:.0}%", fraction * 100.)),
@@ -1265,7 +1269,7 @@ impl Groups {
                     .flex_col()
                     .child(head)
                     .children(body)
-                    .children(empty.map(|e| caption(e, cx).py(px(14.)).flex().justify_center())),
+                    .children(empty.map(|e| caption(e, cx).py(rem_px(14.)).flex().justify_center())),
             )
     }
 }
@@ -1283,16 +1287,16 @@ impl Render for Groups {
         let detail = match self.selected {
             Some(i) if i < self.groups.len() => self.detail(i, cx),
             _ => div()
-                .pt(px(60.))
+                .pt(rem_px(60.))
                 .flex()
                 .flex_col()
                 .items_center()
-                .gap(px(6.))
-                .child(Icon::new(IconName::Layers).size(px(28.)).text_color(theme(cx).text_tertiary))
+                .gap(rem_px(6.))
+                .child(Icon::new(IconName::Layers).size(rem_px(28.)).text_color(theme(cx).text_tertiary))
                 .child(
                     div()
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(theme(cx).panel_title)
+                        .font_weight(theme(cx).weight_semibold)
                         .child(if self.groups.iter().any(|g| g.enabled) {
                             "No group selected"
                         } else {
@@ -1319,7 +1323,7 @@ impl Render for Groups {
             .children(notes.into_iter().map(|n| {
                 div()
                     .px(t.page_padding)
-                    .pb(px(6.))
+                    .pb(rem_px(6.))
                     .text_size(t.caption)
                     .text_color(t.orange)
                     .child(n)
@@ -1488,16 +1492,16 @@ impl Editor {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.))
-            .p(px(6.))
+            .gap(rem_px(6.))
+            .p(rem_px(6.))
             .rounded(t.sub_radius)
             .bg(t.card)
             .child(
                 div()
                     .id(("not", id))
-                    .px(px(6.))
-                    .py(px(3.))
-                    .rounded(px(5.))
+                    .px(rem_px(6.))
+                    .py(rem_px(3.))
+                    .rounded(rem_px(5.))
                     .text_size(t.small_caption)
                     .font_weight(FontWeight::BOLD)
                     .map(|d| {
@@ -1520,7 +1524,7 @@ impl Editor {
                 Button::new(("field", id))
                     .outline()
                     .small()
-                    .w(px(130.))
+                    .w(rem_px(130.))
                     .label(field.label())
                     .dropdown_menu_with_anchor(gpui::Anchor::TopLeft, move |mut menu, _, _| {
                         for f in Field::ALL {
@@ -1545,7 +1549,7 @@ impl Editor {
                 Button::new(("op", id))
                     .outline()
                     .small()
-                    .w(px(104.))
+                    .w(rem_px(104.))
                     .label(op.label())
                     .dropdown_menu_with_anchor(gpui::Anchor::TopLeft, move |mut menu, _, _| {
                         for o in Op::ALL {
@@ -1593,11 +1597,11 @@ impl Editor {
             div()
                 .flex()
                 .flex_row()
-                .gap(px(6.))
+                .gap(rem_px(6.))
                 .text_color(t.orange)
                 .child("No conditions yet: this group matches nothing.")
         } else {
-            div().flex().flex_row().gap(px(6.)).child(format!(
+            div().flex().flex_row().gap(rem_px(6.)).child(format!(
                 "Caught now: {} {} · {} · {} of RAM · {:.1}% CPU",
                 caught.len(),
                 if caught.len() == 1 { "process" } else { "processes" },
@@ -1609,15 +1613,15 @@ impl Editor {
         div()
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(rem_px(6.))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(6.))
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::MEDIUM)
+                    .gap(rem_px(6.))
+                    .text_size(rem_px(12.))
+                    .font_weight(t.weight_medium)
                     .font_features(t.numbers.clone())
                     .child(dot(tint, 7.))
                     .child(heading),
@@ -1625,28 +1629,28 @@ impl Editor {
             .child(
                 div()
                     .id("preview")
-                    .h(px(PREVIEW_HEIGHT))
+                    .h(rem_px(PREVIEW_HEIGHT))
                     .overflow_y_scroll()
                     .rounded(t.sub_radius)
                     .bg(t.card)
                     .when(draft.has_conditions() && caught.is_empty(), |d| {
-                        d.child(caption("Nothing running matches these rules right now.", cx).p(px(10.)))
+                        d.child(caption("Nothing running matches these rules right now.", cx).p(rem_px(10.)))
                     })
                     .children(caught.iter().enumerate().map(|(k, p)| {
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(8.))
-                            .h(px(24.))
-                            .px(px(8.))
-                            .text_size(px(12.))
+                            .gap(rem_px(8.))
+                            .h(rem_px(24.))
+                            .px(rem_px(8.))
+                            .text_size(rem_px(12.))
                             .font_features(t.numbers.clone())
                             .when(k % 2 == 1, |d| d.bg(gpui::white().opacity(0.03)))
                             .child(app_icon(&p.comm, &p.cmdline, &icons, 14., cx))
                             .child(
                                 div()
-                                    .w(px(130.))
+                                    .w(rem_px(130.))
                                     .flex_shrink_0()
                                     .overflow_hidden()
                                     .whitespace_nowrap()
@@ -1661,20 +1665,26 @@ impl Editor {
                                     .whitespace_nowrap()
                                     .text_color(t.text_tertiary)
                                     .font_family(t.mono.clone())
-                                    .text_size(px(11.))
+                                    .text_size(t.caption)
                                     .child(p.cmdline.clone()),
                             )
-                            .child(div().w(px(76.)).flex().justify_end().child(bytes(p.rss_bytes as f64)))
                             .child(
                                 div()
-                                    .w(px(56.))
+                                    .w(rem_px(76.))
+                                    .flex()
+                                    .justify_end()
+                                    .child(bytes(p.rss_bytes as f64)),
+                            )
+                            .child(
+                                div()
+                                    .w(rem_px(56.))
                                     .flex()
                                     .justify_end()
                                     .child(format!("{:.1}%", p.cpu_pct)),
                             )
                             .child(
                                 div()
-                                    .w(px(56.))
+                                    .w(rem_px(56.))
                                     .flex()
                                     .justify_end()
                                     .text_color(t.text_secondary)
@@ -1699,12 +1709,12 @@ impl Render for Editor {
         let swatches = div()
             .flex()
             .flex_row()
-            .gap(px(6.))
+            .gap(rem_px(6.))
             .children(Colour::ALL.iter().enumerate().map(|(k, &c)| {
                 let selected = c == self.colour;
                 div()
                     .id(("colour", k))
-                    .size(px(20.))
+                    .size(rem_px(20.))
                     .rounded_full()
                     .flex()
                     .items_center()
@@ -1719,14 +1729,14 @@ impl Render for Editor {
         div()
             .flex()
             .flex_col()
-            .gap(px(12.))
-            .text_size(px(13.))
+            .gap(rem_px(12.))
+            .text_size(t.panel_title)
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(12.))
+                    .gap(rem_px(12.))
                     .child(div().flex_1().child(Input::new(&self.name)))
                     .child(swatches),
             )
@@ -1736,13 +1746,13 @@ impl Render for Editor {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
+                    .gap(rem_px(6.))
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(8.))
+                            .gap(rem_px(8.))
                             .child(segmented(
                                 "combine",
                                 [(Combine::Any, "ANY of"), (Combine::All, "ALL of")].iter().copied(),
@@ -1780,7 +1790,7 @@ impl Render for Editor {
                     .flex()
                     .flex_row()
                     .justify_end()
-                    .gap(px(8.))
+                    .gap(rem_px(8.))
                     .child(
                         Button::new("cancel")
                             .small()
@@ -1852,7 +1862,7 @@ impl Render for Renamer {
         div()
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(rem_px(10.))
             .child(Input::new(&self.name))
             .children(problem.map(|p| caption(p, cx).text_color(t.orange)))
             .child(
@@ -1860,7 +1870,7 @@ impl Render for Renamer {
                     .flex()
                     .flex_row()
                     .justify_end()
-                    .gap(px(8.))
+                    .gap(rem_px(8.))
                     .child(
                         Button::new("cancel-rename")
                             .small()
