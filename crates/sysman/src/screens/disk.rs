@@ -1456,7 +1456,7 @@ impl Render for Disk {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sample = self.live.read(cx).latest.clone();
         let body = match self.view {
-            View::Overview => self.overview(sample.as_ref(), cx).into_any_element(),
+            View::Overview => self.overview(sample.as_deref(), cx).into_any_element(),
             View::Map => {
                 let live = self.live.clone();
                 self.map

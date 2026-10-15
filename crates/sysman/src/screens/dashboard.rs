@@ -921,7 +921,7 @@ impl Dashboard {
 impl Render for Dashboard {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sample = self.live.read(cx).latest.clone();
-        let sample = sample.as_ref();
+        let sample = sample.as_deref();
         let (net_down, net_up) = sample.and_then(|s| s.net.as_ref()).map_or((0., 0.), |net| {
             net.interfaces
                 .iter()

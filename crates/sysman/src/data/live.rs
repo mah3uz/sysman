@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -105,8 +106,9 @@ fn parse(line: &str) -> Event {
 pub struct Live {
     pub conn: Conn,
     pub meta: Option<Meta>,
-    /// Each module as last reported; a sample carries only the modules due on its tick.
-    pub latest: Option<Sample>,
+    /// Each module as last reported; a sample carries only the modules due on its tick. Shared, so a render can
+    /// hold it without copying every module.
+    pub latest: Option<Rc<Sample>>,
     pub skipped: u64,
     /// Kept here, not on the Network screen, so it counts while that tab is unmounted.
     pub net_session: net::Session,
@@ -170,9 +172,10 @@ impl Live {
 
     fn merge(&mut self, sample: Sample) {
         let Some(latest) = &mut self.latest else {
-            self.latest = Some(sample);
+            self.latest = Some(Rc::new(sample));
             return;
         };
+        let latest = Rc::make_mut(latest);
         macro_rules! keep {
             ($($module:ident),*) => {$(
                 if sample.$module.is_some() {

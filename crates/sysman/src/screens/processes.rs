@@ -1912,7 +1912,7 @@ impl Render for Processes {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_widgets(window, cx);
         let sample = self.live.read(cx).latest.clone();
-        let helper_running = helper::running(sample.as_ref());
+        let helper_running = helper::running(sample.as_deref());
         let cols = self
             .columns
             .clone()
@@ -1962,7 +1962,7 @@ impl Render for Processes {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(self.header(sample.as_ref(), cx))
+                    .child(self.header(sample.as_deref(), cx))
                     .child(toolbar)
                     .when(!helper_running, |d| {
                         d.child(

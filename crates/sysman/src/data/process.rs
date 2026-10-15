@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use schema::processes::Table;
 use serde::Deserialize;
-use serde_json::Value;
 
 use crate::data::live::Conn;
 
@@ -84,12 +83,14 @@ fn poll(stream: UnixStream, interval: &Interval, tx: &Sender<Event>) -> bool {
     }
 }
 
+/// Reads the reply straight into its types: going through a `Value` first cost more than the rest of the poll.
 fn parse(line: &str) -> Event {
-    let Ok(value) = serde_json::from_str::<Value>(line) else {
-        return Event::Skipped;
-    };
-    match (value.get("t").and_then(Value::as_f64), Table::deserialize(&value)) {
-        (Some(t), Ok(table)) => Event::Table { t, table },
+    #[derive(Deserialize)]
+    struct Stamp {
+        t: f64,
+    }
+    match (serde_json::from_str::<Stamp>(line), serde_json::from_str::<Table>(line)) {
+        (Ok(Stamp { t }), Ok(table)) => Event::Table { t, table },
         _ => Event::Skipped,
     }
 }
@@ -165,6 +166,16 @@ mod tests {
                 Event::Conn(_) => {}
             }
         }
+    }
+
+    #[test]
+    fn a_reply_without_its_time_or_rows_is_skipped() {
+        assert!(matches!(parse(&reply(7)), Event::Table { t: 5.0, ref table } if table.rows[0].pid == 7));
+        assert!(matches!(parse(r#"{"error": "no rates yet"}"#), Event::Skipped));
+        assert!(matches!(
+            parse(r#"{"count": 0, "threads": 0, "states": {}, "rows": []}"#),
+            Event::Skipped
+        ));
     }
 
     #[test]

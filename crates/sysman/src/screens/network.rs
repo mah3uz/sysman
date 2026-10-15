@@ -1032,7 +1032,7 @@ impl Network {
 impl Render for Network {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sample = self.live.read(cx).latest.clone();
-        let sample = sample.as_ref();
+        let sample = sample.as_deref();
         if helper::running(sample) {
             self.ensure_icons(cx);
         }
