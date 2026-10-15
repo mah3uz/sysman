@@ -4,16 +4,18 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyView, App, AppContext, Context, Entity, FontWeight, Global, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window,
-    WindowControlArea, div, prelude::FluentBuilder, px,
+    AnyView, App, AppContext, Context, Decorations, Entity, Global, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Rems, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, WeakEntity, Window, WindowControlArea, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
+use serde::{Deserialize, Serialize};
 
+use crate::charts::format::TempUnit;
 use crate::data::helper;
 use crate::data::live::{self, Conn, Event, Live};
 use crate::data::prefs::prefs;
@@ -30,18 +32,18 @@ use crate::screens::insights::Insights;
 use crate::screens::network::Network;
 use crate::screens::processes::Processes;
 use crate::ui::settings;
-use crate::ui::theme::{Theme, theme};
+use crate::ui::theme::{self, TextSize, Theme, rem_px, theme};
 use crate::ui::widgets::hairline;
 
-const TITLE_BAR_HEIGHT: Pixels = px(52.);
-const STRIP_HEIGHT: Pixels = px(36.);
-const STRIP_INSET: Pixels = px(3.);
-const TAB_PADDING_X: Pixels = px(20.);
-const TAB_MIN_WIDTH: Pixels = px(64.);
-const CONTROL_HEIGHT: Pixels = px(32.);
-const TAB_FONT: Pixels = px(13.);
+const TITLE_BAR_HEIGHT: Rems = rem_px(52.);
+const STRIP_HEIGHT: Rems = rem_px(36.);
+const STRIP_INSET: Rems = rem_px(3.);
+const TAB_PADDING_X: Rems = rem_px(20.);
+const TAB_MIN_WIDTH: Rems = rem_px(64.);
+const CONTROL_HEIGHT: Rems = rem_px(32.);
+const TAB_FONT: Rems = rem_px(13.);
 /// Room each side of the centred strip: the refresh and settings controls and their margin.
-const SIDE_WIDTH: Pixels = px(150.);
+const SIDE_WIDTH: Rems = rem_px(150.);
 const DRAIN_EVERY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -147,11 +149,89 @@ impl Refresh {
         Refresh(Duration::from_secs(60)),
     ];
 
+    const KEY: &str = "app.refresh";
+
     pub fn label(self) -> SharedString {
         match self.0.as_secs() {
             60 => "1 min".into(),
             s => format!("{s} s").into(),
         }
+    }
+
+    /// Stored as seconds; anything else is the first choice.
+    fn load() -> Self {
+        Self::stored(prefs().lock().ok().and_then(|p| p.get::<u64>(Self::KEY)))
+    }
+
+    fn stored(secs: Option<u64>) -> Self {
+        Self::CHOICES
+            .into_iter()
+            .find(|c| Some(c.0.as_secs()) == secs)
+            .unwrap_or(Self::CHOICES[0])
+    }
+
+    fn save(self) {
+        if let Ok(mut p) = prefs().lock() {
+            p.set(Self::KEY, &self.0.as_secs());
+        }
+    }
+}
+
+/// Whether empty title-bar space moves the window; `Never` is for compositors that do not report tiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TitlebarDrag {
+    #[default]
+    Auto,
+    Never,
+}
+
+impl TitlebarDrag {
+    pub const ALL: [TitlebarDrag; 2] = [Self::Auto, Self::Never];
+    const KEY: &str = "display.titlebar_drag";
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Never => "Never",
+        }
+    }
+
+    fn load() -> Self {
+        prefs().lock().ok().and_then(|p| p.get(Self::KEY)).unwrap_or_default()
+    }
+
+    fn save(self) {
+        if let Ok(mut p) = prefs().lock() {
+            p.set(Self::KEY, &self);
+        }
+    }
+}
+
+/// What a press on empty title-bar space does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Press {
+    Move,
+    Maximize,
+    Nothing,
+}
+
+/// While the compositor lays the window out (any tiled edge, maximised, fullscreen), a move request makes a tiled
+/// window jump or float, so the title bar leaves it alone.
+fn title_bar_press(
+    setting: TitlebarDrag,
+    decorations: Decorations,
+    maximized: bool,
+    fullscreen: bool,
+    clicks: usize,
+) -> Press {
+    let tiled = matches!(decorations, Decorations::Client { tiling } if tiling.is_tiled());
+    if setting == TitlebarDrag::Never || tiled || maximized || fullscreen {
+        Press::Nothing
+    } else if clicks >= 2 {
+        Press::Maximize
+    } else {
+        Press::Move
     }
 }
 
@@ -252,6 +332,7 @@ pub struct Shell {
     feed_eager: bool,
     helper_running: bool,
     pause_after: PauseAfter,
+    drag: TitlebarDrag,
     idle: Idle,
     paused: bool,
     /// Window activation and visibility observers, made on the first render, which is the first to see the window.
@@ -301,13 +382,14 @@ impl Shell {
             feed_interval,
             feed,
             live,
-            refresh: Refresh::CHOICES[0],
+            refresh: Refresh::load(),
             drawn: Instant::now(),
             pending: false,
             feed_pending: false,
             feed_eager: true,
             helper_running: false,
             pause_after,
+            drag: TitlebarDrag::load(),
             idle: Idle::new(idle_after),
             paused: false,
             watching: Vec::new(),
@@ -341,6 +423,41 @@ impl Shell {
         choice.save();
         self.update_pause(cx);
         cx.notify();
+    }
+
+    pub fn titlebar_drag(&self) -> TitlebarDrag {
+        self.drag
+    }
+
+    pub fn set_titlebar_drag(&mut self, choice: TitlebarDrag, cx: &mut Context<Self>) {
+        self.drag = choice;
+        choice.save();
+        cx.notify();
+    }
+
+    /// Forgets sidebar widths, column choices and the like; the open tab is rebuilt to show the defaults.
+    pub fn reset_layout(&mut self, cx: &mut Context<Self>) {
+        if let Ok(mut p) = prefs().lock() {
+            p.retain(|key| key.starts_with("app.") || key.starts_with("display."));
+        }
+        self.active = mount(self.tab, &self.live, &self.feed, cx);
+        cx.notify();
+    }
+
+    /// Takes up preferences that were edited by hand in `ui.toml`, already reloaded.
+    pub fn prefs_changed(&mut self, cx: &mut Context<Self>) {
+        self.refresh = Refresh::load();
+        self.sync_feed();
+        self.pause_after = PauseAfter::load();
+        self.idle.after = self.pause_after.0;
+        self.update_pause(cx);
+        self.drag = TitlebarDrag::load();
+        TempUnit::reload();
+        let size = TextSize::load();
+        if size != theme(cx).text_size {
+            theme::install(size, cx);
+        }
+        cx.refresh_windows();
     }
 
     fn watch_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -476,6 +593,7 @@ impl Shell {
 
     pub fn set_refresh(&mut self, refresh: Refresh, cx: &mut Context<Self>) {
         self.refresh = refresh;
+        refresh.save();
         self.sync_feed();
         cx.notify();
     }
@@ -492,19 +610,44 @@ impl Shell {
 
     fn title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
-        let compact = strip_width(window, t) > window.viewport_size().width - SIDE_WIDTH * 2.;
+        let rem = window.rem_size();
+        let compact = strip_width(window, t) > window.viewport_size().width - SIDE_WIDTH.to_pixels(rem) * 2.;
         let gear = pill(Button::new("settings").ghost().icon(Icon::new(IconName::Settings)), t)
             .w(CONTROL_HEIGHT)
             .tooltip("Settings")
             .on_click(|_, _, cx| settings::open(cx));
-        let drag = |id: &'static str| {
+        let setting = self.drag;
+        let drag = move |id: &'static str| {
             div()
                 .id(id)
                 .flex_1()
                 .h_full()
                 .window_control_area(WindowControlArea::Drag)
-                .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+                .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, window, _| {
+                    let press = title_bar_press(
+                        setting,
+                        window.window_decorations(),
+                        window.is_maximized(),
+                        window.is_fullscreen(),
+                        e.click_count,
+                    );
+                    match press {
+                        Press::Move => window.start_window_move(),
+                        Press::Maximize => window.zoom_window(),
+                        Press::Nothing => {}
+                    }
+                })
         };
+        // The controls sit inside the right drag area; a press on them ends here instead of bubbling up to it.
+        let controls = div()
+            .id("title-controls")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(rem_px(6.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(self.refresh_control(cx))
+            .child(gear);
         div()
             .flex()
             .flex_row()
@@ -519,10 +662,8 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .justify_end()
-                    .pr(px(14.))
-                    .gap(px(6.))
-                    .child(self.refresh_control(cx))
-                    .child(gear),
+                    .pr(rem_px(14.))
+                    .child(controls),
             )
     }
 
@@ -551,19 +692,19 @@ impl Shell {
                 .flex()
                 .flex_row()
                 .items_center()
-                .child(div().w(px(1.)).h(px(14.)).when(divider, |d| d.bg(t.hairline)))
+                .child(div().w(px(1.)).h(rem_px(14.)).when(divider, |d| d.bg(t.hairline)))
                 .child(
                     div()
                         .id(("tab", i))
-                        .h(STRIP_HEIGHT - STRIP_INSET * 2.)
-                        .min_w(if compact { px(38.) } else { TAB_MIN_WIDTH })
-                        .px(if compact { px(11.) } else { TAB_PADDING_X })
+                        .h(rem_px(30.))
+                        .min_w(if compact { rem_px(38.) } else { TAB_MIN_WIDTH })
+                        .px(if compact { rem_px(11.) } else { TAB_PADDING_X })
                         .flex()
                         .items_center()
                         .justify_center()
                         .rounded_full()
                         .text_size(TAB_FONT)
-                        .font_weight(FontWeight::MEDIUM)
+                        .font_weight(t.weight_medium)
                         .when(selected, |d| d.bg(t.strip_active).text_color(t.text))
                         .when(!selected, |d| {
                             d.text_color(t.text_secondary).hover(|d| d.text_color(t.text))
@@ -594,7 +735,7 @@ impl Shell {
                 .child(Icon::new(IconName::ChevronDown).xsmall().text_color(t.text_secondary)),
             t,
         )
-        .px(px(12.))
+        .px(rem_px(12.))
         .tooltip("Redraw interval")
         .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |mut menu, _, _| {
             for choice in Refresh::CHOICES {
@@ -632,6 +773,7 @@ impl Render for Shell {
             .bg(t.window)
             .text_color(t.text)
             .font_family(t.font.clone())
+            .font_weight(t.weight_body)
             .child(self.title_bar(window, cx))
             .when(waiting, |d| d.child(banner(cx)))
             .child(div().flex_1().min_h_0().child(self.active.clone()))
@@ -670,14 +812,23 @@ fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App
 fn strip_width(window: &mut Window, t: &Theme) -> Pixels {
     let mut style = window.text_style();
     style.font_family = t.font.clone();
-    Tab::ALL.iter().fold(STRIP_INSET * 2. + px(1.), |total, tab| {
-        let run = style.to_run(tab.label().len());
-        let text = window
-            .text_system()
-            .shape_line(tab.label().into(), TAB_FONT, &[run], None)
-            .width;
-        total + (text + TAB_PADDING_X * 2.).max(TAB_MIN_WIDTH) + px(1.)
-    })
+    style.font_weight = t.weight_medium;
+    let rem = window.rem_size();
+    let (font, padding, min) = (
+        TAB_FONT.to_pixels(rem),
+        TAB_PADDING_X.to_pixels(rem),
+        TAB_MIN_WIDTH.to_pixels(rem),
+    );
+    Tab::ALL
+        .iter()
+        .fold(STRIP_INSET.to_pixels(rem) * 2. + px(1.), |total, tab| {
+            let run = style.to_run(tab.label().len());
+            let text = window
+                .text_system()
+                .shape_line(tab.label().into(), font, &[run], None)
+                .width;
+            total + (text + padding * 2.).max(min) + px(1.)
+        })
 }
 
 fn banner(cx: &App) -> impl IntoElement {
@@ -689,13 +840,13 @@ fn banner(cx: &App) -> impl IntoElement {
         .items_center()
         .gap_2()
         .px(t.page_padding)
-        .py(px(7.))
+        .py(rem_px(7.))
         .bg(t.orange.opacity(0.14))
         .border_b_1()
         .border_color(t.orange.opacity(0.3))
         .text_size(t.caption)
-        .child(div().size(px(6.)).rounded_full().bg(t.orange))
-        .child(div().font_weight(FontWeight::SEMIBOLD).child("Collector not running"))
+        .child(div().size(rem_px(6.)).rounded_full().bg(t.orange))
+        .child(div().font_weight(t.weight_semibold).child("Collector not running"))
         .child(
             div()
                 .text_color(t.text_secondary)
@@ -810,5 +961,106 @@ mod tests {
         assert_eq!(PauseAfter::CHOICES[0], PauseAfter(Some(MINUTE)));
         assert_eq!(PauseAfter::CHOICES[0].label(), "After 1 min");
         assert_eq!(PauseAfter::CHOICES[4].label(), "Never");
+    }
+
+    const FLOATING: Decorations = Decorations::Client {
+        tiling: gpui::Tiling {
+            top: false,
+            left: false,
+            right: false,
+            bottom: false,
+        },
+    };
+
+    #[test]
+    fn a_floating_window_moves_and_maximizes_from_the_title_bar() {
+        assert_eq!(
+            title_bar_press(TitlebarDrag::Auto, FLOATING, false, false, 1),
+            Press::Move
+        );
+        assert_eq!(
+            title_bar_press(TitlebarDrag::Auto, FLOATING, false, false, 2),
+            Press::Maximize
+        );
+        assert_eq!(
+            title_bar_press(TitlebarDrag::Auto, Decorations::Server, false, false, 1),
+            Press::Move,
+            "without tiling news the window is taken as floating"
+        );
+    }
+
+    #[test]
+    fn a_tiled_window_is_never_moved() {
+        // a move request on a tiling compositor pops the window out of its tile or makes it jump
+        let left_half = Decorations::Client {
+            tiling: gpui::Tiling {
+                left: true,
+                top: true,
+                bottom: true,
+                right: false,
+            },
+        };
+        for clicks in [1, 2] {
+            assert_eq!(
+                title_bar_press(TitlebarDrag::Auto, left_half, false, false, clicks),
+                Press::Nothing
+            );
+            let one_edge = Decorations::Client {
+                tiling: gpui::Tiling {
+                    right: true,
+                    ..Default::default()
+                },
+            };
+            assert_eq!(
+                title_bar_press(TitlebarDrag::Auto, one_edge, false, false, clicks),
+                Press::Nothing
+            );
+        }
+    }
+
+    #[test]
+    fn maximized_or_fullscreen_windows_are_never_moved() {
+        // some compositors report these without tiled edges, or with server decorations that hide the tiling
+        for decorations in [FLOATING, Decorations::Server] {
+            assert_eq!(
+                title_bar_press(TitlebarDrag::Auto, decorations, true, false, 1),
+                Press::Nothing
+            );
+            assert_eq!(
+                title_bar_press(TitlebarDrag::Auto, decorations, false, true, 1),
+                Press::Nothing
+            );
+            assert_eq!(
+                title_bar_press(TitlebarDrag::Auto, decorations, true, false, 2),
+                Press::Nothing
+            );
+        }
+    }
+
+    #[test]
+    fn never_turns_dragging_off_for_compositors_that_hide_their_tiling() {
+        assert_eq!(
+            title_bar_press(TitlebarDrag::Never, FLOATING, false, false, 1),
+            Press::Nothing
+        );
+        assert_eq!(
+            title_bar_press(TitlebarDrag::Never, Decorations::Server, false, false, 2),
+            Press::Nothing
+        );
+        assert_eq!(TitlebarDrag::default(), TitlebarDrag::Auto);
+    }
+
+    #[test]
+    fn the_refresh_interval_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui.toml");
+        crate::data::prefs::Prefs::load(path.clone()).set(Refresh::KEY, &10u64);
+        let secs = crate::data::prefs::Prefs::load(path).get::<u64>(Refresh::KEY);
+        assert_eq!(Refresh::stored(secs), Refresh::CHOICES[2]);
+        assert_eq!(
+            Refresh::stored(Some(7)),
+            Refresh::CHOICES[0],
+            "a value edited by hand to something not offered falls back"
+        );
     }
 }
