@@ -11,6 +11,7 @@ pub enum Unit {
     Millis,
     /// Operations, requests: whole numbers, one decimal below 10.
     Count,
+    Watts,
 }
 
 impl Unit {
@@ -24,6 +25,8 @@ impl Unit {
             Self::Millis => format!("{v:.1} ms"),
             Self::Count if v.abs() < 10. && v.fract() != 0. => format!("{v:.1}"),
             Self::Count => format!("{v:.0}"),
+            Self::Watts if v.abs() >= 10. => format!("{v:.0} W"),
+            Self::Watts => format!("{v:.1} W"),
         }
     }
 
@@ -94,6 +97,8 @@ mod tests {
         assert_eq!(Unit::Millis.format(0.44), "0.4 ms");
         assert_eq!(Unit::Count.format(0.4), "0.4", "a queue-depth axis keeps its fractions");
         assert_eq!(Unit::Count.format(8245.4), "8245");
+        assert_eq!(Unit::Watts.format(33.66), "34 W");
+        assert_eq!(Unit::Watts.format(3.66), "3.7 W", "small iGPU draws keep a decimal");
     }
 
     #[test]

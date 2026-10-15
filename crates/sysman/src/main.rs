@@ -76,7 +76,7 @@ fn open(shell: Entity<Shell>, cx: &mut App) {
             appears_transparent: true,
             traffic_light_position: None,
         }),
-        app_id: Some(app_id().into()),
+        app_id: Some(app_id()),
         window_decorations: Some(WindowDecorations::Client),
         ..Default::default()
     };
