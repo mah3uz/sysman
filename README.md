@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" alt="sysman mascot: a small chip creature with a sparkline smile" width="160"></p>
+
 # sysman
 
 A system monitor for Linux desktops: a small collector daemon that records what

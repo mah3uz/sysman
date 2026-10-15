@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>sysman</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2E3140"/>
+      <stop offset="1" stop-color="#16171C"/>
+    </linearGradient>
+    <linearGradient id="body" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#5BDCEF"/>
+      <stop offset="0.55" stop-color="#2E9BF5"/>
+      <stop offset="1" stop-color="#0A63E8"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="pin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#B7C0CE"/>
+      <stop offset="1" stop-color="#7C8596"/>
+    </linearGradient>
+    <linearGradient id="area" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#30D158" stop-opacity="0.38"/>
+      <stop offset="1" stop-color="#30D158" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="led" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FFE2A8"/>
+      <stop offset="0.45" stop-color="#FF9F0A"/>
+      <stop offset="1" stop-color="#FF7A00"/>
+    </radialGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="soft" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="9"/>
+    </filter>
+    <clipPath id="screen">
+      <rect x="178" y="286" width="156" height="62" rx="18"/>
+    </clipPath>
+  </defs>
+
+  <!-- tile -->
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+  <rect x="16.5" y="16.5" width="479" height="479" rx="111.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.08"/>
+
+  <!-- chart grid behind the mascot -->
+  <g stroke="#FFFFFF" stroke-opacity="0.05" stroke-width="2">
+    <line x1="56" y1="176" x2="456" y2="176"/>
+    <line x1="56" y1="256" x2="456" y2="256"/>
+    <line x1="56" y1="336" x2="456" y2="336"/>
+  </g>
+  <line x1="56" y1="136" x2="456" y2="136" stroke="#FF9F0A" stroke-opacity="0.35" stroke-width="2" stroke-dasharray="8 6"/>
+
+  <!-- shadow -->
+  <ellipse cx="256" cy="420" rx="112" ry="14" fill="#000000" fill-opacity="0.45" filter="url(#soft)"/>
+
+  <!-- antenna and live LED -->
+  <line x1="256" y1="152" x2="256" y2="108" stroke="#9AA3B3" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="256" cy="96" r="22" fill="#FF9F0A" fill-opacity="0.35" filter="url(#soft)"/>
+  <circle cx="256" cy="96" r="14" fill="url(#led)"/>
+  <circle cx="251" cy="91" r="4" fill="#FFFFFF" fill-opacity="0.85"/>
+
+  <!-- pins as arms -->
+  <g fill="url(#pin)">
+    <rect x="102" y="198" width="52" height="18" rx="9"/>
+    <rect x="102" y="238" width="52" height="18" rx="9"/>
+    <rect x="102" y="278" width="52" height="18" rx="9"/>
+    <rect x="102" y="318" width="52" height="18" rx="9"/>
+    <rect x="358" y="198" width="52" height="18" rx="9"/>
+    <rect x="358" y="238" width="52" height="18" rx="9"/>
+    <rect x="358" y="278" width="52" height="18" rx="9"/>
+    <rect x="358" y="318" width="52" height="18" rx="9"/>
+  </g>
+
+  <!-- feet -->
+  <g fill="url(#pin)">
+    <rect x="190" y="366" width="46" height="44" rx="14"/>
+    <rect x="276" y="366" width="46" height="44" rx="14"/>
+  </g>
+
+  <!-- body -->
+  <rect x="136" y="150" width="240" height="236" rx="58" fill="url(#body)"/>
+  <rect x="136" y="150" width="240" height="236" rx="58" fill="none" stroke="#FFFFFF" stroke-opacity="0.25" stroke-width="2"/>
+  <path d="M194 162 H318 C346 162 364 178 364 204 V214 C330 196 182 196 148 214 V204 C148 178 166 162 194 162 Z" fill="url(#sheen)"/>
+  <!-- chip notch -->
+  <circle cx="168" cy="182" r="7" fill="#0A3E8C" fill-opacity="0.35"/>
+
+  <!-- eyes -->
+  <g>
+    <circle cx="210" cy="234" r="31" fill="#FFFFFF"/>
+    <circle cx="302" cy="234" r="31" fill="#FFFFFF"/>
+    <circle cx="213" cy="228" r="16" fill="#15171C"/>
+    <circle cx="305" cy="228" r="16" fill="#15171C"/>
+    <circle cx="207" cy="221" r="6" fill="#FFFFFF"/>
+    <circle cx="299" cy="221" r="6" fill="#FFFFFF"/>
+    <circle cx="219" cy="235" r="2.5" fill="#FFFFFF" fill-opacity="0.8"/>
+    <circle cx="311" cy="235" r="2.5" fill="#FFFFFF" fill-opacity="0.8"/>
+  </g>
+
+  <!-- cheeks -->
+  <ellipse cx="172" cy="270" rx="15" ry="8" fill="#FF4F7B" fill-opacity="0.7"/>
+  <ellipse cx="340" cy="270" rx="15" ry="8" fill="#FF4F7B" fill-opacity="0.7"/>
+
+  <!-- chest display with a sparkline smile -->
+  <rect x="178" y="286" width="156" height="62" rx="18" fill="#0E1317"/>
+  <g clip-path="url(#screen)">
+    <path d="M192 300 C204 318 220 328 236 330 L242 330 L248 314 L256 340 L262 330 C282 330 304 320 320 300 L320 348 L192 348 Z" fill="url(#area)"/>
+  </g>
+  <path d="M192 300 C204 318 220 328 236 330 L242 330 L248 314 L256 340 L262 330 C282 330 304 320 320 300"
+        fill="none" stroke="#30D158" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
+  <circle cx="320" cy="300" r="5.5" fill="#B8FFC9"/>
+  <rect x="178.5" y="286.5" width="155" height="61" rx="17.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.14"/>
+</svg>
