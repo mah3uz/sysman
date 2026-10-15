@@ -1,4 +1,5 @@
 pub mod desktop;
+pub mod diskmap;
 pub mod groups;
 pub mod helper;
 pub mod history;
