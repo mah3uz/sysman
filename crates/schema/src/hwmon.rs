@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// `chip` (`name/device`) → kind (`temp` °C, `fan` rpm, `in` V, `power` W, `curr` A) → label → value;
-/// `null` when the sensor could not be read.
+/// `chip` (`name/device`) → kind → label → value; `null` when the sensor could not be read.
 pub type Hwmon = BTreeMap<String, BTreeMap<String, BTreeMap<String, Option<f64>>>>;
 
 /// chip → kind → label → `min` | `max` | `crit` | `lcrit` → value

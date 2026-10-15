@@ -1,0 +1,11 @@
+[Unit]
+Description=sysman metrics collector
+
+[Service]
+ExecStart=%h/.cargo/bin/sysmand
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=default.target

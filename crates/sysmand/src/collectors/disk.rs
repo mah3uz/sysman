@@ -140,8 +140,7 @@ impl Disk {
 
 const WRAP: u64 = 1 << 32;
 
-/// Increase of a counter that some kernels print as 32 bits. A smaller value after an old value
-/// below 2^32 is a wrap; after a larger old value it is a reset.
+/// Some kernels print this counter as 32 bits, so a drop from below 2^32 is a wrap, not a reset.
 fn wrap_delta(old: u64, new: u64) -> u64 {
     if new >= old {
         new - old

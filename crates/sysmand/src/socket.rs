@@ -143,7 +143,9 @@ fn processes(scanner: &mut Option<ProcessScanner>, sys: &Sys) -> Result<String> 
         thread::sleep(Duration::from_millis(500));
         *scanner = Some(fresh);
     }
-    let table = scanner.as_mut().expect("set above").scan()?.context("no rates yet")?;
+    let scanner = scanner.as_mut().expect("set above");
+    let mut table = scanner.scan()?.context("no rates yet")?;
+    scanner.fill_details(&mut table.rows);
     let mut reply = serde_json::to_value(table)?;
     reply["type"] = "processes".into();
     reply["t"] = json!((unix_now() * 1000.0).round() / 1000.0);

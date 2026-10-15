@@ -130,8 +130,7 @@ fn parse(addr: &str, route: &str, resolv: &str, exclude: &[String]) -> Result<sc
     })
 }
 
-/// Runs a command and returns its stdout. A child that outlives `timeout` is killed and
-/// not waited for beyond a short grace, so a process stuck in the kernel cannot stall the daemon.
+/// A child past `timeout` is killed and barely waited for, so a process stuck in the kernel cannot stall the daemon.
 fn run(program: &str, args: &[&str], timeout: Duration) -> Result<String> {
     let mut child = Command::new(program)
         .args(args)

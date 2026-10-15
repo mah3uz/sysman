@@ -23,7 +23,7 @@ pub const SCHEMA: u32 = 3;
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Record {
     Meta(Meta),
-    Sample(Sample),
+    Sample(Box<Sample>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -112,20 +112,28 @@ impl Collector for Fs {
     fn sample(&mut self) -> Result<Option<Value>> {
         let mounts = parse_mountinfo(&self.sys.read("/proc/self/mountinfo")?);
         // btrfs subvolumes and bind mounts share a maj:min and would repeat the same totals
-        let mut by_dev: BTreeMap<&str, Vec<&Mount>> = BTreeMap::new();
-        for m in &mounts {
+        let mut by_dev: BTreeMap<&str, (usize, Vec<&Mount>)> = BTreeMap::new();
+        for (i, m) in mounts.iter().enumerate() {
             if m.source.starts_with("/dev/") && !self.opts.exclude_fstypes.contains(&m.fstype) {
-                by_dev.entry(&m.dev_id).or_default().push(m);
+                by_dev.entry(&m.dev_id).or_insert_with(|| (i, Vec::new())).1.push(m);
             }
         }
+        let mut groups: Vec<(usize, Vec<&Mount>)> = by_dev.into_values().collect();
+        groups.sort_by_key(|(i, _)| *i);
         let mut out: schema::fs::Fs = BTreeMap::new();
-        for group in by_dev.values_mut() {
+        for (_, mut group) in groups {
             group.sort_by(|a, b| (a.mount_point.len(), &a.mount_point).cmp(&(b.mount_point.len(), &b.mount_point)));
             group.dedup_by(|a, b| a.mount_point == b.mount_point);
-            let first = group[0];
-            let Ok(st) = (self.statvfs)(Path::new(&first.mount_point)) else {
+            let Some((first, st)) = group
+                .iter()
+                .find_map(|m| Some((*m, (self.statvfs)(Path::new(&m.mount_point)).ok()?)))
+            else {
                 continue;
             };
+            // an overmount hides the earlier device; the first in mount order keeps the entry
+            if out.contains_key(&first.mount_point) {
+                continue;
+            }
             let used = st.blocks.saturating_sub(st.bfree) * st.frsize;
             let avail = st.bavail * st.frsize;
             out.insert(
@@ -278,6 +286,26 @@ mod tests {
         let v = c.sample().unwrap().unwrap();
         assert_schema::<schema::fs::Fs>(&v);
         assert!(v["/srv/data"]["used_pct"].is_null());
+    }
+
+    #[test]
+    fn device_overmounting_another_mount_point_is_skipped_in_favour_of_the_first_in_mount_order() {
+        let v = run(
+            "40 2 8:2 / /srv/data rw - ext4 /dev/sdb1 rw\n41 2 8:1 / /srv/data rw - ext4 /dev/sda1 rw\n",
+            Options::default(),
+        );
+        assert_eq!(v.as_object().unwrap().len(), 1);
+        assert_eq!(v["/srv/data"]["device"], "/dev/sdb1");
+    }
+
+    #[test]
+    fn another_mount_point_of_the_device_is_tried_when_the_first_cannot_be_statted() {
+        let v = run(
+            "40 2 8:1 / /gone rw - ext4 /dev/sda1 rw\n41 2 8:1 /d /srv/data rw - ext4 /dev/sda1 rw\n",
+            Options::default(),
+        );
+        assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), ["/srv/data"]);
+        assert_eq!(v["/srv/data"]["mounts"], serde_json::json!(["/gone", "/srv/data"]));
     }
 
     #[test]

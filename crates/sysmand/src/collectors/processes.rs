@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::MetadataExt;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 use schema::processes::{Group, Process, Table};
@@ -37,13 +38,9 @@ struct Snapshot {
     state: String,
     threads: u64,
     rss_bytes: u64,
-    cmdline: String,
-    user: Option<String>,
-    fds: Option<u64>,
 }
 
-/// Scans `/proc` and turns cumulative counters into rates. It owns its rate
-/// state, so scanners used by different callers do not disturb each other.
+/// Owns its rate state, so scanners used by different callers do not disturb each other.
 pub struct ProcessScanner {
     sys: Sys,
     io: bool,
@@ -51,6 +48,8 @@ pub struct ProcessScanner {
     clk_tck: f64,
     page_size: u64,
     deltas: Deltas<String>,
+    users: HashMap<u32, String>,
+    passwd_mtime: Option<SystemTime>,
 }
 
 impl ProcessScanner {
@@ -67,12 +66,14 @@ impl ProcessScanner {
             clk_tck: clk_tck as f64,
             page_size: page_size as u64,
             deltas: Deltas::default(),
+            users: HashMap::new(),
+            passwd_mtime: None,
         })
     }
 
-    /// `None` on the first call, which only primes the counters.
+    /// `None` on the first call, which only primes the counters. Rows carry no `user`, `fds` or `cmdline`;
+    /// `fill_details` adds them.
     pub fn scan(&mut self) -> Result<Option<Table>> {
-        let users = self.users();
         let mut procs: HashMap<String, Snapshot> = HashMap::new();
         let mut counters: HashMap<String, Vec<u64>> = HashMap::new();
         for pid in self.sys.list("/proc") {
@@ -83,7 +84,9 @@ impl ProcessScanner {
             let Some(stat) = self.sys.read_opt(format!("/proc/{pid}/stat")) else {
                 continue;
             };
-            let (snap, start, ticks) = self.parse_stat(&pid, &stat, &users)?;
+            let Ok((snap, start, ticks)) = self.parse_stat(&pid, &stat) else {
+                continue;
+            };
             let mut counts = vec![ticks];
             if self.io
                 && let Some(io) = self.sys.read_opt(format!("/proc/{pid}/io"))
@@ -118,9 +121,9 @@ impl ProcessScanner {
                 cpu_pct: round1(100.0 * d[0] as f64 / self.clk_tck / dt),
                 read_bps: io.map(|i| i.0),
                 write_bps: io.map(|i| i.1),
-                user: p.user,
-                fds: p.fds,
-                cmdline: p.cmdline,
+                user: None,
+                fds: None,
+                cmdline: String::new(),
             });
         }
         rows.sort_by_key(|r| r.pid);
@@ -132,7 +135,7 @@ impl ProcessScanner {
         }))
     }
 
-    fn parse_stat(&self, pid: &str, stat: &str, users: &HashMap<u32, String>) -> Result<(Snapshot, String, u64)> {
+    fn parse_stat(&self, pid: &str, stat: &str) -> Result<(Snapshot, String, u64)> {
         // comm may contain spaces and parentheses, so split on the last ")"
         let (head, tail) = stat
             .rsplit_once(')')
@@ -146,17 +149,6 @@ impl ProcessScanner {
             f[i].parse()
                 .with_context(|| format!("/proc/{pid}/stat: field {:?}", f[i]))
         };
-        let uid = std::fs::metadata(self.sys.path(format!("/proc/{pid}")))
-            .ok()
-            .map(|m| m.uid());
-        let fds = std::fs::read_dir(self.sys.path(format!("/proc/{pid}/fd")))
-            .ok()
-            .map(|d| d.count() as u64);
-        let cmdline = self
-            .sys
-            .read_opt(format!("/proc/{pid}/cmdline"))
-            .unwrap_or_default()
-            .replace('\0', " ");
         let snap = Snapshot {
             pid: pid.parse().with_context(|| format!("pid {pid:?}"))?,
             ppid: num(1)? as u32,
@@ -164,24 +156,47 @@ impl ProcessScanner {
             state: f[0].to_string(),
             threads: num(17)?,
             rss_bytes: num(21)? * self.page_size,
-            cmdline: cmdline.trim().chars().take(self.cmdline_max).collect(),
-            user: uid.map(|u| users.get(&u).cloned().unwrap_or_else(|| u.to_string())),
-            fds,
         };
         Ok((snap, f[19].to_string(), num(11)? + num(12)?))
     }
 
-    fn users(&self) -> HashMap<u32, String> {
-        let mut users = HashMap::new();
+    /// Fills `user`, `fds` and `cmdline`, which cost a metadata call, a directory read and a file read per row.
+    pub fn fill_details(&mut self, rows: &mut [Process]) {
+        self.refresh_users();
+        for r in rows {
+            let uid = std::fs::metadata(self.sys.path(format!("/proc/{}", r.pid)))
+                .ok()
+                .map(|m| m.uid());
+            r.user = uid.map(|u| self.users.get(&u).cloned().unwrap_or_else(|| u.to_string()));
+            r.fds = std::fs::read_dir(self.sys.path(format!("/proc/{}/fd", r.pid)))
+                .ok()
+                .map(|d| d.count() as u64);
+            let cmdline = self
+                .sys
+                .read_opt(format!("/proc/{}/cmdline", r.pid))
+                .unwrap_or_default()
+                .replace('\0', " ");
+            r.cmdline = cmdline.trim().chars().take(self.cmdline_max).collect();
+        }
+    }
+
+    fn refresh_users(&mut self) {
+        let mtime = std::fs::metadata(self.sys.path("/etc/passwd"))
+            .and_then(|m| m.modified())
+            .ok();
+        if mtime.is_some() && mtime == self.passwd_mtime {
+            return;
+        }
+        self.passwd_mtime = mtime;
+        self.users.clear();
         for line in self.sys.read_opt("/etc/passwd").unwrap_or_default().lines() {
             let mut f = line.split(':');
             if let (Some(name), Some(_), Some(uid)) = (f.next(), f.next(), f.next())
                 && let Ok(uid) = uid.parse()
             {
-                users.entry(uid).or_insert_with(|| name.to_string());
+                self.users.entry(uid).or_insert_with(|| name.to_string());
             }
         }
-        users
     }
 }
 
@@ -272,6 +287,12 @@ impl Collector for Processes {
             out.groups_cpu = Some(top(&groups, |g| g.cpu_pct, n));
             out.groups_memory = Some(top(&groups, |g| g.rss_bytes as f64, n));
         }
+        for list in [Some(&mut out.top_cpu), Some(&mut out.top_memory), out.top_io.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            self.scanner.fill_details(list);
+        }
         Ok(Some(serde_json::to_value(out)?))
     }
 }
@@ -283,8 +304,6 @@ mod tests {
     use super::*;
     use crate::testutil::{Fixture, assert_schema};
 
-    // fields after comm: state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt
-    // utime stime cutime cstime prio nice threads itrealvalue starttime vsize rss
     fn stat(pid: u32, comm: &str, ppid: u32, utime: u64, threads: u64, start: u64, rss: u64) -> String {
         format!("{pid} ({comm}) S {ppid} 1 1 0 -1 0 0 0 0 0 {utime} 0 0 0 20 0 {threads} 0 {start} 100000 {rss} 0 0\n")
     }
@@ -362,9 +381,16 @@ mod tests {
     }
 
     #[test]
-    fn malformed_stat_is_an_error_not_a_guess() {
-        let f = Fixture::new().file("proc/5/stat", "5 (a) S 1\n");
-        assert!(scanner(&f).scan().is_err());
+    fn malformed_pid_is_skipped_and_the_others_are_still_reported() {
+        let f = Fixture::new()
+            .file("proc/5/stat", &stat(5, "good", 1, 0, 1, 10, 7))
+            .file("proc/6/stat", "6 (bad) S 1\n")
+            .file("proc/7/stat", &stat(7, "also-good", 1, 0, 1, 11, 7));
+        let mut s = scanner(&f);
+        s.scan().unwrap();
+        let t = s.scan().unwrap().unwrap();
+        assert_eq!(t.count, 2);
+        assert_eq!(t.rows.iter().map(|r| r.pid).collect::<Vec<_>>(), [5, 7]);
     }
 
     #[test]
@@ -386,7 +412,8 @@ mod tests {
         s.scan().unwrap();
         pause();
         std::fs::write(f.path().join("proc/5/io"), "read_bytes: 2000\nwrite_bytes: 4000\n").unwrap();
-        let t = s.scan().unwrap().unwrap();
+        let mut t = s.scan().unwrap().unwrap();
+        s.fill_details(&mut t.rows);
         let mine = row(&t, 5);
         assert!(mine.read_bps.unwrap() > 0);
         assert_eq!(mine.write_bps, Some(0));
@@ -399,12 +426,79 @@ mod tests {
     }
 
     #[test]
+    fn scan_alone_leaves_details_empty() {
+        let f = Fixture::new()
+            .file("proc/5/stat", &stat(5, "a", 1, 0, 1, 10, 7))
+            .file("proc/5/cmdline", "a\0--x\0")
+            .file("proc/5/fd/0", "");
+        let mut s = scanner(&f);
+        s.scan().unwrap();
+        let t = s.scan().unwrap().unwrap();
+        assert_eq!(
+            (row(&t, 5).user.as_deref(), row(&t, 5).fds, row(&t, 5).cmdline.as_str()),
+            (None, None, "")
+        );
+    }
+
+    #[test]
+    fn passwd_is_reread_only_when_its_mtime_changes() {
+        let f = Fixture::new()
+            .file("etc/passwd", "alice:x:1000:1000::/h:/bin/sh\n")
+            .file("proc/5/stat", &stat(5, "a", 1, 0, 1, 10, 7));
+        let mut s = scanner(&f);
+        s.refresh_users();
+        assert_eq!(s.users.get(&1000).map(String::as_str), Some("alice"));
+        let passwd = f.path().join("etc/passwd");
+        let mtime = std::fs::metadata(&passwd).unwrap().modified().unwrap();
+        std::fs::write(&passwd, "bob:x:1000:1000::/h:/bin/sh\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&passwd)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        s.refresh_users();
+        assert_eq!(
+            s.users.get(&1000).map(String::as_str),
+            Some("alice"),
+            "unchanged mtime, cached map"
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&passwd)
+            .unwrap()
+            .set_modified(mtime + Duration::from_secs(5))
+            .unwrap();
+        s.refresh_users();
+        assert_eq!(s.users.get(&1000).map(String::as_str), Some("bob"));
+    }
+
+    #[test]
+    fn periodic_collector_rows_carry_details() {
+        let f = Fixture::new()
+            .file("proc/5/stat", &stat(5, "busy", 1, 0, 1, 10, 7))
+            .file("proc/5/cmdline", "busy\0--flag\0")
+            .file("proc/5/fd/0", "");
+        let mut c = Processes::new(Options::default(), f.sys()).unwrap();
+        assert!(c.sample().unwrap().is_none());
+        pause();
+        std::fs::write(f.path().join("proc/5/stat"), stat(5, "busy", 1, 50, 1, 10, 7)).unwrap();
+        let v = c.sample().unwrap().unwrap();
+        let top = &v["top_cpu"][0];
+        assert_eq!(top["pid"], 5);
+        assert_eq!(top["cmdline"], "busy --flag");
+        assert_eq!(top["fds"], 1);
+        assert!(top["user"].is_string());
+    }
+
+    #[test]
     fn unknown_uid_falls_back_to_the_number() {
         let f = Fixture::new().file("proc/5/stat", &stat(5, "a", 1, 0, 1, 10, 7));
         let uid = uid_of(&f);
         let mut s = scanner(&f);
         s.scan().unwrap();
-        let t = s.scan().unwrap().unwrap();
+        let mut t = s.scan().unwrap().unwrap();
+        s.fill_details(&mut t.rows);
         assert_eq!(row(&t, 5).user, Some(uid.to_string()));
     }
 
@@ -415,7 +509,9 @@ mod tests {
             .file("proc/5/cmdline", "abcdefghij\0");
         let mut s = ProcessScanner::new(f.sys(), false, 4).unwrap();
         s.scan().unwrap();
-        assert_eq!(row(&s.scan().unwrap().unwrap(), 5).cmdline, "abcd");
+        let mut t = s.scan().unwrap().unwrap();
+        s.fill_details(&mut t.rows);
+        assert_eq!(row(&t, 5).cmdline, "abcd");
     }
 
     #[test]

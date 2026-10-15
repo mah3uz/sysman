@@ -71,10 +71,10 @@ impl Jsonl {
             else {
                 continue;
             };
-            if date < oldest {
-                if let Err(e) = std::fs::remove_file(entry.path()) {
-                    eprintln!("could not delete old log {}: {e}", entry.path().display());
-                }
+            if date < oldest
+                && let Err(e) = std::fs::remove_file(entry.path())
+            {
+                eprintln!("could not delete old log {}: {e}", entry.path().display());
             }
         }
     }

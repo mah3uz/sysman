@@ -86,10 +86,11 @@ impl Collector for Storage {
             let mut device_errors = BTreeMap::new();
             for devid in self.sys.list(format!("{fs}/devinfo")) {
                 let info = format!("{fs}/devinfo/{devid}");
-                let errors = match self.sys.read_opt(format!("{info}/error_stats")) {
-                    Some(text) => parse_error_stats(&text).with_context(|| format!("{info}/error_stats"))?,
-                    None => BTreeMap::new(),
-                };
+                let errors = self
+                    .sys
+                    .read_opt(format!("{info}/error_stats"))
+                    .and_then(|text| parse_error_stats(&text).ok())
+                    .unwrap_or_default();
                 let missing = self.sys.int_opt(format!("{info}/missing")).map(|m| u8::from(m != 0));
                 device_errors.insert(devid, DeviceErrors { missing, errors });
             }
@@ -204,12 +205,23 @@ mod tests {
     }
 
     #[test]
-    fn malformed_error_stats_is_an_error_not_a_zero() {
-        let f = host().file(
-            &format!("sys/fs/btrfs/{UUID}/devinfo/1/error_stats"),
-            "write_errs many\n",
-        );
-        assert!(collector(&f).sample().is_err());
+    fn malformed_error_stats_drops_that_devids_counters_only() {
+        let f = host()
+            .file(
+                &format!("sys/fs/btrfs/{UUID}/devinfo/1/error_stats"),
+                "write_errs many\n",
+            )
+            .file(&format!("sys/fs/btrfs/{UUID}/devinfo/1/missing"), "1\n")
+            .file(
+                &format!("sys/fs/btrfs/{UUID}/devinfo/2/error_stats"),
+                "write_errs 0\nread_errs 4\n",
+            );
+        let v = collector(&f).sample().unwrap().unwrap();
+        assert_schema::<schema::storage::Storage>(&v);
+        assert_eq!(v["devices"]["nvme0n1"]["state"], "live");
+        let errs = &v["btrfs"][UUID]["device_errors"];
+        assert_eq!(errs["1"], serde_json::json!({"missing": 1}), "no counters are invented");
+        assert_eq!(errs["2"]["read_errs"], 4);
     }
 
     #[test]

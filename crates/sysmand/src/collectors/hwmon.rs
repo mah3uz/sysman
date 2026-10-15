@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use schema::hwmon::HwmonMeta;
@@ -23,41 +24,58 @@ struct Sensor {
     stem_path: String,
 }
 
+type Chips = BTreeMap<String, Vec<Sensor>>;
+
 pub struct Hwmon {
     sys: Sys,
-    chips: BTreeMap<String, Vec<Sensor>>,
+    signature: Vec<(String, Option<PathBuf>)>,
+    chips: Chips,
 }
 
 impl Hwmon {
     pub fn new(_: NoOptions, sys: Sys) -> Result<Self> {
-        let mut chips = BTreeMap::new();
-        for h in sys
-            .list("/sys/class/hwmon")
-            .into_iter()
-            .filter(|h| h.starts_with("hwmon"))
-        {
-            let dir = format!("/sys/class/hwmon/{h}");
-            let name = sys.read_opt(format!("{dir}/name")).unwrap_or_else(|| h.clone());
-            let device = std::fs::canonicalize(sys.path(format!("{dir}/device")))
-                .ok()
-                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| "device".to_string());
-            let sensors = sensors(&sys, &dir);
-            if sensors.is_empty() {
-                continue;
-            }
-            // two chips can share name and device; the first keeps the plain key
-            let base = format!("{name}/{device}");
-            let mut key = base.clone();
-            let mut n = 2;
-            while chips.contains_key(&key) {
-                key = format!("{base}#{n}");
-                n += 1;
-            }
-            chips.insert(key, sensors);
-        }
-        Ok(Self { sys, chips })
+        let signature = sys.hwmon_signature();
+        let chips = discover(&sys);
+        Ok(Self { sys, signature, chips })
     }
+
+    fn refresh(&mut self) {
+        let signature = self.sys.hwmon_signature();
+        if signature != self.signature {
+            self.chips = discover(&self.sys);
+            self.signature = signature;
+        }
+    }
+}
+
+fn discover(sys: &Sys) -> Chips {
+    let mut chips = BTreeMap::new();
+    for h in sys
+        .list("/sys/class/hwmon")
+        .into_iter()
+        .filter(|h| h.starts_with("hwmon"))
+    {
+        let dir = format!("/sys/class/hwmon/{h}");
+        let name = sys.read_opt(format!("{dir}/name")).unwrap_or_else(|| h.clone());
+        let device = std::fs::canonicalize(sys.path(format!("{dir}/device")))
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "device".to_string());
+        let sensors = sensors(sys, &dir);
+        if sensors.is_empty() {
+            continue;
+        }
+        // two chips can share name and device; the first keeps the plain key
+        let base = format!("{name}/{device}");
+        let mut key = base.clone();
+        let mut n = 2;
+        while chips.contains_key(&key) {
+            key = format!("{base}#{n}");
+            n += 1;
+        }
+        chips.insert(key, sensors);
+    }
+    chips
 }
 
 fn sensors(sys: &Sys, dir: &str) -> Vec<Sensor> {
@@ -120,6 +138,7 @@ impl Collector for Hwmon {
     }
 
     fn sample(&mut self) -> Result<Option<Value>> {
+        self.refresh();
         let mut out: schema::hwmon::Hwmon = BTreeMap::new();
         for (chip, sensors) in &self.chips {
             for s in sensors {
@@ -234,5 +253,32 @@ mod tests {
         let mut c = Hwmon::new(NoOptions {}, f.sys()).unwrap();
         let v = c.sample().unwrap().unwrap();
         assert_eq!(v["hwmon0/device"]["temp"]["temp1"], 20.0);
+    }
+
+    #[test]
+    fn values_follow_the_chip_when_hwmon_numbers_are_swapped() {
+        let mut f = Fixture::new();
+        for (h, name, milli, dev) in [
+            ("hwmon0", "nvme", "30000", "pci0000:00/0000:00:01.1"),
+            ("hwmon1", "k10temp", "60000", "pci0000:00/0000:00:18.3"),
+        ] {
+            f = f
+                .file(&format!("sys/class/hwmon/{h}/name"), &format!("{name}\n"))
+                .file(&format!("sys/class/hwmon/{h}/temp1_input"), &format!("{milli}\n"));
+            link_device(&f, h, dev);
+        }
+        let mut c = Hwmon::new(NoOptions {}, f.sys()).unwrap();
+        let v = c.sample().unwrap().unwrap();
+        assert_eq!(v["nvme/0000:00:01.1"]["temp"]["temp1"], 30.0);
+
+        let hw = f.path().join("sys/class/hwmon");
+        std::fs::rename(hw.join("hwmon0"), hw.join("tmp")).unwrap();
+        std::fs::rename(hw.join("hwmon1"), hw.join("hwmon0")).unwrap();
+        std::fs::rename(hw.join("tmp"), hw.join("hwmon1")).unwrap();
+        std::fs::write(hw.join("hwmon1/temp1_input"), "31000\n").unwrap();
+
+        let v = c.sample().unwrap().unwrap();
+        assert_eq!(v["nvme/0000:00:01.1"]["temp"]["temp1"], 31.0);
+        assert_eq!(v["k10temp/0000:00:18.3"]["temp"]["temp1"], 60.0);
     }
 }

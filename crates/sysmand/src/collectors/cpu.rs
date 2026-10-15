@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -83,11 +84,13 @@ pub struct Cpu {
     frequency: bool,
     deltas: Deltas<String>,
     temp: Option<TempSource>,
+    temp_signature: Vec<(String, Option<PathBuf>)>,
     rapl: Option<Rapl>,
 }
 
 impl Cpu {
     pub fn new(options: Options, sys: Sys) -> Result<Self> {
+        let temp_signature = sys.hwmon_signature();
         let temp = resolve_temp(&sys);
         let rapl = Rapl::new(&sys);
         Ok(Self {
@@ -96,6 +99,7 @@ impl Cpu {
             frequency: options.frequency,
             deltas: Deltas::default(),
             temp,
+            temp_signature,
             rapl,
         })
     }
@@ -243,6 +247,11 @@ impl Collector for Cpu {
             Vec::new()
         };
         let known: Vec<u64> = mhz.iter().flatten().copied().collect();
+        let signature = self.sys.hwmon_signature();
+        if signature != self.temp_signature {
+            self.temp = resolve_temp(&self.sys);
+            self.temp_signature = signature;
+        }
         let (temp_c, temps_c) = self.temps();
 
         let out = schema::cpu::Cpu {
@@ -260,7 +269,6 @@ impl Collector for Cpu {
     }
 }
 
-/// Per `cpu`/`cpuN` line: user, nice, system, idle, iowait, irq, softirq, steal, guest.
 /// The kernel already counts guest time inside user and nice, so it is moved out of them.
 fn parse_stat(text: &str) -> Result<HashMap<String, Vec<u64>>> {
     let mut out = HashMap::new();
@@ -372,7 +380,6 @@ fn resolve_temp(sys: &Sys) -> Option<TempSource> {
             matching.next().into_iter().collect()
         };
 
-        // (label, path, index into selected)
         let mut sensors: Vec<(String, String, usize)> = Vec::new();
         for (i, chip) in selected.iter().enumerate() {
             let inputs: Vec<(String, String)> = sys
@@ -665,6 +672,28 @@ mod tests {
         let m = c.meta().unwrap();
         assert_schema::<schema::cpu::CpuMeta>(&m);
         assert!(m["temp_source"].is_null());
+    }
+
+    #[test]
+    fn package_temperature_follows_the_chip_when_hwmon_numbers_are_swapped() {
+        let f = hwmon(
+            Fixture::new(),
+            0,
+            "nvme",
+            "pci/0000:03:00.0",
+            &[(1, Some("Composite"), 35000)],
+        );
+        let f = hwmon(f, 1, "k10temp", "pci/0000:00:18.3", &[(1, Some("Tctl"), 50000)]);
+        let (mut c, v) = sample_twice(&f, &stat(IDLE_THEN_BUSY.0, &[]), &stat(IDLE_THEN_BUSY.1, &[]));
+        assert_eq!(v["temp_c"], 50.0);
+
+        let hw = f.path().join("sys/class/hwmon");
+        std::fs::rename(hw.join("hwmon0"), hw.join("tmp")).unwrap();
+        std::fs::rename(hw.join("hwmon1"), hw.join("hwmon0")).unwrap();
+        std::fs::rename(hw.join("tmp"), hw.join("hwmon1")).unwrap();
+        std::fs::write(f.path().join("proc/stat"), stat("300 0 300 2400 0 0 0 0 0 0", &[])).unwrap();
+        let v = c.sample().unwrap().unwrap();
+        assert_eq!(v["temp_c"], 50.0);
     }
 
     #[test]

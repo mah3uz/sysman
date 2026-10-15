@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// One process. `cpu_pct` is percent of one core. `read_bps`, `write_bps`, `user`
-/// and `fds` are absent for processes the daemon's user may not inspect.
+/// `read_bps`, `write_bps`, `user` and `fds` are absent for processes the daemon's user may not inspect.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Process {
     pub pid: u32,
@@ -33,8 +32,7 @@ pub struct Group {
     pub rss_bytes: u64,
 }
 
-/// Every process, as served on demand. Processes first seen on this scan have
-/// no rate yet and are counted but have no row.
+/// Processes first seen on this scan have no rate yet, so they are counted but have no row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Table {
     pub count: u64,

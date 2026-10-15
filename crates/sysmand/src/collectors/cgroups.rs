@@ -41,12 +41,7 @@ impl Cgroups {
     // cgroup v2 keeps processes in leaves, so a parent's totals already include its children
     fn leaves(&self, rel: &str, out: &mut Vec<String>) {
         let dir = format!("{ROOT}/{rel}");
-        let subdirs: Vec<String> = self
-            .sys
-            .list(&dir)
-            .into_iter()
-            .filter(|n| self.sys.path(format!("{dir}/{n}")).is_dir())
-            .collect();
+        let subdirs = self.sys.subdirs(&dir);
         if subdirs.is_empty() && !rel.is_empty() {
             out.push(rel.to_string());
         }
@@ -134,7 +129,6 @@ mod tests {
     }
 
     fn tree(a_usec: u64, b_usec: u64) -> Fixture {
-        // user.slice has no processes of its own: its totals are the sum of its children
         Fixture::new()
             .file("sys/fs/cgroup/cpu.stat", &cpu(9_000_000))
             .file("sys/fs/cgroup/user.slice/cpu.stat", &cpu(a_usec + b_usec))

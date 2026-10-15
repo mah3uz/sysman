@@ -54,4 +54,28 @@ impl Sys {
         names.sort();
         names
     }
+
+    /// Names of the subdirectories of a directory, sorted; the entry type comes from the directory read, with no stat.
+    pub fn subdirs(&self, path: impl AsRef<Path>) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.path(path))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Each `/sys/class/hwmon` entry with its device link target; it changes when hwmon numbers are reassigned.
+    pub fn hwmon_signature(&self) -> Vec<(String, Option<PathBuf>)> {
+        self.list("/sys/class/hwmon")
+            .into_iter()
+            .map(|h| {
+                let link = std::fs::read_link(self.path(format!("/sys/class/hwmon/{h}/device"))).ok();
+                (h, link)
+            })
+            .collect()
+    }
 }
