@@ -62,6 +62,9 @@ impl Sources {
         if let (true, Some(e)) = (smart_ok, smart_error) {
             errors.insert("smart".into(), e);
         }
+        if let Ok(Net { missing: Some(e), .. }) = &self.net {
+            errors.insert("net".into(), e.clone());
+        }
         Status {
             version: env!("CARGO_PKG_VERSION").to_string(),
             features,

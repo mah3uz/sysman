@@ -225,7 +225,16 @@ these and nothing else.
     or v4-mapped 127/8. A `tp_btf/sched_process_exit` program removes a
     process's entry when it exits, keeping the map bounded and a reused pid at
     zero. Kernel structs are declared by hand with `preserve_access_index`, so
-    no `vmlinux.h` is needed; the kernel must have BTF.
+    no `vmlinux.h` is needed; the kernel must have BTF. An `fexit` program must
+    declare its function's exact arguments, and `udp_recvmsg`/`udpv6_recvmsg`
+    changed (6 with `noblock` before 5.19, then 5, then 4 without `addr_len`),
+    so the object holds one program per signature and the loader reads each
+    hooked function's argument count from `/sys/kernel/btf/vmlinux` and loads
+    only the matching one. Every program is optional: if the object fails to
+    load, each program is loaded alone to find the ones the kernel rejects,
+    and those, like any that fails to attach, are left out. `net` stays on
+    while both TCP programs work, with `errors.net` naming what is not counted
+    (`UDP receive not counted: …`).
 - **In sysmand.** A `HelperClient`, shared through `Sys`, asks once per tick
   when the socket exists: one connection per request, a 500 ms limit, and one
   reading shared by every module of the tick. It feeds `cpu.power_w` (only
