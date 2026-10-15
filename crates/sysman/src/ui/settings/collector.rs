@@ -207,7 +207,7 @@ impl CollectorForm {
                 }
             },
         );
-        let control = div().w(rem_px(96.)).child(Input::new(&state).small());
+        let control = text_field(&state, 96., cx);
         with_error(row(label, control, cx), self.invalid.get(&key).cloned(), cx)
     }
 
@@ -354,7 +354,7 @@ impl CollectorForm {
                     .items_center()
                     .gap(rem_px(4.))
                     .children(chips)
-                    .child(div().w(rem_px(150.)).child(Input::new(&state).small())),
+                    .child(text_field(&state, 150., cx)),
             )
             .into_any_element();
         with_error(body, self.invalid.get(&key).cloned(), cx)
@@ -552,7 +552,7 @@ impl CollectorForm {
                     ),
             );
         }
-        if let Some(e) = invalid.filter(|_| dirty || self.save_error.is_some()) {
+        if let Some(e) = invalid {
             bar = bar.child(error_row(e, cx));
         }
         if self.saved && !dirty {
@@ -591,7 +591,7 @@ impl CollectorForm {
                         .min_w_0()
                         .truncate()
                         .text_color(t.text_tertiary)
-                        .child(self.file.path().display().to_string()),
+                        .child(tilde(self.file.path())),
                 )
                 .child(
                     Button::new("config-revert")
@@ -626,6 +626,28 @@ fn notice(tint: gpui::Hsla, text: &'static str, cx: &App) -> gpui::Div {
         .rounded(t.sub_radius)
         .bg(tint.opacity(0.12))
         .child(div().flex_1().min_w_0().text_color(t.text).child(text))
+}
+
+/// A text field drawn like the title bar's controls, so it reads as editable on the grouped rows.
+fn text_field(state: &Entity<InputState>, width: f32, cx: &App) -> gpui::Div {
+    let t = theme(cx);
+    crate::ui::widgets::hairline(
+        div()
+            .w(rem_px(width))
+            .px(rem_px(4.))
+            .rounded(rem_px(6.))
+            .bg(t.control)
+            .border_color(t.control_border),
+        t.hairline_width,
+    )
+    .child(Input::new(state).small().appearance(false))
+}
+
+fn tilde(path: &std::path::Path) -> String {
+    match std::env::home_dir().and_then(|home| path.strip_prefix(home).ok().map(|p| p.display().to_string())) {
+        Some(rest) => format!("~/{rest}"),
+        None => path.display().to_string(),
+    }
 }
 
 /// A row with its field's error under it.
