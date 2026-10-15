@@ -203,6 +203,65 @@ impl History {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Every process instance recorded at some point in `[from, to)`.
+    pub fn procs_between(&self, from: i64, to: i64) -> Result<Vec<Proc>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, pid, start_time, comm, cmdline, user, first_t, last_t FROM procs
+             WHERE last_t >= ?1 AND first_t < ?2",
+        )?;
+        let rows = stmt.query_map([from, to], |r| {
+            Ok(Proc {
+                id: r.get(0)?,
+                pid: r.get(1)?,
+                start_time: r.get(2)?,
+                comm: r.get(3)?,
+                cmdline: r.get(4)?,
+                user: r.get(5)?,
+                first_t: r.get(6)?,
+                last_t: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The total of `field` over the instances `ids`, summed at each instant before bucketing, so
+    /// a restart counts once and the band shows the swing of the total, not of one member.
+    pub fn procs_sum(&self, ids: &[i64], field: ProcField, from: i64, to: i64, buckets: u32) -> Result<Vec<Bucket>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tier = match Tier::for_span(to - from) {
+            Tier::Raw => Tier::Raw,
+            Tier::Minute | Tier::Quarter => Tier::Minute,
+        };
+        let w = width(tier, from, to, buckets);
+        let (raw, [_, avg, _]) = field.columns();
+        let ids = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        // A minute's total is the sample-weighted sum over the minute's scans; an instance that ran for
+        // part of it adds only that part.
+        let (table, total) = match tier {
+            Tier::Raw => ("proc_points", format!("sum({raw})")),
+            _ => (
+                "proc_rollup_1m",
+                format!("sum({avg} * count) / max(CASE WHEN {avg} IS NOT NULL THEN count END)"),
+            ),
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT t / ?3 * ?3 AS b, min(s), avg(s), max(s) FROM (
+               SELECT t, {total} AS s FROM {table} WHERE proc_id IN ({ids}) AND t >= ?1 AND t < ?2 GROUP BY t)
+             WHERE s IS NOT NULL GROUP BY b ORDER BY b"
+        ))?;
+        let rows = stmt.query_map(params![from, to, w], |r| {
+            Ok(Bucket {
+                t: r.get(0)?,
+                min: r.get(1)?,
+                avg: r.get(2)?,
+                max: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn bucketed(
         &self,
@@ -383,5 +442,55 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!((found[0].pid, found[0].cmdline.as_deref()), (42, Some("firefox --x")));
         assert_eq!(h.find_procs("").unwrap().first().map(|p| p.id), Some(2), "newest first");
+    }
+
+    #[test]
+    fn group_totals_sum_instances_at_each_scan_then_bucket() {
+        let (dir, conn) = db();
+        // Instance 2 restarts as 3 at t=20; 4 is outside the group.
+        conn.execute_batch(
+            "INSERT INTO procs VALUES (1, 10, 1, 'a', NULL, NULL, 0, 30), (2, 11, 1, 'b', NULL, NULL, 0, 10),
+                                      (3, 11, 2, 'b', NULL, NULL, 20, 30), (4, 12, 1, 'c', NULL, NULL, 0, 30);
+             INSERT INTO proc_points (proc_id, t, rss_bytes) VALUES
+               (1, 0, 100), (1, 10, 100), (1, 20, 100), (1, 30, 100),
+               (2, 0, 50), (2, 10, 70), (3, 20, 60), (3, 30, 80), (4, 0, 1000);",
+        )
+        .unwrap();
+        let h = history(&dir);
+        let one = h.procs_sum(&[1, 2, 3], ProcField::Rss, 0, 40, 1).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(
+            (one[0].min, one[0].max),
+            (150., 180.),
+            "the totals 150, 170, 160, 180: the restart is not counted twice"
+        );
+        assert!((one[0].avg - 165.).abs() < 1e-9);
+        assert!(h.procs_sum(&[], ProcField::Rss, 0, 40, 1).unwrap().is_empty());
+        let seen: Vec<i64> = h.procs_between(15, 40).unwrap().iter().map(|p| p.id).collect();
+        assert_eq!(seen, [1, 3, 4], "instance 2 ended before the window");
+    }
+
+    #[test]
+    fn group_minute_totals_weight_partial_instances_by_their_samples() {
+        let (dir, conn) = db();
+        // Minute 60: instance 1 ran all six scans at 100, instance 2 only three at 200.
+        conn.execute_batch(
+            "INSERT INTO proc_rollup_1m (proc_id, t, rss_avg, rss_max, cpu_avg, count) VALUES
+               (1, 60, 100, 100, 10, 6), (2, 60, 200, 200, NULL, 3),
+               (1, 120, 100, 100, 10, 6), (2, 120, 300, 300, 5, 6);",
+        )
+        .unwrap();
+        let h = history(&dir);
+        let b = h.procs_sum(&[1, 2], ProcField::Rss, 0, DAY, 1440).unwrap();
+        assert_eq!(
+            b.iter().map(|b| (b.t, b.avg)).collect::<Vec<_>>(),
+            [(60, 200.), (120, 400.)],
+            "half a minute of 200 adds 100, not 200"
+        );
+        let cpu = h.procs_sum(&[1, 2], ProcField::Cpu, 0, DAY, 1440).unwrap();
+        assert_eq!(
+            cpu[0].avg, 10.,
+            "a minute with no CPU reading does not shrink the divisor"
+        );
     }
 }

@@ -21,6 +21,7 @@ use crate::data::systemd;
 use crate::screens::dashboard::Dashboard;
 use crate::screens::disk::Disk;
 use crate::screens::gpu::Gpu;
+use crate::screens::groups::Groups;
 use crate::screens::network::Network;
 use crate::screens::processes::Processes;
 use crate::ui::settings;
@@ -188,7 +189,7 @@ impl Shell {
     /// Only the tabs that show the process table pay for the daemon's scan; Network shows it only via the helper.
     fn sync_feed(&self) {
         let ms = match self.tab {
-            Tab::Dashboard | Tab::Processes | Tab::Disk => self.refresh.0.as_millis() as u64,
+            Tab::Dashboard | Tab::Processes | Tab::Disk | Tab::Groups => self.refresh.0.as_millis() as u64,
             Tab::Network if self.helper_running => self.refresh.0.as_millis() as u64,
             _ => 0,
         };
@@ -430,6 +431,7 @@ fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App
         Tab::Gpu => cx.new(|cx| Gpu::new(live, cx)).into(),
         Tab::Network => cx.new(|cx| Network::new(live, feed, cx)).into(),
         Tab::Disk => cx.new(|cx| Disk::new(live, feed, cx)).into(),
+        Tab::Groups => cx.new(|cx| Groups::new(live, feed, cx)).into(),
         _ => cx.new(|_| Placeholder { tab, live }).into(),
     }
 }

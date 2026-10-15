@@ -51,7 +51,10 @@ gpui_kit_assets::icon_assets!(
         CircleCheck,
         SlidersHorizontal,
         X,
-        Lock
+        Lock,
+        Pencil,
+        PencilLine,
+        Trash
     ]
 );
 
