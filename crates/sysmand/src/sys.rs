@@ -1,23 +1,31 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+
+use crate::helper::{self, HelperClient};
 
 /// Access to `/proc` and `/sys` under a root that tests point at a fixture tree.
 #[derive(Debug, Clone)]
 pub struct Sys {
     root: PathBuf,
+    /// Shared by every clone, so the modules of one tick share one helper reading.
+    helper: Arc<HelperClient>,
 }
 
 impl Sys {
     pub fn host() -> Self {
-        Self {
-            root: PathBuf::from("/"),
-        }
+        Self::at("/")
     }
 
-    #[cfg(test)]
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        let helper = Arc::new(HelperClient::new(root.join(helper::SOCKET.trim_start_matches('/'))));
+        Self { root, helper }
+    }
+
+    pub fn helper(&self) -> &HelperClient {
+        &self.helper
     }
 
     pub fn path(&self, path: impl AsRef<Path>) -> PathBuf {

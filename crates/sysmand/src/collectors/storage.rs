@@ -63,9 +63,14 @@ impl Collector for Storage {
                 (dev, drive)
             })
             .collect();
+        let note = if self.sys.helper().present() {
+            "SMART wear and health come from sysman-helper"
+        } else {
+            "SMART wear and health need root and are not collected"
+        };
         let meta = StorageMeta {
             devices,
-            note: "SMART wear and health need root and are not collected".into(),
+            note: note.into(),
         };
         serde_json::to_value(meta).ok()
     }
@@ -100,7 +105,12 @@ impl Collector for Storage {
         Ok(Some(serde_json::to_value(schema::storage::Storage {
             devices,
             btrfs,
-            smart: Default::default(),
+            smart: self
+                .sys
+                .helper()
+                .read()
+                .map(|(_, r)| r.smart.clone())
+                .unwrap_or_default(),
         })?))
     }
 }
@@ -231,5 +241,26 @@ mod tests {
     #[test]
     fn no_block_devices_disables_the_module() {
         assert!(Storage::new(Options::default(), Fixture::new().sys()).is_err());
+    }
+
+    #[test]
+    fn smart_comes_from_the_helper_and_is_absent_without_it() {
+        let f = host();
+        let before = collector(&f).sample().unwrap().unwrap();
+        assert!(
+            before.get("smart").is_none(),
+            "no helper: the output is as it always was"
+        );
+        f.fake_helper(
+            |_| serde_json::json!({"smart": {"nvme0n1": {"passed": true, "temp_c": 41.0, "percent_used": 3}}}),
+        );
+        let v = collector(&f).sample().unwrap().unwrap();
+        assert_schema::<schema::storage::Storage>(&v);
+        assert_eq!(v["smart"]["nvme0n1"]["percent_used"], 3);
+        assert_eq!(v["devices"], before["devices"]);
+        assert_eq!(
+            collector(&f).meta().unwrap()["note"],
+            "SMART wear and health come from sysman-helper"
+        );
     }
 }

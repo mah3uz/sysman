@@ -1,3 +1,5 @@
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 
 use crate::sys::Sys;
@@ -27,6 +29,21 @@ impl Fixture {
 
     pub fn sys(&self) -> Sys {
         Sys::at(self.dir.path())
+    }
+
+    /// Answers on the helper socket under this root like `sysman-helper`, with `answer(request line)`.
+    pub fn fake_helper(&self, answer: impl Fn(&str) -> serde_json::Value + Send + 'static) {
+        let path = self.dir.path().join(crate::helper::SOCKET.trim_start_matches('/'));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut line = String::new();
+                if BufReader::new(&stream).read_line(&mut line).is_ok() {
+                    let _ = writeln!(&stream, "{}", answer(&line));
+                }
+            }
+        });
     }
 }
 

@@ -14,6 +14,7 @@ use crate::sys::Sys;
 const CPU_DIR: &str = "/sys/devices/system/cpu";
 const HWMON: &str = "/sys/class/hwmon";
 const RAPL: &str = "/sys/class/powercap/intel-rapl:0";
+const RAPL_ZONE: &str = "intel-rapl:0";
 /// hwmon chip name → labels that mean "package temperature", most preferred first.
 const TEMP_CHIPS: [(&str, &[&str]); 3] = [
     ("k10temp", &["Tdie", "Tctl"]),
@@ -86,6 +87,8 @@ pub struct Cpu {
     temp: Option<TempSource>,
     temp_signature: Vec<(String, Option<PathBuf>)>,
     rapl: Option<Rapl>,
+    /// The same counter read by the privileged helper, when it is not readable here.
+    helper_rapl: Option<Rapl>,
 }
 
 impl Cpu {
@@ -101,6 +104,7 @@ impl Cpu {
             temp,
             temp_signature,
             rapl,
+            helper_rapl: None,
         })
     }
 
@@ -165,6 +169,18 @@ impl Cpu {
         }
     }
 
+    fn helper_watts(&mut self) -> Option<f64> {
+        let (t, reading) = self.sys.helper().read()?;
+        let zone = reading.rapl.get(RAPL_ZONE)?;
+        let rapl = self.helper_rapl.get_or_insert_with(|| Rapl {
+            energy: String::new(),
+            max_range_uj: zone.max_energy_range_uj,
+            prev: None,
+        });
+        rapl.max_range_uj = zone.max_energy_range_uj;
+        rapl.step(zone.energy_uj, t)
+    }
+
     fn temps(&self) -> (Option<f64>, BTreeMap<String, f64>) {
         let Some(t) = &self.temp else {
             return (None, BTreeMap::new());
@@ -198,14 +214,23 @@ impl Collector for Cpu {
             min_mhz: mhz("cpuinfo_min_freq"),
             max_mhz: mhz("cpuinfo_max_freq"),
             temp_source: self.temp.as_ref().map(|t| t.key.clone()),
-            power_source: self.rapl.is_some().then(|| "rapl".to_string()),
+            power_source: self.rapl.is_some().then(|| "rapl".to_string()).or_else(|| {
+                let (_, reading) = self.sys.helper().read()?;
+                reading
+                    .rapl
+                    .contains_key(RAPL_ZONE)
+                    .then(|| "rapl (sysman-helper)".to_string())
+            }),
             topology: self.topology(),
         };
         serde_json::to_value(meta).ok()
     }
 
     fn sample(&mut self) -> Result<Option<Value>> {
-        let power_w = self.rapl.as_mut().and_then(|r| r.watts(&self.sys, Instant::now()));
+        let power_w = match self.rapl.as_mut() {
+            Some(r) => r.watts(&self.sys, Instant::now()),
+            None => self.helper_watts(),
+        };
         let counters = parse_stat(&self.sys.read("/proc/stat")?)?;
         let Some((_, d)) = self.deltas.update(counters) else {
             return Ok(None);
@@ -847,5 +872,29 @@ mod tests {
     #[test]
     fn cpulist_ranges_and_singles() {
         assert_eq!(parse_cpulist("0-2,5,8-9"), [0, 1, 2, 5, 8, 9]);
+    }
+
+    #[test]
+    fn helper_supplies_power_when_energy_is_root_only_including_a_wrap() {
+        let f = amd();
+        let energy: [u64; 2] = [65_532_610_987 - 1_000_000, 4_000_000];
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        f.fake_helper(move |_| {
+            let i = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst).min(1);
+            serde_json::json!({"rapl": {"intel-rapl:0": {
+                "name": "package-0", "energy_uj": energy[i], "max_energy_range_uj": 65_532_610_987u64}}})
+        });
+        let mut c = Cpu::new(Options::default(), f.sys()).unwrap();
+        std::fs::write(f.path().join("proc/stat"), stat(IDLE_THEN_BUSY.0, &[])).unwrap();
+        assert!(c.sample().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::write(f.path().join("proc/stat"), stat(IDLE_THEN_BUSY.1, &[])).unwrap();
+        let v = c.sample().unwrap().unwrap();
+        assert_schema::<schema::cpu::Cpu>(&v);
+        // 1 J to the wrap point plus 4 J after it, over about half a second
+        let w = v["power_w"].as_f64().unwrap();
+        assert!((7.0..=10.0).contains(&w), "{w}");
+        assert_eq!(c.meta().unwrap()["power_source"], "rapl (sysman-helper)");
     }
 }

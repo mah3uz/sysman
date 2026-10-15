@@ -64,6 +64,13 @@ pub const MODULES: &[Spec] = &[
         build: |o, sys| Ok(Box::new(collectors::gpu::Gpu::new(options(o)?, sys)?)),
     },
     Spec {
+        name: "helper",
+        default_interval: 10,
+        snapshot: false,
+        unlogged: &[],
+        build: |o, sys| Ok(Box::new(collectors::helper::Helper::new(options(o)?, sys))),
+    },
+    Spec {
         name: "hwmon",
         default_interval: 2,
         snapshot: false,

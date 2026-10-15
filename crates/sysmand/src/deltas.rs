@@ -25,7 +25,7 @@ impl<K: Eq + Hash + Clone> Deltas<K> {
         self.update_at(counters, Instant::now())
     }
 
-    fn update_at(&mut self, counters: HashMap<K, Vec<u64>>, now: Instant) -> Option<(f64, HashMap<K, Vec<u64>>)> {
+    pub fn update_at(&mut self, counters: HashMap<K, Vec<u64>>, now: Instant) -> Option<(f64, HashMap<K, Vec<u64>>)> {
         let dt = self
             .t
             .map(|t| now.duration_since(t).as_secs_f64())

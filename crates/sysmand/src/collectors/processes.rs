@@ -3,6 +3,7 @@ use std::os::unix::fs::MetadataExt;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
+use schema::helper::ProcCounters;
 use schema::processes::{Group, Process, Table};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -49,6 +50,9 @@ pub struct ProcessScanner {
     clk_tck: f64,
     page_size: u64,
     deltas: Deltas<String>,
+    /// The privileged helper's I/O and network counters, keyed by pid and start time.
+    helper_io: Deltas<(u32, u64)>,
+    helper_net: Deltas<(u32, u64)>,
     users: HashMap<u32, String>,
     /// user and cmdline per process instance, which cannot change once it has started
     identity: HashMap<(u32, u64), (Option<String>, String)>,
@@ -69,6 +73,8 @@ impl ProcessScanner {
             clk_tck: clk_tck as f64,
             page_size: page_size as u64,
             deltas: Deltas::default(),
+            helper_io: Deltas::default(),
+            helper_net: Deltas::default(),
             users: HashMap::new(),
             identity: HashMap::new(),
             passwd_mtime: None,
@@ -219,6 +225,45 @@ impl ProcessScanner {
         }
     }
 
+    /// Adds what only the privileged helper can read: I/O and open files of processes this user may not
+    /// inspect, and network traffic of every process. Rows the scan could read keep their own values.
+    pub fn fill_helper(&mut self, rows: &mut [Process]) {
+        let Some((t, reading)) = self.sys.helper().read() else {
+            return;
+        };
+        let btime = self.boot_time();
+        let key = |c: &ProcCounters| (c.pid, btime + c.start_ticks / self.clk_tck as u64);
+        let (mut io, mut net, mut fds) = (HashMap::new(), HashMap::new(), HashMap::new());
+        for c in &reading.processes {
+            if let (Some(r), Some(w)) = (c.read_bytes, c.write_bytes) {
+                io.insert(key(c), vec![r, w]);
+            }
+            if let (Some(rx), Some(tx)) = (c.net_rx_bytes, c.net_tx_bytes) {
+                net.insert(key(c), vec![rx, tx]);
+            }
+            if let Some(n) = c.fds {
+                fds.insert(key(c), n);
+            }
+        }
+        let io = per_second(self.helper_io.update_at(io, t));
+        let net = per_second(self.helper_net.update_at(net, t));
+        for r in rows {
+            let k = (r.pid, r.start_time);
+            if self.io
+                && r.read_bps.is_none()
+                && let Some(&(read, write)) = io.get(&k)
+            {
+                (r.read_bps, r.write_bps) = (Some(read), Some(write));
+            }
+            if r.fds.is_none() {
+                r.fds = fds.get(&k).copied();
+            }
+            if let Some(&(rx, tx)) = net.get(&k) {
+                (r.net_rx_bps, r.net_tx_bps) = (Some(rx), Some(tx));
+            }
+        }
+    }
+
     fn refresh_users(&mut self) {
         let mtime = std::fs::metadata(self.sys.path("/etc/passwd"))
             .and_then(|m| m.modified())
@@ -248,6 +293,15 @@ fn parse_io(text: &str) -> Vec<u64> {
         (Some(r), Some(w)) => vec![r, w],
         _ => Vec::new(),
     }
+}
+
+/// Pairs of counter differences as rates.
+fn per_second<K: Eq + std::hash::Hash>(deltas: Option<(f64, HashMap<K, Vec<u64>>)>) -> HashMap<K, (u64, u64)> {
+    let Some((dt, d)) = deltas else {
+        return HashMap::new();
+    };
+    let rate = |v: u64| (v as f64 / dt).round() as u64;
+    d.into_iter().map(|(k, v)| (k, (rate(v[0]), rate(v[1])))).collect()
 }
 
 fn round1(x: f64) -> f64 {
@@ -285,10 +339,13 @@ impl Collector for Processes {
 
     fn sample(&mut self) -> Result<Option<Value>> {
         let Some(mut table) = self.scanner.scan()? else {
+            // the helper's counters need a first reading too, or its rates start a sample late
+            self.scanner.fill_helper(&mut []);
             return Ok(None);
         };
         let n = self.opts.top_n;
         self.scanner.fill_table(&mut table.rows);
+        self.scanner.fill_helper(&mut table.rows);
         let rows = &table.rows;
         let mut out = schema::processes::Processes {
             count: table.count,
@@ -710,5 +767,83 @@ mod tests {
     fn unknown_option_is_rejected() {
         let t: toml::Table = "top = 3".parse().unwrap();
         assert!(crate::collector::options::<Options>(t).is_err());
+    }
+
+    /// pid 5 is another user's process the scan cannot read I/O or fds of; pid 6 is the daemon user's own.
+    fn helper_host() -> Fixture {
+        Fixture::new()
+            .file("proc/stat", "cpu  1 2 3\nbtime 1700000000\n")
+            .file("proc/5/stat", &stat(5, "other", 1, 0, 1, 10, 7))
+            .file("proc/6/stat", &stat(6, "own", 1, 0, 1, 20, 7))
+            .file("proc/6/io", "read_bytes: 0\nwrite_bytes: 0\n")
+            .file("proc/6/fd/0", "")
+    }
+
+    fn rows(v: &Value) -> Vec<Value> {
+        v["table"].as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn helper_fills_unreadable_io_and_fds_and_network_for_all() {
+        let f = helper_host();
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seen = n.clone();
+        f.fake_helper(move |_| {
+            let k = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst).min(1);
+            json!({"processes": [
+                {"pid": 5, "start_ticks": 10, "read_bytes": k * 1_000_000, "write_bytes": k * 2_000_000, "fds": 9,
+                 "net_rx_bytes": k * 300_000, "net_tx_bytes": k * 400_000},
+                {"pid": 6, "start_ticks": 20, "read_bytes": k * 5_000_000, "write_bytes": 0, "fds": 99,
+                 "net_rx_bytes": k * 600_000, "net_tx_bytes": 0},
+                // the same pid as an earlier instance: its counters belong to someone else
+                {"pid": 5, "start_ticks": 99_999, "net_rx_bytes": 1, "net_tx_bytes": 1}
+            ]})
+        });
+        let mut c = Processes::new(Options::default(), f.sys()).unwrap();
+        c.sample().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let v = c.sample().unwrap().unwrap();
+        assert_schema::<schema::processes::Processes>(&v);
+        let t = rows(&v);
+        let (other, own) = (&t[0], &t[1]);
+        // rates are counter deltas over about half a second
+        let near = |x: &Value, per_half_second: f64| {
+            let x = x.as_f64().unwrap();
+            (per_half_second * 1.6..=per_half_second * 2.0).contains(&x)
+        };
+        assert!(
+            near(&other["read_bps"], 1e6) && near(&other["write_bps"], 2e6),
+            "{other}"
+        );
+        assert!(
+            near(&other["net_rx_bps"], 3e5) && near(&other["net_tx_bps"], 4e5),
+            "{other}"
+        );
+        assert_eq!(other["fds"], 9);
+        // what the scan read itself is kept; the helper only adds what it could not
+        assert_eq!((own["read_bps"].as_u64(), own["fds"].as_u64()), (Some(0), Some(1)));
+        assert!(near(&own["net_rx_bps"], 6e5), "{own}");
+        assert_eq!(v["top_io"][0]["pid"], 5, "helper I/O counts in the top list");
+    }
+
+    #[test]
+    fn without_the_helper_rows_are_as_before() {
+        let f = helper_host();
+        let mut c = Processes::new(Options::default(), f.sys()).unwrap();
+        c.sample().unwrap();
+        let v = c.sample().unwrap().unwrap();
+        let t = rows(&v);
+        assert_eq!(
+            t[0].as_object()
+                .unwrap()
+                .keys()
+                .filter(|k| ["read_bps", "write_bps", "fds", "net_rx_bps", "net_tx_bps"].contains(&k.as_str()))
+                .count(),
+            0,
+            "{}",
+            t[0]
+        );
+        assert!(t[1].get("net_rx_bps").is_none());
+        assert_eq!(t[1]["fds"], 1);
     }
 }

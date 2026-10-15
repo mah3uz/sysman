@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod db;
 mod deltas;
+mod helper;
 mod jsonl;
 mod pool;
 mod socket;
