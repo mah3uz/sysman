@@ -1355,8 +1355,6 @@ impl Groups {
 }
 
 impl Render for Groups {
-    // `window` is only needed by the debug-build editor shortcut
-    #[cfg_attr(not(debug_assertions), expect(unused_variables))]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(debug_assertions)]
         if std::mem::take(&mut self.dev_editor) {
