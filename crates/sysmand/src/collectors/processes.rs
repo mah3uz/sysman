@@ -93,7 +93,7 @@ impl ProcessScanner {
     }
 
     /// `None` on the first call, which only primes the counters. Rows carry no `user`, `fds`, `cmdline` or `exe`;
-    /// `fill_details` adds them.
+    /// `fill_table` adds them.
     pub fn scan(&mut self) -> Result<Option<Table>> {
         let mut procs: HashMap<String, Snapshot> = HashMap::new();
         let mut counters: HashMap<String, Vec<u64>> = HashMap::new();
@@ -229,6 +229,11 @@ impl ProcessScanner {
         }
     }
 
+    #[cfg(test)]
+    pub fn cached_identities(&self) -> usize {
+        self.identity.len()
+    }
+
     fn apply(r: &mut Process, id: Identity) {
         (r.user, r.cmdline, r.exe) = (id.user, id.cmdline, id.exe);
     }
@@ -239,18 +244,8 @@ impl ProcessScanner {
             .map(|d| d.count() as u64)
     }
 
-    /// Fills `user`, `fds`, `cmdline` and `exe`, which cost a metadata call, a directory read, a file read and a
-    /// link read per row.
-    pub fn fill_details(&mut self, rows: &mut [Process]) {
-        self.refresh_users();
-        for r in rows {
-            Self::apply(r, self.read_identity(r.pid));
-            r.fds = self.read_fds(r.pid);
-        }
-    }
-
-    /// Like `fill_details`, but `user`, `cmdline` and `exe` are read only for processes not seen on the previous
-    /// call.
+    /// Fills `user`, `fds`, `cmdline` and `exe`. The last three cost a metadata call, a file read and a link read,
+    /// so they are read only for processes not seen on the previous call; `fds` is read every time.
     pub fn fill_table(&mut self, rows: &mut [Process]) {
         self.refresh_users();
         let mut old = std::mem::take(&mut self.identity);
@@ -649,7 +644,7 @@ mod tests {
         pause();
         std::fs::write(f.path().join("proc/5/io"), "read_bytes: 2000\nwrite_bytes: 4000\n").unwrap();
         let mut t = s.scan().unwrap().unwrap();
-        s.fill_details(&mut t.rows);
+        s.fill_table(&mut t.rows);
         let mine = row(&t, 5);
         assert!(mine.read_bps.unwrap() > 0);
         assert_eq!(mine.write_bps, Some(0));
@@ -734,7 +729,7 @@ mod tests {
         let mut s = scanner(&f);
         s.scan().unwrap();
         let mut t = s.scan().unwrap().unwrap();
-        s.fill_details(&mut t.rows);
+        s.fill_table(&mut t.rows);
         assert_eq!(row(&t, 5).user, Some(uid.to_string()));
     }
 
@@ -746,7 +741,7 @@ mod tests {
         let mut s = ProcessScanner::new(f.sys(), false, 4).unwrap();
         s.scan().unwrap();
         let mut t = s.scan().unwrap().unwrap();
-        s.fill_details(&mut t.rows);
+        s.fill_table(&mut t.rows);
         assert_eq!(row(&t, 5).cmdline, "abcd");
     }
 

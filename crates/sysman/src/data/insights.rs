@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::charts::format::{bytes, duration};
 use crate::data::history::Bucket;
 use crate::data::pressure::{self, Band};
@@ -182,8 +184,9 @@ impl ProcHistory {
 }
 
 /// A running process averaging at least 80% of a core over the last 30 min, busy (25%+) in three quarters of the
-/// minutes, with at least 20 minutes stored.
-pub fn busy_cpu(procs: &[ProcHistory], now: f64) -> Option<Insight> {
+/// minutes, with at least 20 minutes stored. `running` is the live process table's `(pid, start_time)` set, when
+/// there is one: the stored minutes trail an exit by up to a few minutes, so one that has ended is told in the past.
+pub fn busy_cpu(procs: &[ProcHistory], now: f64, running: Option<&HashSet<(u32, u64)>>) -> Option<Insight> {
     let (p, mean) = procs
         .iter()
         .filter(|p| p.alive(now))
@@ -203,15 +206,27 @@ pub fn busy_cpu(procs: &[ProcHistory], now: f64) -> Option<Insight> {
             (mean >= CPU_AVG_PCT && busy >= CPU_BUSY_SHARE).then_some((p, mean))
         })
         .max_by(|a, b| a.1.total_cmp(&b.1))?;
+    let ended = running.is_some_and(|r| !r.contains(&(p.pid, p.start_time)));
+    let (title, detail) = if ended {
+        (
+            format!("{} used a lot of CPU", p.comm),
+            format!("It averaged {mean:.0}% of one core over its last 30 min, and has since exited."),
+        )
+    } else {
+        (
+            format!("{} is using a lot of CPU", p.comm),
+            format!(
+                "It has averaged {mean:.0}% of one core over the last 30 min. If it is not doing work you expect, \
+                 restarting it usually settles it."
+            ),
+        )
+    };
     Some(Insight {
         kind: Kind::Cpu,
         severity: Severity::Advisory,
-        title: format!("{} is using a lot of CPU", p.comm),
+        title,
         value: format!("{mean:.0}%"),
-        detail: format!(
-            "It has averaged {mean:.0}% of one core over the last 30 min. If it is not doing work you expect, \
-             restarting it usually settles it."
-        ),
+        detail,
         target: p.target(),
     })
 }
@@ -693,7 +708,7 @@ mod tests {
 
         #[test]
         fn a_sustained_busy_process_fires_with_its_average() {
-            let i = busy_cpu(&[busy(90., 40.)], NOW).expect("90% for 40 min");
+            let i = busy_cpu(&[busy(90., 40.)], NOW, None).expect("90% for 40 min");
             assert_eq!(i.title, "encoder is using a lot of CPU");
             assert_eq!(i.value, "90%");
             assert_eq!(
@@ -708,17 +723,17 @@ mod tests {
 
         #[test]
         fn the_average_threshold_is_inclusive() {
-            assert!(busy_cpu(&[busy(80., 40.)], NOW).is_some());
-            assert!(busy_cpu(&[busy(79.9, 40.)], NOW).is_none());
+            assert!(busy_cpu(&[busy(80., 40.)], NOW, None).is_some());
+            assert!(busy_cpu(&[busy(79.9, 40.)], NOW, None).is_none());
         }
 
         #[test]
         fn too_little_history_does_not_fire() {
             assert!(
-                busy_cpu(&[busy(150., 19.)], NOW).is_none(),
+                busy_cpu(&[busy(150., 19.)], NOW, None).is_none(),
                 "19 minutes is under the 20 needed"
             );
-            assert!(busy_cpu(&[busy(150., 20.)], NOW).is_some());
+            assert!(busy_cpu(&[busy(150., 20.)], NOW, None).is_some());
         }
 
         #[test]
@@ -728,7 +743,7 @@ mod tests {
                 "build",
                 per_minute(1800., |_| Some(1e8), |ago| Some(if ago < 420. { 400. } else { 1. })),
             );
-            assert!(busy_cpu(&[bursty], NOW).is_none());
+            assert!(busy_cpu(&[bursty], NOW, None).is_none());
         }
 
         #[test]
@@ -737,14 +752,30 @@ mod tests {
             for m in &mut p.minutes {
                 m.t -= 600.;
             }
-            assert!(busy_cpu(&[p], NOW).is_none());
+            assert!(busy_cpu(&[p], NOW, None).is_none());
         }
 
         #[test]
         fn the_busiest_process_wins() {
             let mut other = busy(120., 40.);
             other.comm = "game".into();
-            assert_eq!(busy_cpu(&[busy(90., 40.), other], NOW).unwrap().value, "120%");
+            assert_eq!(busy_cpu(&[busy(90., 40.), other], NOW, None).unwrap().value, "120%");
+        }
+
+        #[test]
+        fn a_process_gone_from_the_live_table_is_told_in_the_past() {
+            // its last stored minute is a minute old, so only the live table knows it has exited
+            let others = HashSet::from([(42, 8), (43, 7)]);
+            let i = busy_cpu(&[busy(90., 40.)], NOW, Some(&others)).expect("still worth reporting");
+            assert_eq!(i.title, "encoder used a lot of CPU");
+            assert!(i.detail.contains("has since exited"), "{}", i.detail);
+        }
+
+        #[test]
+        fn a_process_in_the_live_table_is_using_cpu_now() {
+            let running = HashSet::from([(42, 7)]);
+            let i = busy_cpu(&[busy(90., 40.)], NOW, Some(&running)).unwrap();
+            assert_eq!(i.title, "encoder is using a lot of CPU");
         }
     }
 

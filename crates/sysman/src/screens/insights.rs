@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -567,7 +567,9 @@ impl Insights {
             all.extend(insights::swap(&r.swap, ram, now));
             all.extend(insights::disk_full(&r.fs, now));
             all.extend(insights::growth_insight(&self.board, ram));
-            all.extend(insights::busy_cpu(&r.procs, now));
+            let running: Option<HashSet<(u32, u64)>> =
+                (self.feed.read(cx).table()).map(|t| t.rows.iter().map(|p| (p.pid, p.start_time)).collect());
+            all.extend(insights::busy_cpu(&r.procs, now, running.as_ref()));
         }
         all.extend(insights::pressure_insight(&self.events, now));
         all.extend(insights::gpu_throttle(&gpus, now));
