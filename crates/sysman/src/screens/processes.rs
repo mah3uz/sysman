@@ -30,6 +30,7 @@ use crate::charts::format::{Unit, bytes};
 use crate::charts::sparkline::Sparkline;
 use crate::charts::trend::{ChartState, TrendChart, YScale, clock};
 use crate::data::desktop::IconIndex;
+use crate::data::helper;
 use crate::data::history::{Bucket, History, ProcField, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::process::ProcessFeed;
@@ -39,6 +40,7 @@ use crate::ui::shell::Tab;
 use crate::ui::theme::theme;
 use crate::ui::widgets::card::card;
 use crate::ui::widgets::hairline;
+use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::panel::caption_label;
 use crate::ui::widgets::range::{Range, range_picker, remember, remembered};
 
@@ -72,6 +74,8 @@ pub enum Col {
     Cpu,
     Threads,
     Fds,
+    NetRx,
+    NetTx,
     User,
     Pid,
 }
@@ -87,6 +91,16 @@ impl Col {
         Self::Pid,
     ];
 
+    /// Every column, with the Net pair after FDs when the helper reports per-process traffic.
+    pub fn shown(net: bool) -> Vec<Col> {
+        let mut cols = Self::ALL.to_vec();
+        if net {
+            let at = cols.iter().position(|&c| c == Self::Fds).map_or(cols.len(), |i| i + 1);
+            cols.splice(at..at, [Self::NetRx, Self::NetTx]);
+        }
+        cols
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Process => "Process",
@@ -94,6 +108,8 @@ impl Col {
             Self::Cpu => "CPU",
             Self::Threads => "Threads",
             Self::Fds => "FDs",
+            Self::NetRx => "Net ↓",
+            Self::NetTx => "Net ↑",
             Self::User => "User",
             Self::Pid => "PID",
         }
@@ -106,6 +122,7 @@ impl Col {
             Self::Cpu => 72.,
             Self::Threads => 72.,
             Self::Fds => 64.,
+            Self::NetRx | Self::NetTx => 84.,
             Self::User => 110.,
             Self::Pid => 76.,
         }
@@ -125,6 +142,8 @@ pub fn compare(a: &Process, b: &Process, col: Col) -> Ordering {
         Col::Cpu => a.cpu_pct.total_cmp(&b.cpu_pct),
         Col::Threads => a.threads.cmp(&b.threads),
         Col::Fds => a.fds.cmp(&b.fds),
+        Col::NetRx => a.net_rx_bps.cmp(&b.net_rx_bps),
+        Col::NetTx => a.net_tx_bps.cmp(&b.net_tx_bps),
         Col::User => a.user.cmp(&b.user),
         Col::Pid => Ordering::Equal,
     };
@@ -353,7 +372,7 @@ fn signal_name(signal: Signal) -> &'static str {
 }
 
 /// An app icon from its `.desktop` file, else a generic glyph; kernel threads have no command line.
-fn process_icon(p: &Process, icons: &IconIndex, size: f32, cx: &App) -> AnyElement {
+pub(crate) fn process_icon(p: &Process, icons: &IconIndex, size: f32, cx: &App) -> AnyElement {
     let glyph = if p.cmdline.is_empty() {
         IconName::Cpu
     } else {
@@ -381,13 +400,14 @@ pub struct ProcessTable {
     pub model: Model,
     /// The Process column takes the width the others leave.
     process_width: f32,
+    cols: Vec<Col>,
     icons: Arc<IconIndex>,
     me: Option<String>,
 }
 
 impl TableDelegate for ProcessTable {
     fn columns_count(&self, _: &App) -> usize {
-        Col::ALL.len()
+        self.cols.len()
     }
 
     fn rows_count(&self, _: &App) -> usize {
@@ -395,7 +415,7 @@ impl TableDelegate for ProcessTable {
     }
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
-        let col = Col::ALL[col_ix];
+        let col = self.cols[col_ix];
         let width = if col == Col::Process {
             self.process_width
         } else {
@@ -412,15 +432,15 @@ impl TableDelegate for ProcessTable {
 
     fn perform_sort(&mut self, col_ix: usize, sort: ColumnSort, _: &mut Window, _: &mut Context<TableState<Self>>) {
         (self.model.sort, self.model.descending) = match sort {
-            ColumnSort::Ascending => (Col::ALL[col_ix], false),
-            ColumnSort::Descending => (Col::ALL[col_ix], true),
+            ColumnSort::Ascending => (self.cols[col_ix], false),
+            ColumnSort::Descending => (self.cols[col_ix], true),
             ColumnSort::Default => (Col::Memory, true),
         };
         self.model.rebuild();
     }
 
     fn render_th(&mut self, col_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
-        let col = Col::ALL[col_ix];
+        let col = self.cols[col_ix];
         div()
             .size_full()
             .flex()
@@ -455,7 +475,7 @@ impl TableDelegate for ProcessTable {
             return div().into_any_element();
         };
         let t = theme(cx);
-        let col = Col::ALL[col_ix];
+        let col = self.cols[col_ix];
         let number = |text: String| {
             div()
                 .w_full()
@@ -529,6 +549,12 @@ impl TableDelegate for ProcessTable {
             Col::Cpu => number(format!("{:.1}%", p.cpu_pct)),
             Col::Threads => number(p.threads.to_string()),
             Col::Fds => p.fds.map_or_else(|| unreadable("fds"), |n| number(n.to_string())),
+            Col::NetRx => p
+                .net_rx_bps
+                .map_or_else(|| unreadable("net-rx"), |n| number(Unit::BytesPerSec.format(n as f64))),
+            Col::NetTx => p
+                .net_tx_bps
+                .map_or_else(|| unreadable("net-tx"), |n| number(Unit::BytesPerSec.format(n as f64))),
             Col::User => match &p.user {
                 Some(user) => div()
                     .overflow_hidden()
@@ -591,7 +617,7 @@ struct HierarchyMode(bool);
 impl Global for HierarchyMode {}
 
 /// Built once per run on the background executor.
-struct Icons(Arc<IconIndex>);
+pub(crate) struct Icons(pub(crate) Arc<IconIndex>);
 
 impl Global for Icons {}
 
@@ -723,6 +749,7 @@ impl Processes {
                 icons,
                 me: current_user(),
                 process_width: Col::Process.width(),
+                cols: Col::shown(false),
             }),
             search: None,
             range: remembered(Tab::Processes, cx),
@@ -1390,19 +1417,24 @@ impl Processes {
 impl Render for Processes {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_widgets(window, cx);
-        let others: f32 = Col::ALL[1..].iter().map(|c| c.width()).sum();
+        let sample = self.live.read(cx).latest.clone();
+        let helper_running = helper::running(sample.as_ref());
+        let cols = Col::shown(helper::net_columns(&self.delegate(cx).model.table, helper_running));
+        let others: f32 = cols[1..].iter().map(|c| c.width()).sum();
         let fill = (f32::from(window.viewport_size().width) - INSPECTOR_WIDTH - others - 16.)
             .max(Col::Process.width())
             .floor();
-        if let Some(table) = &self.table
-            && table.read(cx).delegate().process_width != fill
-        {
-            table.update(cx, |state, cx| {
-                state.delegate_mut().process_width = fill;
-                state.refresh(cx);
-            });
+        if let Some(table) = &self.table {
+            let delegate = table.read(cx).delegate();
+            if delegate.process_width != fill || delegate.cols != cols {
+                table.update(cx, |state, cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.process_width = fill;
+                    delegate.cols = cols;
+                    state.refresh(cx);
+                });
+            }
         }
-        let sample = self.live.read(cx).latest.clone();
         let toolbar = self.toolbar(cx).into_any_element();
         let inspector = self.inspector(cx);
         let t = theme(cx);
@@ -1420,6 +1452,20 @@ impl Render for Processes {
                     .flex_col()
                     .child(self.header(sample.as_ref(), cx))
                     .child(toolbar)
+                    .when(!helper_running, |d| {
+                        d.child(
+                            div()
+                                .px(px(12.))
+                                .py(px(3.))
+                                .border_b_1()
+                                .border_color(t.hairline)
+                                .child(helper_hint(
+                                    "processes-enable",
+                                    "Disk I/O and open files of other users' processes need the privileged helper",
+                                    cx,
+                                )),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -1570,6 +1616,21 @@ mod tests {
         assert_eq!(
             compare(&proc(1, 0, "Zed", 0), &proc(2, 0, "alpha", 0), Col::Process),
             Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn net_columns_sit_after_fds_and_sort_absent_rates_lowest() {
+        assert!(!Col::shown(false).contains(&Col::NetRx));
+        let cols = Col::shown(true);
+        let fds = cols.iter().position(|&c| c == Col::Fds).unwrap();
+        assert_eq!(cols[fds + 1..fds + 3], [Col::NetRx, Col::NetTx]);
+        let mut busy = proc(1, 0, "a", 1);
+        busy.net_tx_bps = Some(10);
+        assert_eq!(
+            compare(&busy, &proc(2, 0, "b", 1), Col::NetTx),
+            Ordering::Greater,
+            "a process the helper has no rate for sorts below any rate"
         );
     }
 

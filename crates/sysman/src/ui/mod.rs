@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use gpui::{AssetSource, Result, SharedString};
 
+pub mod settings;
 pub mod shell;
 pub mod theme;
 pub mod widgets;
@@ -47,7 +48,10 @@ gpui_kit_assets::icon_assets!(
         ChartLine,
         HeartPulse,
         ChartArea,
-        CircleCheck
+        CircleCheck,
+        ShieldCheck,
+        X,
+        Lock
     ]
 );
 

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 
+use crate::data::helper;
 use crate::data::live::{self, Conn, Event, Live};
 use crate::data::process::{self, Interval, ProcessFeed};
 use crate::screens::dashboard::Dashboard;
@@ -20,6 +22,7 @@ use crate::screens::disk::Disk;
 use crate::screens::gpu::Gpu;
 use crate::screens::network::Network;
 use crate::screens::processes::Processes;
+use crate::ui::settings;
 use crate::ui::theme::{Theme, theme};
 
 const TITLE_BAR_HEIGHT: Pixels = px(38.);
@@ -27,8 +30,8 @@ const TAB_HEIGHT: Pixels = px(26.);
 const TAB_PADDING_X: Pixels = px(12.);
 const TAB_MIN_WIDTH: Pixels = px(64.);
 const TAB_FONT: Pixels = px(13.);
-/// Room each side of the centred strip: the refresh control and its margin.
-const SIDE_WIDTH: Pixels = px(110.);
+/// Room each side of the centred strip: the refresh and settings controls and their margin.
+const SIDE_WIDTH: Pixels = px(140.);
 const DRAIN_EVERY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -135,11 +138,13 @@ pub struct Shell {
     refresh: Refresh,
     drawn: Instant,
     pending: bool,
+    helper_running: bool,
 }
 
 impl Shell {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let live = cx.new(|_| Live::default());
+        settings::install(live.clone(), Arc::new(helper::System), cx);
         cx.observe(&live, |_, _, cx| cx.notify()).detach();
         cx.spawn(async move |this, cx| {
             loop {
@@ -170,15 +175,17 @@ impl Shell {
             refresh: Refresh::CHOICES[0],
             drawn: Instant::now(),
             pending: false,
+            helper_running: false,
         };
         shell.sync_feed();
         shell
     }
 
-    /// Only the tabs that show the process table pay for the daemon's scan.
+    /// Only the tabs that show the process table pay for the daemon's scan; Network shows it only via the helper.
     fn sync_feed(&self) {
         let ms = match self.tab {
             Tab::Dashboard | Tab::Processes | Tab::Disk => self.refresh.0.as_millis() as u64,
+            Tab::Network if self.helper_running => self.refresh.0.as_millis() as u64,
             _ => 0,
         };
         self.feed_interval.store(ms, Ordering::Relaxed);
@@ -231,6 +238,11 @@ impl Shell {
             }
         });
         self.pending |= data;
+        let running = helper::running(self.live.read(cx).latest.as_ref());
+        if running != self.helper_running {
+            self.helper_running = running;
+            self.sync_feed();
+        }
         if reconnected || (self.pending && self.drawn.elapsed() >= self.refresh.0) {
             self.pending = false;
             self.drawn = Instant::now();
@@ -275,7 +287,16 @@ impl Shell {
                     .items_center()
                     .justify_end()
                     .pr_3()
-                    .child(self.refresh_control(cx)),
+                    .gap_1()
+                    .child(self.refresh_control(cx))
+                    .child(
+                        Button::new("settings")
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(IconName::Settings))
+                            .tooltip("Settings")
+                            .on_click(|_, _, cx| settings::open(cx)),
+                    ),
             )
     }
 
@@ -380,7 +401,7 @@ fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App
         Tab::Dashboard => cx.new(|cx| Dashboard::new(live, feed, cx)).into(),
         Tab::Processes => cx.new(|cx| Processes::new(live, feed, cx)).into(),
         Tab::Gpu => cx.new(|cx| Gpu::new(live, cx)).into(),
-        Tab::Network => cx.new(|cx| Network::new(live, cx)).into(),
+        Tab::Network => cx.new(|cx| Network::new(live, feed, cx)).into(),
         Tab::Disk => cx.new(|cx| Disk::new(live, feed, cx)).into(),
         _ => cx.new(|_| Placeholder { tab, live }).into(),
     }
