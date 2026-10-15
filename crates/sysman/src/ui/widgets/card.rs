@@ -42,7 +42,8 @@ pub fn card(id: &'static str, label: &str, color: Hsla, cx: &App) -> Stateful<Di
             .py(t.card_padding_y)
             .px(t.card_padding_x)
             .rounded(t.card_radius)
-            .bg(t.card)
+            // raised like a panel: it sits on the window, where a card's tint would read as sunken in light
+            .bg(t.panel)
             .border_color(t.hairline),
         t.hairline_width,
     )

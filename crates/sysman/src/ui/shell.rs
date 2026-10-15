@@ -32,7 +32,7 @@ use crate::screens::insights::Insights;
 use crate::screens::network::Network;
 use crate::screens::processes::Processes;
 use crate::ui::settings;
-use crate::ui::theme::{self, TextSize, Theme, rem_px, theme};
+use crate::ui::theme::{self, Appearance, TextSize, Theme, rem_px, theme};
 use crate::ui::widgets::hairline;
 
 const TITLE_BAR_HEIGHT: Rems = rem_px(52.);
@@ -453,9 +453,9 @@ impl Shell {
         self.update_pause(cx);
         self.drag = TitlebarDrag::load();
         TempUnit::reload();
-        let size = TextSize::load();
-        if size != theme(cx).text_size {
-            theme::install(size, cx);
+        let (appearance, size) = (Appearance::load(), TextSize::load());
+        if (appearance, size) != (theme::appearance(cx), theme(cx).text_size) {
+            theme::install(appearance, size, cx);
         }
         cx.refresh_windows();
     }
@@ -464,6 +464,7 @@ impl Shell {
         let now = Instant::now();
         self.idle.focus(window.is_window_active(), now);
         self.idle.visible = window.is_visible();
+        theme::window_appearance(window.appearance(), cx);
         self.watching = vec![
             cx.observe_window_activation(window, |shell, window, cx| {
                 shell.idle.focus(window.is_window_active(), Instant::now());
@@ -472,6 +473,9 @@ impl Shell {
             cx.observe_window_visibility(window, |shell, visibility, _, cx| {
                 shell.idle.visible = visibility.is_visible();
                 shell.update_pause(cx);
+            }),
+            cx.observe_window_appearance(window, |_, window, cx| {
+                theme::window_appearance(window.appearance(), cx)
             }),
         ];
         #[cfg(debug_assertions)]

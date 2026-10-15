@@ -18,7 +18,7 @@ use crate::data::live::{Conn, Live};
 use crate::data::prefs::prefs;
 use crate::data::systemd::{self, COLLECTOR, HELPER, Runner, Service, Unit};
 use crate::ui::shell::{PauseAfter, Refresh, Shell, TitlebarDrag};
-use crate::ui::theme::{self, TextSize, rem_px, theme};
+use crate::ui::theme::{self, Appearance, TextSize, rem_px, theme};
 use crate::ui::widgets::hairline;
 use crate::ui::widgets::segmented::segmented_full;
 
@@ -453,6 +453,13 @@ impl Settings {
 
     fn display(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = theme(cx);
+        let appearance = segmented_full(
+            "appearance",
+            Appearance::ALL.map(|a| (a, a.label())),
+            &theme::appearance(cx),
+            |appearance, _, cx| theme::set_appearance(appearance, cx),
+            cx,
+        );
         let text_size = segmented_full(
             "text-size",
             TextSize::ALL.map(|s| (s, s.label())),
@@ -526,6 +533,7 @@ impl Settings {
         vec![
             group(
                 vec![
+                    row("Appearance", div().w(rem_px(210.)).child(appearance), cx),
                     row("Text size", div().w(rem_px(210.)).child(text_size), cx),
                     row("Temperature", div().w(rem_px(110.)).child(unit), cx),
                 ],
@@ -533,7 +541,8 @@ impl Settings {
             )
             .into_any_element(),
             footnote(
-                "Bold draws text a little larger and heavier. Bigger scales the whole layout by about 15%.",
+                "System follows the desktop's light or dark style as it changes. Bold draws text a little larger \
+                 and heavier. Bigger scales the whole layout by about 15%.",
                 cx,
             )
             .into_any_element(),
