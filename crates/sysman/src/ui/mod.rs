@@ -37,7 +37,14 @@ gpui_kit_assets::icon_assets!(
         MemoryStick,
         FileText,
         AppWindow,
-        SquareTerminal
+        SquareTerminal,
+        Wifi,
+        EthernetPort,
+        Waypoints,
+        Settings,
+        ArrowLeftRight,
+        Plug,
+        ChartLine
     ]
 );
 
