@@ -2,7 +2,6 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 version := `sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1`
 arch_out := justfile_directory() / "target/arch"
-assets := justfile_directory() / "target/release-assets"
 
 # List recipes
 default:
@@ -76,41 +75,54 @@ uninstall:
     systemctl --user disable --now sysmand || true
     sudo pacman -Rns sysman
 
-# Tag v<version>, build the release assets and update both PKGBUILDs; pushes and uploads nothing
+# Check the tree, then tag v<version>; CI builds and drafts the GitHub release once the tag is pushed
 release:
     #!/usr/bin/env bash
     set -euo pipefail
-    ver={{ version }} tag=v{{ version }} out="{{ assets }}/{{ version }}"
-    git diff --quiet HEAD || { echo "error: commit first; a release is built from a tag" >&2; exit 1; }
-    if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-        [ "$(git rev-parse "$tag^{commit}")" = "$(git rev-parse HEAD)" ] || { echo "error: $tag exists and is not HEAD" >&2; exit 1; }
-    else
-        git tag -a "$tag" -m "sysman $ver"
-    fi
-    rm -rf "$out"
-    mkdir -p "$out"
-    git archive --prefix="sysman-$ver/" -o "$out/sysman-$ver.tar.gz" "$tag"
-    cargo build --release --locked -p sysmand -p sysman -p sysman-helper
-    dist/stage.sh target/release "$out/sysman-$ver-x86_64" sysman
-    tar -C "$out" -czf "$out/sysman-$ver-x86_64.tar.gz" "sysman-$ver-x86_64"
-    rm -rf "$out/sysman-$ver-x86_64"
-    (cd "$out" && sha256sum ./*.tar.gz > SHA256SUMS)
-    src_sum=$(sha256sum "$out/sysman-$ver.tar.gz" | cut -d' ' -f1)
-    bin_sum=$(sha256sum "$out/sysman-$ver-x86_64.tar.gz" | cut -d' ' -f1)
-    sed -i -e "s/^pkgver=.*/pkgver=$ver/" -e "s/^pkgrel=.*/pkgrel=1/" \
+    ver={{ version }} tag=v{{ version }}
+    [ -z "$(git status --porcelain)" ] || { echo "error: uncommitted changes; a release is cut from a clean tree" >&2; exit 1; }
+    bad=$(awk -v v="\"$ver\"" '/^name = "sysman/ {n=$3} /^version = / && n {if ($3 != v) print n, $3; n=""}' Cargo.lock)
+    [ -z "$bad" ] || { echo "error: Cargo.lock disagrees with workspace version $ver:" >&2; echo "$bad" >&2; exit 1; }
+    ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null || { echo "error: tag $tag already exists" >&2; exit 1; }
+    just check
+    git tag -a "$tag" -m "sysman $ver"
+    echo
+    echo "Tagged $tag. Push it to build the release:"
+    echo "  git push origin main $tag"
+    echo "Then publish the draft release on GitHub and run: just aur"
+
+# After the GitHub release is published: fill both PKGBUILDs from its SHA256SUMS and commit them in clones of the AUR repos (does not push)
+aur pkgrel="1":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ver={{ version }} rel={{ pkgrel }}
+    sums=$(curl -fsSL "https://github.com/mah3uz/sysman/releases/download/v$ver/SHA256SUMS")
+    src_sum=$(awk -v f="sysman-$ver.tar.gz" '$2 == f {print $1}' <<<"$sums")
+    bin_sum=$(awk -v f="sysman-$ver-x86_64.tar.gz" '$2 == f {print $1}' <<<"$sums")
+    [ -n "$src_sum" ] && [ -n "$bin_sum" ] || { echo "error: SHA256SUMS lacks a tarball checksum" >&2; exit 1; }
+    sed -i -e "s/^pkgver=.*/pkgver=$ver/" -e "s/^pkgrel=.*/pkgrel=$rel/" \
         -e "s/^sha256sums=.*/sha256sums=('$src_sum')/" dist/arch/sysman/PKGBUILD
-    sed -i -e "s/^pkgver=.*/pkgver=$ver/" -e "s/^pkgrel=.*/pkgrel=1/" \
+    sed -i -e "s/^pkgver=.*/pkgver=$ver/" -e "s/^pkgrel=.*/pkgrel=$rel/" \
         -e "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$bin_sum')/" dist/arch/sysman-bin/PKGBUILD
-    for p in sysman sysman-bin; do (cd "dist/arch/$p" && makepkg --printsrcinfo > .SRCINFO); done
-    echo
-    echo "Release assets in $out:"
-    ls -1 "$out"
-    echo
-    echo "Next:"
-    echo "  1. git push origin main $tag"
-    echo "  2. Create the GitHub release $tag and upload both tarballs and SHA256SUMS"
-    echo "  3. Commit dist/arch/ (new pkgver, checksums, .SRCINFO)"
-    echo "  4. Copy PKGBUILD, sysman.install and .SRCINFO from dist/arch/sysman and dist/arch/sysman-bin to their AUR repos and push"
+    mkdir -p target/aur
+    for p in sysman sysman-bin; do
+        (cd "dist/arch/$p" && makepkg --printsrcinfo > .SRCINFO)
+        dir=target/aur/$p
+        if [ -d "$dir/.git" ]; then
+            if [ -n "$(git -C "$dir" ls-remote --heads origin)" ]; then git -C "$dir" pull --ff-only; fi
+        else
+            git clone -b master "ssh://aur@aur.archlinux.org/$p.git" "$dir"
+        fi
+        cp "dist/arch/$p/PKGBUILD" "dist/arch/$p/.SRCINFO" "dist/arch/$p/sysman.install" "$dir/"
+        git -C "$dir" add PKGBUILD .SRCINFO sysman.install
+        if git -C "$dir" diff --cached --quiet; then
+            echo "$p: nothing to commit"
+        else
+            git -C "$dir" commit -qm "Update to $ver-$rel"
+            echo "$p: committed; push with: git -C $dir push"
+        fi
+    done
+    echo "Commit the updated dist/arch/ files in this repository too."
 
 # Collector service status
 status:

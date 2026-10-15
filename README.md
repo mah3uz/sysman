@@ -34,16 +34,63 @@ kernel documentation and are marked unverified.
 ### Arch Linux
 
 From the AUR, either `sysman` (builds the release from source) or `sysman-bin`
-(prebuilt). From a checkout:
+(prebuilt):
 
 ```bash
-just install          # builds the sysman package from this checkout, installs it, starts the collector
+yay -S sysman         # or sysman-bin
+systemctl --user enable --now sysmand
 ```
 
-The package installs the three binaries, the systemd user unit, the helper's
-system unit (not enabled), a desktop entry and hicolor icons. `just uninstall` removes it. Maintainers cut a release with
-`just release`: it tags `v<version>`, builds the source and binary tarballs for
-the GitHub release, and updates both PKGBUILDs and their `.SRCINFO`.
+From a checkout, `just install` builds the package from the committed state,
+installs it and starts the collector. The package installs the three binaries,
+the systemd user unit, the helper's system unit (not enabled), a desktop entry
+and hicolor icons. `sudo pacman -Rns sysman` (or `sysman-bin`) removes it.
+
+### Debian and Ubuntu
+
+Download `sysman_<version>-1_amd64.deb` from the
+[latest release](https://github.com/mah3uz/sysman/releases/latest) (Ubuntu 22.04
+or newer, Debian 12 or newer) and install it with its dependencies:
+
+```bash
+sudo apt install ./sysman_<version>-1_amd64.deb
+systemctl --user enable --now sysmand
+```
+
+`sudo apt remove sysman` removes it and stops the helper.
+
+### Other distributions
+
+`install.sh` installs the prebuilt x86_64 release under `/usr/local` with sudo,
+checks its checksum, enables `sysmand` for your user and warns about missing
+shared libraries. It refuses to run over a pacman or dpkg install.
+
+```bash
+curl -fsSL https://github.com/mah3uz/sysman/releases/latest/download/install.sh | sh
+```
+
+Use `sh -s -- --version X.Y.Z` for another release, or run the script inside an
+extracted `sysman-<version>-x86_64.tar.gz`. It records what it installed in
+`/usr/local/share/sysman/install-manifest`; to remove exactly those files and
+stop the services, run the script again with `--uninstall`. It keeps
+`~/.local/share/sysman` (history and crash log) unless you add `--purge`:
+
+```bash
+curl -fsSL https://github.com/mah3uz/sysman/releases/latest/download/install.sh | sh -s -- --uninstall
+```
+
+### The helper
+
+None of the packages enables the privileged helper (see [Live data](#live-data)).
+Its socket is open to one group, which is `wheel` on Arch and on distributions
+with a `wheel` group (`install.sh` prefers it) and `sudo` on Debian and Ubuntu.
+Enable it with:
+
+```bash
+sudo systemctl enable --now sysman-helper
+```
+
+Add yourself to that group if you are not in it, and log in again.
 
 ### From source
 
@@ -187,7 +234,7 @@ sudo systemctl enable --now sysman-helper
 
 It runs as root, limited by systemd to the capabilities it needs, with a
 read-only system and no network. It answers only on
-`/run/sysman-helper/helper.sock`, which members of `wheel` can open, and
+`/run/sysman-helper/helper.sock`, which members of the helper group (`wheel` or `sudo`, see Install) can open, and
 `sysmand` picks it up on its next tick. SATA drive health needs
 `smartmontools`; NVMe health, CPU power, other users' I/O and per-process
 network traffic need nothing more. Each source works on its own, and
@@ -204,7 +251,7 @@ crates/schema    record types, DB schema and series naming shared by daemon and 
 crates/sysmand   the collector daemon
 crates/sysman-helper  the optional privileged helper (builds an eBPF program; needs clang)
 crates/sysman    the GPUI app
-dist/            systemd unit, desktop entry, file layout, Arch PKGBUILDs
+dist/            systemd units, desktop entry, file layout, Arch PKGBUILDs, .deb scripts, install.sh, release CI
 docs/            app design
 ```
 
