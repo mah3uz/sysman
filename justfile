@@ -132,7 +132,9 @@ aur pkgrel="1":
         if [ -d "$dir/.git" ]; then
             if [ -n "$(git -C "$dir" ls-remote --heads origin)" ]; then git -C "$dir" pull --ff-only; fi
         else
-            git clone -b master "ssh://aur@aur.archlinux.org/$p.git" "$dir"
+            # a new package's AUR repo is empty, so there is no master branch to clone yet
+            git clone -q "ssh://aur@aur.archlinux.org/$p.git" "$dir"
+            git -C "$dir" checkout -q -B master
         fi
         cp "dist/arch/$p/PKGBUILD" "dist/arch/$p/.SRCINFO" "dist/arch/$p/sysman.install" "$dir/"
         git -C "$dir" add PKGBUILD .SRCINFO sysman.install
@@ -140,7 +142,7 @@ aur pkgrel="1":
             echo "$p: nothing to commit"
         else
             git -C "$dir" commit -qm "Update to $ver-$rel"
-            echo "$p: committed; push with: git -C $dir push"
+            echo "$p: committed; push with: git -C $dir push -u origin master"
         fi
     done
     echo "Commit the updated dist/arch/ files in this repository too."
