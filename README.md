@@ -168,7 +168,7 @@ crates/schema    record types, DB schema and series naming shared by daemon and 
 crates/sysmand   the collector daemon
 crates/sysman    the GPUI app
 dist/            systemd unit
-docs/            app design and research
+docs/            app design
 ```
 
 ```bash

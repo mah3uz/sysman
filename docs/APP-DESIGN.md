@@ -9,7 +9,7 @@ and what each screen contains.
 | --- | --- | --- |
 | UI framework | `gpui-pre` + `gpui-pre-platform` from crates.io, renamed to `gpui` / `gpui_platform` | A pinned snapshot of Zed's gpui (`gpui-pre 0.3.7` = zed@1a28cff), and the gpui `gpui-component` builds against |
 | Components | `gpui-component` (pinned with `=`) | Virtualised sortable table, segmented tab bar, resizable panes, sidebar, menus, tooltips, client-side title bar, themes |
-| Charts, treemap, energy flow, core bars | Custom elements on `canvas` + `PathBuilder` | `gpui-component` charts lack monotone cubic, min–max band, labelled dashed rules, gaps and a shared cursor (`docs/research/gpui-stack.md`) |
+| Charts, treemap, energy flow, core bars | Custom elements on `canvas` + `PathBuilder` | `gpui-component` charts lack monotone cubic, min–max band, labelled dashed rules, gaps and a shared cursor |
 | Fonts | Adwaita Sans (UI, tabular digits), Adwaita Mono (paths, ids) | Clean, Inter-derived, widely installed |
 | Data | `schema` crate types; socket client; read-only SQLite | Same types as the daemon, so a format change breaks the build, not the screen |
 

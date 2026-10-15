@@ -16,7 +16,7 @@ GPUI app (`sysman`) that shows them live and as history.
 | JSONL | Today and yesterday, uncompressed. |
 | NVIDIA | NVML in-process; after an NVML timeout, `nvidia-smi` with a kill timeout until restart. |
 | Hardware | Vendor-neutral records. GPUs: NVIDIA, AMD, Intel (i915 and xe), generic DRM fallback. CPUs: x86 (AMD, Intel). |
-| Verification | This machine for AMD CPU, NVIDIA and amdgpu. Fixtures built from kernel docs for the rest, marked unverified on hardware. beszel (henrygd/beszel) is a reference for data sources. |
+| Verification | This machine for AMD CPU, NVIDIA and amdgpu. Fixtures built from kernel docs for the rest, marked unverified on hardware. |
 | Sensors | Super I/O chips (nct67xx) read every 10 s, everything else every 2 s. |
 | App design | `docs/APP-DESIGN.md`. v1 has every screen, Disk Map included. |
 | Menu bar | A DankMaterialShell bar widget reading the socket, after the app's v1. |
@@ -37,7 +37,6 @@ crates/schema              record types (serde), shared by daemon and app
 crates/sysmand             daemon: config, collectors, scheduler, JSONL, SQLite, socket
 crates/sysman              GPUI app (not started)
 dist/sysmand.service       systemd user unit
-docs/research/             data-source and design research
 ```
 
 | What | Path |
