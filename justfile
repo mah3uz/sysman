@@ -75,21 +75,42 @@ uninstall:
     systemctl --user disable --now sysmand || true
     sudo pacman -Rns sysman
 
-# Check the tree, then tag v<version>; CI builds and drafts the GitHub release once the tag is pushed
-release:
+# Set the version to VER (x.y.z), check, tag and push v<VER>, then follow the CI run that drafts the GitHub release
+release ver:
     #!/usr/bin/env bash
     set -euo pipefail
-    ver={{ version }} tag=v{{ version }}
+    ver={{ ver }} tag=v{{ ver }} current={{ version }}
+    [[ $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: give the version as x.y.z, e.g. just release 0.2.0" >&2; exit 1; }
+    [ "$(git branch --show-current)" = main ] || { echo "error: release from main" >&2; exit 1; }
     [ -z "$(git status --porcelain)" ] || { echo "error: uncommitted changes; a release is cut from a clean tree" >&2; exit 1; }
-    bad=$(awk -v v="\"$ver\"" '/^name = "sysman/ {n=$3} /^version = / && n {if ($3 != v) print n, $3; n=""}' Cargo.lock)
-    [ -z "$bad" ] || { echo "error: Cargo.lock disagrees with workspace version $ver:" >&2; echo "$bad" >&2; exit 1; }
     ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null || { echo "error: tag $tag already exists" >&2; exit 1; }
+    git fetch -q origin main
+    git merge-base --is-ancestor origin/main HEAD || { echo "error: origin/main has commits this checkout lacks; pull first" >&2; exit 1; }
+    if [ "$ver" != "$current" ]; then
+        echo "Version $current -> $ver"
+        sed -i "0,/^version = \".*\"/s//version = \"$ver\"/" Cargo.toml
+        cargo update -w --offline -q
+    fi
     just check
+    if [ -n "$(git status --porcelain)" ]; then git commit -qam "sysman $ver"; fi
     git tag -a "$tag" -m "sysman $ver"
+    git push -q origin main "$tag"
+    echo "Pushed $tag; waiting for the release workflow to start..."
+    run=
+    for _ in $(seq 30); do
+        run=$(gh run list --workflow release.yml --event push --limit 10 --json databaseId,headBranch \
+            --jq ".[] | select(.headBranch == \"$tag\") | .databaseId" | head -1)
+        [ -n "$run" ] && break
+        sleep 5
+    done
+    [ -n "$run" ] || { echo "error: no release run for $tag after 150 s; see the Actions tab on GitHub" >&2; exit 1; }
+    if ! gh run watch "$run" --exit-status --interval 15; then
+        echo "error: the release workflow failed: $(gh run view "$run" --json url --jq .url)" >&2
+        exit 1
+    fi
     echo
-    echo "Tagged $tag. Push it to build the release:"
-    echo "  git push origin main $tag"
-    echo "Then publish the draft release on GitHub and run: just aur"
+    echo "Draft release ready: $(gh release view "$tag" --json url --jq .url)"
+    echo "Review and publish it on GitHub, then run: just aur"
 
 # After the GitHub release is published: fill both PKGBUILDs from its SHA256SUMS and commit them in clones of the AUR repos (does not push)
 aur pkgrel="1":
