@@ -1282,7 +1282,7 @@ impl Disk {
         section(IconName::List, "Top disk processes", cx)
             .child(top_list(top, "No disk activity", cx))
             .child(caption("Read plus write per process.", cx))
-            .when(!helper::running(self.live.read(cx).latest.as_ref()), |d| {
+            .when(!helper::running(self.live.read(cx).latest.as_deref()), |d| {
                 d.child(helper_hint(
                     "disk-processes-enable",
                     "Disk I/O of other users' processes needs the privileged helper",
