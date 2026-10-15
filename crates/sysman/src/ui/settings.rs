@@ -2,16 +2,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, AnyWindowHandle, App, AppContext, Bounds, Context, Div, Entity, FontWeight, Global, Hsla,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement,
-    Styled, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowControlArea, WindowDecorations, WindowOptions,
-    div, prelude::FluentBuilder, px, size,
+    AnyElement, App, AppContext, Context, Div, Entity, FontWeight, Global, Hsla, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::spinner::Spinner;
 use gpui_component::switch::Switch;
-use gpui_component::{Disableable, Icon, Root, Sizable};
+use gpui_component::{Disableable, Icon, Sizable, WindowExt};
 use gpui_kit_assets::IconName;
 
 use crate::data::helper::{self, State};
@@ -21,8 +20,9 @@ use crate::ui::shell::{Refresh, Shell};
 use crate::ui::theme::theme;
 use crate::ui::widgets::hairline;
 
-const TITLE: &str = "sysman Settings";
-/// systemd's view is re-read this often while the window is open, to follow changes made elsewhere.
+const WIDTH: f32 = 520.;
+const HEIGHT: f32 = 600.;
+/// systemd's view is re-read this often while Settings is open, to follow changes made elsewhere.
 const POLL: Duration = Duration::from_secs(5);
 const ROW_LABEL: f32 = 13.;
 const PRIVILEGED_NOTE: &str = "Drive health needs raw drive commands, CPU package power is readable only by root, \
@@ -55,12 +55,12 @@ impl Tab {
     }
 }
 
-/// What opening Settings needs from anywhere in the app, and the window once open.
+/// What opening Settings needs from anywhere in the app, and the dialog once open.
 struct Host {
     live: Entity<Live>,
     shell: WeakEntity<Shell>,
     runner: Arc<dyn Runner>,
-    window: Option<AnyWindowHandle>,
+    open: Option<WeakEntity<Settings>>,
 }
 
 impl Global for Host {}
@@ -70,48 +70,48 @@ pub fn install(live: Entity<Live>, shell: WeakEntity<Shell>, runner: Arc<dyn Run
         live,
         shell,
         runner,
-        window: None,
+        open: None,
     });
 }
 
-/// Focuses the Settings window, opening it first if it is not open.
+/// Opens Settings as a modal dialog over the main window, unless it is already open.
 pub fn open(cx: &mut App) {
     let Some(host) = cx.try_global::<Host>() else {
         return;
     };
-    let (live, shell, runner, window) = (host.live.clone(), host.shell.clone(), host.runner.clone(), host.window);
-    if let Some(handle) = window
-        && cx
-            .update_window(handle, |_, window, _| window.activate_window())
-            .is_ok()
-    {
+    let Some(handle) = cx.active_window().or_else(|| cx.windows().first().copied()) else {
         return;
-    }
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            size(px(480.), px(560.)),
-            cx,
-        ))),
-        window_min_size: Some(size(px(420.), px(400.))),
-        titlebar: Some(TitlebarOptions {
-            title: Some(TITLE.into()),
-            appears_transparent: true,
-            traffic_light_position: None,
-        }),
-        app_id: Some("sysman".into()),
-        window_decorations: Some(WindowDecorations::Client),
-        ..Default::default()
     };
-    let opened = cx.open_window(options, |window, cx| {
-        window.set_window_title(TITLE);
-        let view = cx.new(|cx| Settings::new(live, shell, runner, cx));
-        cx.new(|cx| Root::new(view, window, cx))
+    let (live, shell, runner) = (host.live.clone(), host.shell.clone(), host.runner.clone());
+    // A click handler runs while its window is borrowed, so the window is updated once it returns.
+    cx.defer(move |cx| {
+        if cx.global::<Host>().open.as_ref().is_some_and(|s| s.upgrade().is_some()) {
+            return;
+        }
+        let opened = handle.update(cx, |_, window, cx| {
+            let view = cx.new(|cx| Settings::new(live, shell, runner, cx));
+            cx.global_mut::<Host>().open = Some(view.downgrade());
+            window.open_dialog(cx, move |dialog, window, cx| {
+                let t = theme(cx);
+                let view = view.clone();
+                let top = ((window.viewport_size().height - px(HEIGHT)) / 2.).max(px(16.));
+                dialog
+                    .w(px(WIDTH))
+                    .h(px(HEIGHT))
+                    .margin_top(top)
+                    .close_button(false)
+                    .p_0()
+                    .gap_0()
+                    .bg(t.window)
+                    .border_color(t.control_border)
+                    .rounded(px(12.))
+                    .content(move |content, _, _| content.min_h_0().child(view.clone()))
+            });
+        });
+        if let Err(e) = opened {
+            eprintln!("sysman: could not open Settings: {e:#}");
+        }
     });
-    match opened {
-        Ok(handle) => cx.global_mut::<Host>().window = Some(handle.into()),
-        Err(e) => eprintln!("sysman: could not open Settings: {e:#}"),
-    }
 }
 
 /// A unit behind a switch: what systemd last said, and a change in flight.
@@ -288,14 +288,6 @@ impl Settings {
                         cx.notify();
                     }))
             }));
-        let drag = |id: &'static str| {
-            div()
-                .id(id)
-                .flex_1()
-                .h_full()
-                .window_control_area(WindowControlArea::Drag)
-                .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
-        };
         div()
             .flex_shrink_0()
             .h(px(64.))
@@ -303,16 +295,16 @@ impl Settings {
             .flex_row()
             .items_center()
             .pr(px(10.))
-            .child(drag("toolbar-left").ml(px(34.)))
+            .child(div().flex_1().ml(px(34.)))
             .child(tabs)
-            .child(drag("toolbar-right"))
+            .child(div().flex_1())
             .child(
                 Button::new("settings-close")
                     .ghost()
                     .xsmall()
                     .icon(Icon::new(IconName::X))
                     .tooltip("Close")
-                    .on_click(|_, window, _| window.remove_window()),
+                    .on_click(|_, window, cx| window.close_dialog(cx)),
             )
     }
 

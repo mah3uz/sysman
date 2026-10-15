@@ -30,8 +30,9 @@ use crate::data::source::{Combine, Source};
 use crate::screens::dashboard::Groups;
 use crate::ui::theme::{Theme, theme};
 use crate::ui::widgets::hairline;
+use crate::ui::widgets::sidebar::{self, Side, Sidebar, Widths};
 
-const SIDEBAR_WIDTH: f32 = 340.;
+const OUTLINE: Widths = Widths::new(300., 240., 440.);
 const CHART_SPAN_S: f64 = 300.;
 const CHART_BUCKETS: u32 = 120;
 const SEED_EVERY_S: f64 = 30.;
@@ -121,6 +122,7 @@ fn downloads_dir() -> PathBuf {
 
 pub struct Hardware {
     live: Entity<Live>,
+    outline: Entity<Sidebar>,
     inventory: Option<Rc<Inventory>>,
     sections: Rc<Vec<Section>>,
     built_with_data: bool,
@@ -166,6 +168,7 @@ impl Hardware {
         let selected = Selection::Overview;
         let mut this = Self {
             live,
+            outline: cx.new(|_| Sidebar::new("hardware.left", Side::Left, OUTLINE)),
             inventory: None,
             sections: Rc::new(Vec::new()),
             built_with_data: false,
@@ -1808,7 +1811,7 @@ impl Render for Hardware {
             }
         }
         let header = self.header(cx).into_any_element();
-        let sidebar = self.sidebar(cx).into_any_element();
+        let sidebar = sidebar::showing(&self.outline, cx).then(|| self.sidebar(cx).into_any_element());
         let detail = match self.selected {
             Selection::Overview => self.overview(window, cx),
             Selection::Category(c) => self.detail(c, None, cx),
@@ -1821,19 +1824,23 @@ impl Render for Hardware {
                 .min_h_0()
                 .flex()
                 .flex_row()
-                .child(
-                    div()
-                        .id("hw-sidebar")
-                        .w(px(SIDEBAR_WIDTH))
-                        .flex_shrink_0()
-                        .h_full()
-                        .overflow_y_scroll()
-                        .bg(t.card.opacity(0.6))
-                        .border_r_1()
-                        .border_color(t.hairline)
-                        .p(px(10.))
-                        .child(sidebar),
-                )
+                .child(sidebar::sidebar(
+                    &self.outline,
+                    sidebar.map(|sidebar| {
+                        div()
+                            .id("hw-sidebar")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .bg(t.card.opacity(0.6))
+                            .border_r_1()
+                            .border_color(t.hairline)
+                            .p(px(10.))
+                            .child(sidebar)
+                            .into_any_element()
+                    }),
+                    window,
+                    cx,
+                ))
                 .child(
                     div()
                         .id("hw-detail")

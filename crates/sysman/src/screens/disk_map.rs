@@ -6,8 +6,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, App, BorderStyle, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, DispatchPhase, Entity,
-    FocusHandle, Font, FontWeight, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
+    AnyElement, App, AppContext, BorderStyle, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, DispatchPhase,
+    Entity, FocusHandle, Font, FontWeight, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Render, SharedString,
     StatefulInteractiveElement, Styled, TextAlign, WeakEntity, Window, canvas, div, fill, outline, point,
     prelude::FluentBuilder, px, relative, rgb, size,
@@ -27,8 +27,9 @@ use crate::data::diskmap::{self, DIR, FOLD, HARD_LINK, Kind, OTHER_FS, ROOT, SYM
 use crate::data::live::Live;
 use crate::screens::disk::segmented;
 use crate::ui::theme::theme;
+use crate::ui::widgets::sidebar::{self, Side, Sidebar, Widths};
 
-const RAIL_WIDTH: f32 = 330.;
+const RAIL: Widths = Widths::new(340., 280., 480.);
 const ROW_LIMIT: usize = 200;
 const STRIP: f32 = 16.;
 const PAD: f32 = 2.;
@@ -420,6 +421,7 @@ struct SceneCache {
 
 pub struct DiskMap {
     live: Entity<Live>,
+    rail: Entity<Sidebar>,
     root: PathBuf,
     tree: Option<Arc<Tree>>,
     scan: Option<Arc<Scan>>,
@@ -470,6 +472,7 @@ impl DiskMap {
         let mode = Mode::Map;
         let mut this = Self {
             live,
+            rail: cx.new(|_| Sidebar::new("disk_map.right", Side::Right, RAIL)),
             root: PathBuf::new(),
             tree: None,
             scan: None,
@@ -1564,9 +1567,10 @@ impl DiskMap {
         };
         div()
             .id("disk-map-rail")
-            .w(px(RAIL_WIDTH))
-            .flex_shrink_0()
+            .size_full()
             .overflow_y_scroll()
+            .border_l(t.hairline_width)
+            .border_color(t.hairline)
             .p(px(14.))
             .child(content)
     }
@@ -1908,7 +1912,7 @@ impl DiskMap {
 }
 
 impl Render for DiskMap {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let toolbar = self.toolbar(cx).into_any_element();
         let body = match self.tree.clone() {
             None => self.waiting(cx).into_any_element(),
@@ -1918,7 +1922,7 @@ impl Render for DiskMap {
                     Mode::Largest | Mode::Oldest => self.table(&tree, cx).into_any_element(),
                     Mode::Kinds => self.kinds_view(&tree, cx).into_any_element(),
                 };
-                let t = theme(cx);
+                let rail = sidebar::showing(&self.rail, cx).then(|| self.rail(&tree, cx).into_any_element());
                 div()
                     .flex_1()
                     .min_h_0()
@@ -1933,8 +1937,7 @@ impl Render for DiskMap {
                             .flex()
                             .flex_row()
                             .child(content)
-                            .child(div().w(t.hairline_width).bg(t.hairline))
-                            .child(self.rail(&tree, cx)),
+                            .child(sidebar::sidebar(&self.rail, rail, window, cx)),
                     )
                     .into_any_element()
             }

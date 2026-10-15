@@ -74,6 +74,7 @@ gpui_kit_assets::icon_assets!(
         LayoutGrid,
         LayoutList,
         RefreshCw,
+        PanelLeft,
         PanelRight,
         Ellipsis,
         StepBack,

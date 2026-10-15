@@ -33,6 +33,7 @@ use crate::data::history::{Bucket, History, Proc, ProcPoint, bucket_width, db_pa
 use crate::data::live::Live;
 use crate::data::source::Source;
 use crate::ui::theme::{Theme, theme};
+use crate::ui::widgets::sidebar::{self, Side, Sidebar, Toggled, Widths};
 use catalog::{CHARTS, ChartDef, Group, HELPER_CHART, Hue, Preset, Scope, chart};
 use model::{CsvLine, MAX_PROCESSES, SPANS, View, ZOOM_IN, ZOOM_OUT};
 
@@ -42,8 +43,8 @@ const RELOAD_S: f64 = 60.;
 /// The collector's interval for machine series and for process rows.
 const MACHINE_INTERVAL_S: f64 = 2.;
 const PROCESS_INTERVAL_S: f64 = 10.;
-const SIDEBAR_WIDTH: Pixels = px(190.);
-const INSPECTOR_WIDTH: Pixels = px(250.);
+const SIDEBAR: Widths = Widths::new(280., 220., 420.);
+const INSPECTOR: Widths = Widths::new(320., 260., 480.);
 const TOOLBAR_HEIGHT: Pixels = px(44.);
 const HEADER_HEIGHT: Pixels = px(30.);
 const STATUS_HEIGHT: Pixels = px(26.);
@@ -186,7 +187,8 @@ pub struct Explorer {
     source_tab: SourceTab,
     inspector_tab: InspectorTab,
     grid: bool,
-    inspector: bool,
+    left: Entity<Sidebar>,
+    right: Entity<Sidebar>,
     filter: Option<Entity<InputState>>,
     filter_text: String,
     search: Option<Entity<InputState>>,
@@ -210,6 +212,10 @@ impl Explorer {
         cx.observe(&live, |this, _, cx| this.tick(cx)).detach();
         #[cfg(debug_assertions)]
         let dev = |name: &str| std::env::var(format!("SYSMAN_DEV_EXPLORER_{name}")).ok();
+        let left = cx.new(|_| Sidebar::new("explorer.left", Side::Left, SIDEBAR));
+        let right = cx.new(|_| Sidebar::new("explorer.right", Side::Right, INSPECTOR));
+        cx.subscribe(&right, |this, _, _: &Toggled, cx| this.refresh(cx))
+            .detach();
         let mut this = Self {
             live,
             view: View::live(3600),
@@ -231,7 +237,8 @@ impl Explorer {
             source_tab: SourceTab::Metrics,
             inspector_tab: InspectorTab::Values,
             grid: true,
-            inspector: true,
+            left,
+            right,
             filter: None,
             filter_text: String::new(),
             search: None,
@@ -424,7 +431,7 @@ impl Explorer {
     }
 
     fn refresh_top(&mut self, now: f64, cx: &mut Context<Self>) {
-        if self.inspector_tab != InspectorTab::Processes || !self.inspector || self.top_loading {
+        if self.inspector_tab != InspectorTab::Processes || self.right.read(cx).collapsed() || self.top_loading {
             return;
         }
         let t = self.pin.get().unwrap_or_else(|| self.view.range(now).1) as i64;
@@ -527,7 +534,7 @@ impl Explorer {
         self.pin.set(None);
         self.focused = None;
         self.grid = true;
-        self.inspector = true;
+        self.right.update(cx, |s, cx| s.set_collapsed(false, cx));
         self.apply_preset(Preset::Overview, cx);
     }
 
@@ -852,6 +859,8 @@ impl Explorer {
                     )
             });
         let open_goto = cx.listener(|this, _: &MouseDownEvent, window, cx| this.open_goto(window, cx));
+        let sources = !self.left.read(cx).collapsed();
+        let inspector = !self.right.read(cx).collapsed();
         div()
             .flex()
             .flex_row()
@@ -861,6 +870,15 @@ impl Explorer {
             .px(px(14.))
             .gap(px(6.))
             .map(|d| hairline_bottom(d, t))
+            .child(
+                tool(
+                    "sources",
+                    IconName::PanelLeft,
+                    if sources { "Hide sidebar" } else { "Show sidebar" },
+                )
+                .selected(sources)
+                .on_click(cx.listener(|this, _, _, cx| this.left.update(cx, |s, cx| s.toggle(cx)))),
+            )
             .child(
                 div()
                     .flex()
@@ -956,17 +974,10 @@ impl Explorer {
                 tool(
                     "inspector",
                     IconName::PanelRight,
-                    if self.inspector {
-                        "Hide inspector"
-                    } else {
-                        "Show inspector"
-                    },
+                    if inspector { "Hide inspector" } else { "Show inspector" },
                 )
-                .selected(self.inspector)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.inspector = !this.inspector;
-                    this.refresh(cx);
-                })),
+                .selected(inspector)
+                .on_click(cx.listener(|this, _, _, cx| this.right.update(cx, |s, cx| s.toggle(cx)))),
             )
             .child({
                 let entity = cx.entity().downgrade();
@@ -1011,9 +1022,7 @@ impl Explorer {
         div()
             .flex()
             .flex_col()
-            .flex_shrink_0()
-            .w(SIDEBAR_WIDTH)
-            .h_full()
+            .size_full()
             .bg(t.panel.opacity(0.5))
             .map(|d| hairline_right(d, t))
             .child(div().p(px(10.)).child(tabs))
@@ -1580,9 +1589,7 @@ impl Explorer {
         div()
             .flex()
             .flex_col()
-            .flex_shrink_0()
-            .w(INSPECTOR_WIDTH)
-            .h_full()
+            .size_full()
             .bg(t.panel.opacity(0.3))
             .map(|d| hairline_left(d, t))
             .child(div().p(px(10.)).child(tabs))
@@ -2031,15 +2038,14 @@ impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_widgets(window, cx);
         let now = self.now(cx);
-        let mut centre = window.viewport_size().width - SIDEBAR_WIDTH;
-        if self.inspector {
-            centre -= INSPECTOR_WIDTH;
-        }
+        let centre = window.viewport_size().width - self.left.read(cx).width() - self.right.read(cx).width();
         let toolbar = self.toolbar(cx).into_any_element();
-        let sidebar = self.sidebar(cx).into_any_element();
+        let sidebar = sidebar::showing(&self.left, cx).then(|| self.sidebar(cx).into_any_element());
+        let sidebar = sidebar::sidebar(&self.left, sidebar, window, cx);
         let header = self.header(now, cx).into_any_element();
         let workspace = self.workspace(centre, now, cx).into_any_element();
-        let inspector = self.inspector.then(|| self.inspector(now, cx).into_any_element());
+        let inspector = sidebar::showing(&self.right, cx).then(|| self.inspector(now, cx).into_any_element());
+        let inspector = sidebar::sidebar(&self.right, inspector, window, cx);
         let status = self.status_bar(now, cx).into_any_element();
         let t = theme(cx);
         div()
@@ -2065,7 +2071,7 @@ impl Render for Explorer {
                             .child(header)
                             .child(workspace),
                     )
-                    .children(inspector),
+                    .child(inspector),
             )
             .child(status)
     }

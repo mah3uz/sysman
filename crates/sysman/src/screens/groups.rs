@@ -36,10 +36,11 @@ use crate::ui::theme::{Theme, theme};
 use crate::ui::widgets::hairline;
 use crate::ui::widgets::panel::caption_label;
 use crate::ui::widgets::range::{Range, range_picker, remember, remembered};
+use crate::ui::widgets::sidebar::{self, Side, Sidebar, Widths};
 
 const BUCKETS: u32 = 120;
 const RELOAD_S: f64 = 60.;
-const LIST_WIDTH: f32 = 330.;
+const LIST: Widths = Widths::new(340., 280., 480.);
 const CHART_HEIGHT: f32 = 190.;
 /// The daemon records processes every 10 s.
 const RECORD_INTERVAL_S: f64 = 10.;
@@ -203,6 +204,7 @@ fn suggest(groups: &[Group], table: &[Process], units: Option<&schema::cgroups::
 
 pub struct Groups {
     live: Entity<Live>,
+    list: Entity<Sidebar>,
     feed: Entity<ProcessFeed>,
     path: PathBuf,
     groups: Vec<Group>,
@@ -265,6 +267,7 @@ impl Groups {
         };
         let mut this = Self {
             live,
+            list: cx.new(|_| Sidebar::new("groups.left", Side::Left, LIST)),
             feed,
             path,
             selected: groups.iter().position(|g| g.enabled),
@@ -854,9 +857,7 @@ impl Groups {
         let section = |label: &str, cx: &App| div().pt(px(10.)).pb(px(2.)).child(caption_label(label, cx));
         div()
             .id("groups-list")
-            .flex_shrink_0()
-            .w(px(LIST_WIDTH))
-            .h_full()
+            .size_full()
             .overflow_y_scroll()
             .border_r_1()
             .border_color(t.hairline)
@@ -1361,7 +1362,8 @@ impl Render for Groups {
             cx.defer_in(window, move |this, window, cx| this.open_editor(target, window, cx));
         }
         let header = self.header(cx).into_any_element();
-        let sidebar = self.sidebar(cx).into_any_element();
+        let sidebar = sidebar::showing(&self.list, cx).then(|| self.sidebar(cx).into_any_element());
+        let sidebar = sidebar::sidebar(&self.list, sidebar, window, cx);
         let detail = match self.selected {
             Some(i) if i < self.groups.len() => self.detail(i, cx),
             _ => div()
