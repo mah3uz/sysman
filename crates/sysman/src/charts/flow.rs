@@ -257,7 +257,7 @@ impl EnergyFlow {
         let mut font = gpui::font(t.font.clone());
         font.features = t.numbers.clone();
         let mut bold = font.clone();
-        bold.weight = gpui::FontWeight::SEMIBOLD;
+        bold.weight = t.weight_semibold;
         let ink = Ink {
             font,
             bold,

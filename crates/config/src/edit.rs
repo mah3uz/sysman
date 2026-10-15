@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
@@ -121,6 +121,80 @@ impl Draft {
         Config::validate(&text)?;
         write_atomic(path, &text).with_context(|| format!("writing {}", path.display()))?;
         self.saved = text;
+        Ok(())
+    }
+}
+
+/// What [`Watched::poll`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Polled {
+    Unchanged,
+    /// Changed elsewhere and taken in; nothing here was unsaved.
+    Reloaded,
+    /// Changed elsewhere while there are unsaved edits here; the user chooses between the two.
+    Conflict,
+}
+
+/// A config file open for editing that follows edits made to it elsewhere.
+#[derive(Debug)]
+pub struct Watched {
+    path: PathBuf,
+    /// `Err` while the file on disk is not TOML.
+    pub draft: Result<Draft, String>,
+    stamp: Stamp,
+    pub conflict: bool,
+}
+
+impl Watched {
+    pub fn open(path: PathBuf) -> Self {
+        let stamp = Stamp::of(&path);
+        let draft = Draft::load(&path).map_err(|e| format!("{e:#}"));
+        Self {
+            path,
+            draft,
+            stamp,
+            conflict: false,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn dirty(&self) -> bool {
+        self.draft.as_ref().is_ok_and(Draft::dirty)
+    }
+
+    pub fn poll(&mut self) -> Polled {
+        if self.conflict || Stamp::of(&self.path) == self.stamp {
+            return Polled::Unchanged;
+        }
+        if self.dirty() {
+            self.conflict = true;
+            return Polled::Conflict;
+        }
+        self.reload();
+        Polled::Reloaded
+    }
+
+    /// Drops the unsaved edits for the file as it is now.
+    pub fn reload(&mut self) {
+        *self = Self::open(std::mem::take(&mut self.path));
+    }
+
+    /// Keeps the unsaved edits; saving them replaces the file changed elsewhere.
+    pub fn keep_mine(&mut self) {
+        self.stamp = Stamp::of(&self.path);
+        self.conflict = false;
+    }
+
+    pub fn save(&mut self) -> Result<()> {
+        let Ok(draft) = &mut self.draft else {
+            anyhow::bail!("the file on disk is not TOML; fix or remove it first");
+        };
+        draft.save(&self.path)?;
+        self.stamp = Stamp::of(&self.path);
+        self.conflict = false;
         Ok(())
     }
 }
@@ -248,5 +322,77 @@ mod tests {
             Draft::parse("[general]\nintervall = 5\n").is_ok(),
             "valid TOML opens so the form can show the error"
         );
+    }
+
+    /// Writes with a different length, so the change shows even within the mtime's resolution.
+    fn edit_by_hand(path: &Path, text: &str) {
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_hand_edit_is_taken_in_when_nothing_is_unsaved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        edit_by_hand(&path, FILE);
+        let mut w = Watched::open(path.clone());
+        assert_eq!(w.poll(), Polled::Unchanged);
+        edit_by_hand(&path, "[general]\ninterval = 7\n");
+        assert_eq!(w.poll(), Polled::Reloaded);
+        assert_eq!(w.draft.as_ref().unwrap().check().unwrap().general.interval, 7);
+        assert_eq!(w.poll(), Polled::Unchanged, "taken in once");
+    }
+
+    #[test]
+    fn a_hand_edit_during_unsaved_edits_asks_and_destroys_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        edit_by_hand(&path, FILE);
+        let mut w = Watched::open(path.clone());
+        w.draft.as_mut().unwrap().set(&["general", "interval"], 4);
+        edit_by_hand(&path, "[general]\ninterval = 7\n");
+        assert_eq!(w.poll(), Polled::Conflict);
+        assert!(w.dirty(), "the unsaved edit is still there");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[general]\ninterval = 7\n",
+            "and so is theirs"
+        );
+        assert_eq!(w.poll(), Polled::Unchanged, "asked once, not on every poll");
+
+        let mut keep = Watched::open(path.clone());
+        keep.draft.as_mut().unwrap().set(&["general", "interval"], 4);
+        edit_by_hand(&path, "[general]\ninterval = 9\n");
+        assert_eq!(keep.poll(), Polled::Conflict);
+        keep.keep_mine();
+        keep.save().unwrap();
+        assert_eq!(Config::load(&path).unwrap().general.interval, 4);
+
+        w.reload();
+        assert!(!w.dirty() && !w.conflict);
+        assert_eq!(w.draft.as_ref().unwrap().check().unwrap().general.interval, 4);
+    }
+
+    #[test]
+    fn our_own_save_is_not_an_outside_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sysman/config.toml");
+        let mut w = Watched::open(path.clone());
+        w.draft.as_mut().unwrap().set(&["general", "fsync"], false);
+        w.save().unwrap();
+        assert_eq!(w.poll(), Polled::Unchanged);
+    }
+
+    #[test]
+    fn a_file_broken_by_hand_opens_as_an_error_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        edit_by_hand(&path, "[general\n");
+        let mut w = Watched::open(path.clone());
+        assert!(w.draft.is_err());
+        assert!(w.save().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[general\n");
+        edit_by_hand(&path, "[general]\n");
+        assert_eq!(w.poll(), Polled::Reloaded);
+        assert!(w.draft.is_ok());
     }
 }

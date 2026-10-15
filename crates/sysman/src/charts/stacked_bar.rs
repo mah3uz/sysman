@@ -1,11 +1,11 @@
 use gpui::{
-    App, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
-    Styled, div, px, relative,
+    App, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, div,
+    relative,
 };
 use gpui_component::tooltip::Tooltip;
 
 use crate::charts::format::bytes;
-use crate::ui::theme::theme;
+use crate::ui::theme::{rem_px, theme};
 
 pub struct Segment {
     pub name: SharedString,
@@ -21,8 +21,8 @@ pub fn stacked_bar(segments: Vec<Segment>, total: f64, cx: &App) -> impl IntoEle
     let bar = div()
         .flex()
         .flex_row()
-        .h(px(22.))
-        .rounded(px(6.))
+        .h(rem_px(22.))
+        .rounded(rem_px(6.))
         .overflow_hidden()
         .bg(t.card)
         .children(segments.iter().enumerate().map(|(i, s)| {
@@ -34,30 +34,34 @@ pub fn stacked_bar(segments: Vec<Segment>, total: f64, cx: &App) -> impl IntoEle
                 .bg(s.color)
                 .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
         }));
-    let legend = div().flex().flex_col().gap(px(8.)).children(segments.iter().map(|s| {
-        div()
-            .flex()
-            .flex_row()
-            .gap(px(8.))
-            .child(div().mt(px(3.)).size(px(10.)).rounded(px(3.)).bg(s.color))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(t.caption)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(s.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(t.small_caption)
-                            .text_color(t.text_secondary)
-                            .font_features(t.numbers.clone())
-                            .child(detail(s)),
-                    ),
-            )
-    }));
-    div().flex().flex_col().gap(px(14.)).child(bar).child(legend)
+    let legend = div()
+        .flex()
+        .flex_col()
+        .gap(rem_px(8.))
+        .children(segments.iter().map(|s| {
+            div()
+                .flex()
+                .flex_row()
+                .gap(rem_px(8.))
+                .child(div().mt(rem_px(3.)).size(rem_px(10.)).rounded(rem_px(3.)).bg(s.color))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(t.caption)
+                                .font_weight(t.weight_medium)
+                                .child(s.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(t.small_caption)
+                                .text_color(t.text_secondary)
+                                .font_features(t.numbers.clone())
+                                .child(detail(s)),
+                        ),
+                )
+        }));
+    div().flex().flex_col().gap(rem_px(14.)).child(bar).child(legend)
 }

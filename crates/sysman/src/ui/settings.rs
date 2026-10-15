@@ -2,9 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, AppContext, Context, Div, Entity, FontWeight, Global, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div,
-    prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, Div, Entity, Global, Hsla, InteractiveElement, IntoElement, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
@@ -13,17 +12,26 @@ use gpui_component::switch::Switch;
 use gpui_component::{Disableable, Icon, Sizable, WindowExt};
 use gpui_kit_assets::IconName;
 
+use crate::charts::format::TempUnit;
 use crate::data::helper::{self, State};
 use crate::data::live::{Conn, Live};
+use crate::data::prefs::prefs;
 use crate::data::systemd::{self, COLLECTOR, HELPER, Runner, Service, Unit};
-use crate::ui::shell::{PauseAfter, Refresh, Shell};
-use crate::ui::theme::theme;
+use crate::ui::shell::{PauseAfter, Refresh, Shell, TitlebarDrag};
+use crate::ui::theme::{self, TextSize, rem_px, theme};
 use crate::ui::widgets::hairline;
+use crate::ui::widgets::segmented::segmented_full_width;
 
-const WIDTH: f32 = 520.;
-const HEIGHT: f32 = 600.;
+mod collector;
+
+use collector::CollectorForm;
+
+const WIDTH: f32 = 560.;
+const HEIGHT: f32 = 640.;
 /// systemd's view is re-read this often while Settings is open, to follow changes made elsewhere.
 const POLL: Duration = Duration::from_secs(5);
+/// Both settings files are checked this often for edits made by hand.
+const FILE_POLL: Duration = Duration::from_secs(2);
 const ROW_LABEL: f32 = 13.;
 const PRIVILEGED_NOTE: &str = "Drive health needs raw drive commands, CPU package power is readable only by root, \
                                other users' disk I/O and open files need root, and per-app traffic needs an eBPF \
@@ -34,15 +42,27 @@ const PRIVILEGED_NOTE: &str = "Drive health needs raw drive commands, CPU packag
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     General,
+    Display,
+    Collector,
+    Modules,
     Advanced,
 }
 
 impl Tab {
-    const ALL: [Tab; 2] = [Self::General, Self::Advanced];
+    const ALL: [Tab; 5] = [
+        Self::General,
+        Self::Display,
+        Self::Collector,
+        Self::Modules,
+        Self::Advanced,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Display => "Display",
+            Self::Collector => "Collector",
+            Self::Modules => "Modules",
             Self::Advanced => "Advanced",
         }
     }
@@ -50,6 +70,9 @@ impl Tab {
     fn icon(self) -> IconName {
         match self {
             Self::General => IconName::Settings,
+            Self::Display => IconName::Monitor,
+            Self::Collector => IconName::Database,
+            Self::Modules => IconName::Blocks,
             Self::Advanced => IconName::SlidersHorizontal,
         }
     }
@@ -94,17 +117,21 @@ pub fn open(cx: &mut App) {
             window.open_dialog(cx, move |dialog, window, cx| {
                 let t = theme(cx);
                 let view = view.clone();
-                let top = ((window.viewport_size().height - px(HEIGHT)) / 2.).max(px(16.));
+                let rem = window.rem_size();
+                let height = rem_px(HEIGHT)
+                    .to_pixels(rem)
+                    .min(window.viewport_size().height - px(32.));
+                let top = ((window.viewport_size().height - height) / 2.).max(px(16.));
                 dialog
-                    .w(px(WIDTH))
-                    .h(px(HEIGHT))
+                    .w(rem_px(WIDTH).to_pixels(rem))
+                    .h(height)
                     .margin_top(top)
                     .close_button(false)
                     .p_0()
                     .gap_0()
                     .bg(t.window)
                     .border_color(t.control_border)
-                    .rounded(px(12.))
+                    .rounded(rem_px(12.))
                     .content(move |content, _, _| content.min_h_0().child(view.clone()))
             });
         });
@@ -161,6 +188,9 @@ pub struct Settings {
     tab: Tab,
     helper: Toggle,
     collector: Toggle,
+    form: Entity<CollectorForm>,
+    /// "Reset layout" was pressed and waits for its confirmation.
+    confirm_reset: bool,
 }
 
 impl Settings {
@@ -182,11 +212,22 @@ impl Settings {
             }
         })
         .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                if this.update(cx, |this, cx| this.poll_files(cx)).is_err() {
+                    break;
+                }
+                cx.background_executor().timer(FILE_POLL).await;
+            }
+        })
+        .detach();
+        let form = cx.new(|_| CollectorForm::new(sysman_config::config_path(), runner.clone()));
+        cx.observe(&form, |_, _, cx| cx.notify()).detach();
         #[cfg(debug_assertions)]
-        let tab = match std::env::var("SYSMAN_DEV_SETTINGS").as_deref() {
-            Ok("Advanced") => Tab::Advanced,
-            _ => Tab::General,
-        };
+        let tab = std::env::var("SYSMAN_DEV_SETTINGS")
+            .ok()
+            .and_then(|name| Tab::ALL.into_iter().find(|t| t.label().eq_ignore_ascii_case(&name)))
+            .unwrap_or(Tab::General);
         #[cfg(not(debug_assertions))]
         let tab = Tab::General;
         Self {
@@ -196,7 +237,24 @@ impl Settings {
             tab,
             helper: Toggle::new(HELPER),
             collector: Toggle::new(COLLECTOR),
+            form,
+            confirm_reset: false,
         }
+    }
+
+    /// Takes in edits made by hand to `ui.toml` and the collector's `config.toml`.
+    fn poll_files(&mut self, cx: &mut Context<Self>) {
+        let changed = prefs().lock().is_ok_and(|mut p| {
+            let changed = p.changed_on_disk();
+            if changed {
+                p.reload();
+            }
+            changed
+        });
+        if changed && let Some(shell) = self.shell.upgrade() {
+            shell.update(cx, |shell, cx| shell.prefs_changed(cx));
+        }
+        self.form.update(cx, |form, cx| form.poll(cx));
     }
 
     fn toggle(&mut self, service: Service) -> &mut Toggle {
@@ -264,24 +322,24 @@ impl Settings {
         let tabs = div()
             .flex()
             .flex_row()
-            .gap(px(4.))
+            .gap(rem_px(4.))
             .children(Tab::ALL.iter().map(|&tab| {
                 let selected = tab == self.tab;
                 div()
                     .id(tab.label())
-                    .w(px(76.))
-                    .py(px(5.))
+                    .w(rem_px(76.))
+                    .py(rem_px(5.))
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(3.))
-                    .rounded(px(7.))
-                    .text_size(px(11.))
+                    .gap(rem_px(3.))
+                    .rounded(rem_px(7.))
+                    .text_size(rem_px(11.))
                     .when(selected, |d| d.bg(t.card_hover).text_color(t.text))
                     .when(!selected, |d| {
                         d.text_color(t.text_secondary).hover(|d| d.text_color(t.text))
                     })
-                    .child(Icon::new(tab.icon()).size(px(20.)))
+                    .child(Icon::new(tab.icon()).size(rem_px(20.)))
                     .child(tab.label())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.tab = tab;
@@ -290,12 +348,12 @@ impl Settings {
             }));
         div()
             .flex_shrink_0()
-            .h(px(64.))
+            .h(rem_px(64.))
             .flex()
             .flex_row()
             .items_center()
-            .pr(px(10.))
-            .child(div().flex_1().ml(px(34.)))
+            .pr(rem_px(10.))
+            .child(div().flex_1().ml(rem_px(34.)))
             .child(tabs)
             .child(div().flex_1())
             .child(
@@ -319,7 +377,7 @@ impl Settings {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.))
+            .gap(rem_px(8.))
             .when(toggle.pending.is_some(), |d| d.child(Spinner::new().small()))
             .when_some(toggle.note(), |d, note| {
                 d.child(div().text_size(t.caption).text_color(t.text_secondary).child(note))
@@ -335,7 +393,6 @@ impl Settings {
     }
 
     fn general(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let t = theme(cx);
         let current = self.shell.upgrade().map(|s| s.read(cx).refresh());
         let shell = self.shell.clone();
         let interval = Button::new("refresh-interval")
@@ -376,19 +433,6 @@ impl Settings {
                 }
                 menu
             });
-        let connected = self.live.read(cx).conn == Conn::Connected;
-        let status = status_value(
-            if connected { "Running" } else { "Stopped" }.into(),
-            if connected { t.green } else { t.orange },
-            cx,
-        );
-        let mut collector = vec![
-            row("Status", status, cx),
-            self.switch_row("Start at login", COLLECTOR, cx),
-        ];
-        if let Some(e) = self.collector.error.clone() {
-            collector.push(error_row(e, cx));
-        }
         vec![
             group(
                 vec![
@@ -404,14 +448,146 @@ impl Settings {
                 cx,
             )
             .into_any_element(),
-            group_title("Collector", cx).into_any_element(),
-            group(collector, cx).into_any_element(),
+        ]
+    }
+
+    fn display(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let t = theme(cx);
+        let text_size = segmented_full_width(
+            "text-size",
+            TextSize::ALL.map(|s| (s, s.label())),
+            &t.text_size,
+            |size, _, cx| theme::set_text_size(size, cx),
+            cx,
+        );
+        let unit = segmented_full_width(
+            "temperature-unit",
+            TempUnit::ALL.map(|u| (u, u.label())),
+            &TempUnit::current(),
+            |unit, _, cx| {
+                unit.choose();
+                cx.refresh_windows();
+            },
+            cx,
+        );
+        let shell = self.shell.clone();
+        let drag = segmented_full_width(
+            "titlebar-drag",
+            TitlebarDrag::ALL.map(|d| (d, d.label())),
+            &self
+                .shell
+                .upgrade()
+                .map_or(TitlebarDrag::Auto, |s| s.read(cx).titlebar_drag()),
+            move |choice, _, cx| {
+                shell.update(cx, |shell, cx| shell.set_titlebar_drag(choice, cx)).ok();
+            },
+            cx,
+        );
+        let reset = if self.confirm_reset {
+            div()
+                .flex()
+                .flex_row()
+                .gap(rem_px(4.))
+                .child(
+                    Button::new("reset-cancel")
+                        .ghost()
+                        .small()
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_reset = false;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("reset-confirm")
+                        .danger()
+                        .small()
+                        .label("Reset")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_reset = false;
+                            if let Some(shell) = this.shell.upgrade() {
+                                shell.update(cx, |shell, cx| shell.reset_layout(cx));
+                            }
+                            cx.notify();
+                        })),
+                )
+        } else {
+            div().child(
+                Button::new("reset-layout")
+                    .ghost()
+                    .small()
+                    .label("Reset…")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.confirm_reset = true;
+                        cx.notify();
+                    })),
+            )
+        };
+        vec![
+            group(
+                vec![
+                    row("Text size", div().w(rem_px(210.)).child(text_size), cx),
+                    row("Temperature", div().w(rem_px(110.)).child(unit), cx),
+                ],
+                cx,
+            )
+            .into_any_element(),
+            footnote(
+                "Bold draws text a little larger and heavier. Bigger scales the whole layout by about 15%.",
+                cx,
+            )
+            .into_any_element(),
+            group_title("Window", cx).into_any_element(),
+            group(
+                vec![
+                    row("Drag window from title bar", div().w(rem_px(130.)).child(drag), cx),
+                    row(
+                        if self.confirm_reset {
+                            "Reset sidebar widths and column choices?"
+                        } else {
+                            "Reset layout"
+                        },
+                        reset,
+                        cx,
+                    ),
+                ],
+                cx,
+            )
+            .into_any_element(),
+            footnote(
+                "Auto moves the window from empty title-bar space only while it floats, never while it is tiled, \
+                 maximised or fullscreen. Choose Never if your compositor still moves tiled windows.",
+                cx,
+            )
+            .into_any_element(),
+        ]
+    }
+
+    fn collector(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let t = theme(cx);
+        let connected = self.live.read(cx).conn == Conn::Connected;
+        let status = status_value(
+            if connected { "Running" } else { "Stopped" }.into(),
+            if connected { t.green } else { t.orange },
+            cx,
+        );
+        let mut service = vec![
+            row("Status", status, cx),
+            self.switch_row("Start at login", COLLECTOR, cx),
+        ];
+        if let Some(e) = self.collector.error.clone() {
+            service.push(error_row(e, cx));
+        }
+        let mut out = vec![
+            group(service, cx).into_any_element(),
             footnote(
                 "sysmand runs as your user service and records history while the app is closed.",
                 cx,
             )
             .into_any_element(),
-        ]
+        ];
+        out.extend(self.form.update(cx, |form, cx| form.collector_tab(window, cx)));
+        out
     }
 
     fn advanced(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -468,7 +644,7 @@ fn group(rows: Vec<AnyElement>, cx: &App) -> Div {
         t.hairline_width,
     )
     .children(rows.into_iter().enumerate().flat_map(move |(i, row)| {
-        let rule = (i + 1 < count).then(|| div().mx(px(12.)).h(px(1.)).bg(rule_colour).into_any_element());
+        let rule = (i + 1 < count).then(|| div().mx(rem_px(12.)).h(px(1.)).bg(rule_colour).into_any_element());
         std::iter::once(row).chain(rule)
     }))
 }
@@ -477,18 +653,18 @@ fn group(rows: Vec<AnyElement>, cx: &App) -> Div {
 fn row(label: impl Into<SharedString>, control: impl IntoElement, cx: &App) -> AnyElement {
     let t = theme(cx);
     div()
-        .min_h(px(38.))
-        .px(px(12.))
-        .py(px(6.))
+        .min_h(rem_px(38.))
+        .px(rem_px(12.))
+        .py(rem_px(6.))
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(12.))
+        .gap(rem_px(12.))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
-                .text_size(px(ROW_LABEL))
+                .text_size(rem_px(ROW_LABEL))
                 .text_color(t.text)
                 .child(label.into()),
         )
@@ -499,11 +675,11 @@ fn row(label: impl Into<SharedString>, control: impl IntoElement, cx: &App) -> A
 fn error_row(text: SharedString, cx: &App) -> AnyElement {
     let t = theme(cx);
     div()
-        .px(px(12.))
-        .py(px(7.))
+        .px(rem_px(12.))
+        .py(rem_px(7.))
         .flex()
         .flex_row()
-        .gap(px(7.))
+        .gap(rem_px(7.))
         .text_size(t.caption)
         .text_color(t.red)
         .child(Icon::new(IconName::TriangleAlert).small().flex_shrink_0())
@@ -514,8 +690,8 @@ fn error_row(text: SharedString, cx: &App) -> AnyElement {
 fn note_row(text: &'static str, cx: &App) -> AnyElement {
     let t = theme(cx);
     div()
-        .px(px(12.))
-        .py(px(7.))
+        .px(rem_px(12.))
+        .py(rem_px(7.))
         .text_size(t.caption)
         .text_color(t.text_secondary)
         .child(text)
@@ -528,20 +704,20 @@ fn status_value(label: SharedString, tint: Hsla, cx: &App) -> impl IntoElement +
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(6.))
-        .text_size(px(ROW_LABEL))
+        .gap(rem_px(6.))
+        .text_size(rem_px(ROW_LABEL))
         .text_color(t.text_secondary)
-        .child(div().size(px(7.)).rounded_full().bg(tint))
+        .child(div().size(rem_px(7.)).rounded_full().bg(tint))
         .child(label)
 }
 
 fn group_title(text: &'static str, cx: &App) -> impl IntoElement + use<> {
     let t = theme(cx);
     div()
-        .px(px(4.))
-        .pt(px(6.))
+        .px(rem_px(4.))
+        .pt(rem_px(6.))
         .text_size(t.caption)
-        .font_weight(FontWeight::SEMIBOLD)
+        .font_weight(t.weight_semibold)
         .text_color(t.text_secondary)
         .child(text)
 }
@@ -549,19 +725,24 @@ fn group_title(text: &'static str, cx: &App) -> impl IntoElement + use<> {
 fn footnote(text: &'static str, cx: &App) -> impl IntoElement + use<> {
     let t = theme(cx);
     div()
-        .px(px(4.))
+        .px(rem_px(4.))
         .text_size(t.small_caption)
-        .line_height(px(14.))
+        .line_height(rem_px(14.))
         .text_color(t.text_secondary)
         .child(text)
 }
 
 impl Render for Settings {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.tab {
             Tab::General => self.general(cx),
+            Tab::Display => self.display(cx),
+            Tab::Collector => self.collector(window, cx),
+            Tab::Modules => self.form.update(cx, |form, cx| form.modules_tab(window, cx)),
             Tab::Advanced => self.advanced(cx),
         };
+        let footer =
+            matches!(self.tab, Tab::Collector | Tab::Modules).then(|| self.form.update(cx, |form, cx| form.footer(cx)));
         let toolbar = self.toolbar(cx).into_any_element();
         let t = theme(cx);
         div()
@@ -571,10 +752,11 @@ impl Render for Settings {
             .bg(t.window)
             .text_color(t.text)
             .font_family(t.font.clone())
+            .font_weight(t.weight_body)
             .child(toolbar)
             .child(
                 div()
-                    .id("settings-content")
+                    .id(SharedString::from(format!("settings-content-{}", self.tab.label())))
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -582,12 +764,13 @@ impl Render for Settings {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(8.))
+                            .gap(rem_px(8.))
                             .px(t.page_padding)
-                            .pt(px(4.))
+                            .pt(rem_px(4.))
                             .pb(t.page_padding)
                             .children(body),
                     ),
             )
+            .children(footer)
     }
 }

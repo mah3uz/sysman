@@ -1,10 +1,10 @@
-use gpui::{App, IntoElement, ParentElement, Styled, div, px};
+use gpui::{App, IntoElement, ParentElement, Styled, div};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 
 use crate::ui::settings;
-use crate::ui::theme::theme;
+use crate::ui::theme::{rem_px, theme};
 
 /// One line saying the privileged helper would provide this, and a button that opens Settings.
 pub fn helper_hint(id: &'static str, text: &'static str, cx: &App) -> impl IntoElement + use<> {
@@ -13,7 +13,7 @@ pub fn helper_hint(id: &'static str, text: &'static str, cx: &App) -> impl IntoE
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(7.))
+        .gap(rem_px(7.))
         .text_size(t.small_caption)
         .text_color(t.text_secondary)
         .child(

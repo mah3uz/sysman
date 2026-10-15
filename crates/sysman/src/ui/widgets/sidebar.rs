@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::prefs::{Prefs, prefs};
 use crate::ui::shell::paused;
-use crate::ui::theme::{Theme, theme};
+use crate::ui::theme::{Theme, rem_px, theme};
 
 const ANIMATION: Duration = Duration::from_millis(150);
 /// What a collapsed sidebar leaves behind: a strip that brings it back.
@@ -287,12 +287,12 @@ fn gutter(state: &Entity<Sidebar>, key: &'static str, side: Side, t: &Theme) -> 
         });
     let toggle = div()
         .id("sidebar-hide")
-        .w(px(12.))
-        .h(px(36.))
+        .w(rem_px(12.))
+        .h(rem_px(36.))
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(6.))
+        .rounded(rem_px(6.))
         .bg(t.control)
         .border_1()
         .border_color(t.control_border)
@@ -321,8 +321,8 @@ fn gutter(state: &Entity<Sidebar>, key: &'static str, side: Side, t: &Theme) -> 
         .bottom_0()
         .w(px(GUTTER))
         .map(|d| match side {
-            Side::Left => d.right(overhang).items_start().pl(px(2.)),
-            Side::Right => d.left(overhang).items_end().pr(px(2.)),
+            Side::Left => d.right(overhang).items_start().pl(rem_px(2.)),
+            Side::Right => d.left(overhang).items_end().pr(rem_px(2.)),
         })
         .flex()
         .flex_col()
@@ -341,7 +341,7 @@ fn strip(state: &Entity<Sidebar>, key: &'static str, side: Side, t: &Theme) -> A
         .flex()
         .flex_col()
         .items_center()
-        .pt(px(12.))
+        .pt(rem_px(12.))
         .bg(t.panel.opacity(0.5))
         .text_color(t.text_tertiary)
         .hover(|d| d.bg(t.card_hover).text_color(t.text))

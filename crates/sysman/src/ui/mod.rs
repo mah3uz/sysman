@@ -50,6 +50,7 @@ gpui_kit_assets::icon_assets!(
         ChartArea,
         CircleCheck,
         SlidersHorizontal,
+        Blocks,
         X,
         Lock,
         Pencil,
