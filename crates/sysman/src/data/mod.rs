@@ -4,6 +4,7 @@ pub mod groups;
 pub mod hardware;
 pub mod helper;
 pub mod history;
+pub mod insights;
 pub mod live;
 pub mod net;
 pub mod pressure;

@@ -6,5 +6,6 @@ pub mod explorer;
 pub mod gpu;
 pub mod groups;
 pub mod hardware;
+pub mod insights;
 pub mod network;
 pub mod processes;

@@ -94,7 +94,11 @@ gpui_kit_assets::icon_assets!(
         Share,
         Fan,
         Copy,
-        Radio
+        Radio,
+        Sparkles,
+        TrendingUp,
+        ChartColumn,
+        Skull,
     ]
 );
 

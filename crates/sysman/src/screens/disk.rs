@@ -28,7 +28,7 @@ use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source};
 use crate::screens::dashboard::{caption, readout, top_list, whole_disk};
 use crate::screens::disk_map::DiskMap;
-use crate::ui::shell::Tab;
+use crate::ui::shell::{Focus, Tab, take_focus};
 use crate::ui::theme::{Theme, theme};
 use crate::ui::widgets::card::card;
 use crate::ui::widgets::hairline;
@@ -287,6 +287,8 @@ pub struct Disk {
     sensors: Option<HwmonMeta>,
     /// Made on first visit, so the scan starts only when the map is wanted.
     map: Option<Entity<DiskMap>>,
+    /// A mount point another screen asked to show; its disk is selected once the disks are known.
+    focus: Option<String>,
 }
 
 fn initial_view() -> View {
@@ -329,6 +331,10 @@ impl Disk {
             drives: None,
             sensors: None,
             map: None,
+            focus: match take_focus(cx) {
+                Some(Focus::Mount(mount)) => Some(mount),
+                _ => None,
+            },
         };
         this.refresh(cx);
         this
@@ -383,6 +389,16 @@ impl Disk {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let live = self.live.read(cx);
+        if let Some(sample) = live.latest.as_ref()
+            && let (Some(mount), Some(disks), Some(fs)) = (self.focus.take(), &sample.disk, &sample.fs)
+        {
+            for disk in disks.keys().filter(|d| whole_disk(d)) {
+                let held = self.holders.entry(disk.clone()).or_insert_with(|| holders(disk));
+                if mounts_on(disk, fs, held).iter().any(|(m, _)| *m == mount) {
+                    self.selected = Some(disk.clone());
+                }
+            }
+        }
         if self.selected.is_none() {
             self.selected = live
                 .latest

@@ -133,6 +133,11 @@ impl History {
         })
     }
 
+    /// For queries one screen owns.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Buckets over `[from, to)` for a series named by JSON pointer; empty when the series is unknown.
     pub fn series(&self, path: &str, from: i64, to: i64, buckets: u32) -> Result<Vec<Bucket>> {
         let id: Option<i64> = self

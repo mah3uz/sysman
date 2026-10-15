@@ -4,9 +4,9 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyView, App, AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Window, WindowControlArea, div,
-    prelude::FluentBuilder, px,
+    AnyView, App, AppContext, Context, Entity, FontWeight, Global, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
+    WindowControlArea, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
@@ -25,6 +25,7 @@ use crate::screens::explorer::Explorer;
 use crate::screens::gpu::Gpu;
 use crate::screens::groups::Groups;
 use crate::screens::hardware::Hardware;
+use crate::screens::insights::Insights;
 use crate::screens::network::Network;
 use crate::screens::processes::Processes;
 use crate::ui::settings;
@@ -99,19 +100,37 @@ impl Tab {
             Self::Groups => IconName::Layers,
         }
     }
+}
 
-    /// The live number each placeholder shows: label, series path, unit.
-    fn probe(self) -> (&'static str, &'static str, &'static str) {
-        match self {
-            Self::Dashboard => ("CPU", "/cpu/total_pct", "%"),
-            Self::Processes => ("Processes", "/processes/count", ""),
-            Self::Hardware => ("CPU temperature", "/cpu/temp_c", " °C"),
-            Self::Explorer => ("Load (1 min)", "/system/load/0", ""),
-            Self::Insights => ("OOM kills", "/memory/oom_kills_total", ""),
-            Self::Groups => ("Tasks", "/system/tasks_total", ""),
-            Self::Gpu | Self::Energy | Self::Network | Self::Disk => ("Memory used", "/memory/used_pct", "%"),
-        }
+/// What the screen opened by [`navigate`] should select once its data is in.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Focus {
+    /// This instance if it still runs, else the newest process with this command.
+    Process { comm: String, instance: Option<(u32, u64)> },
+    /// The disk that holds this mount point.
+    Mount(String),
+}
+
+struct Navigator(WeakEntity<Shell>);
+
+impl Global for Navigator {}
+
+struct PendingFocus(Option<Focus>);
+
+impl Global for PendingFocus {}
+
+/// Switches tabs from inside a screen; the screen mounted there takes `focus` with [`take_focus`].
+pub fn navigate(tab: Tab, focus: Option<Focus>, cx: &mut App) {
+    cx.set_global(PendingFocus(focus));
+    if let Some(shell) = cx.try_global::<Navigator>().map(|n| n.0.clone()) {
+        shell.update(cx, |shell, cx| shell.select(tab, cx)).ok();
     }
+}
+
+pub fn take_focus(cx: &mut App) -> Option<Focus> {
+    cx.has_global::<PendingFocus>()
+        .then(|| cx.global_mut::<PendingFocus>().0.take())
+        .flatten()
 }
 
 /// Redraw throttle; collection always runs at the daemon's own interval.
@@ -151,6 +170,8 @@ pub struct Shell {
 
 impl Shell {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let navigator = Navigator(cx.weak_entity());
+        cx.set_global(navigator);
         let live = cx.new(|_| Live::default());
         settings::install(live.clone(), cx.entity().downgrade(), Arc::new(systemd::System), cx);
         cx.observe(&live, |_, _, cx| cx.notify()).detach();
@@ -192,7 +213,9 @@ impl Shell {
     /// Only the tabs that show the process table pay for the daemon's scan; Network shows it only via the helper.
     fn sync_feed(&self) {
         let ms = match self.tab {
-            Tab::Dashboard | Tab::Processes | Tab::Disk | Tab::Groups => self.refresh.0.as_millis() as u64,
+            Tab::Dashboard | Tab::Processes | Tab::Disk | Tab::Groups | Tab::Insights => {
+                self.refresh.0.as_millis() as u64
+            }
             Tab::Network if self.helper_running => self.refresh.0.as_millis() as u64,
             _ => 0,
         };
@@ -219,6 +242,9 @@ impl Shell {
             return v.read(cx).ready(cx);
         }
         if let Ok(v) = active.clone().downcast::<Network>() {
+            return v.read(cx).ready(cx);
+        }
+        if let Ok(v) = active.clone().downcast::<Insights>() {
             return v.read(cx).ready(cx);
         }
         active.downcast::<Disk>().is_ok_and(|v| v.read(cx).ready(cx))
@@ -444,7 +470,7 @@ fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App
         Tab::Groups => cx.new(|cx| Groups::new(live, feed, cx)).into(),
         Tab::Explorer => cx.new(|cx| Explorer::new(live, cx)).into(),
         Tab::Hardware => cx.new(|cx| Hardware::new(live, cx)).into(),
-        _ => cx.new(|_| Placeholder { tab, live }).into(),
+        Tab::Insights => cx.new(|cx| Insights::new(live, feed, cx)).into(),
     }
 }
 
@@ -483,71 +509,4 @@ fn banner(cx: &App) -> impl IntoElement {
                 .text_color(t.text_secondary)
                 .child(format!("waiting for sysmand at {path}")),
         )
-}
-
-struct Placeholder {
-    tab: Tab,
-    live: Entity<Live>,
-}
-
-impl Render for Placeholder {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = theme(cx);
-        let (label, path, unit) = self.tab.probe();
-        let value = self.live.read(cx).value(path);
-        let value = value.map_or("–".to_string(), |v| {
-            if v.fract() == 0.0 {
-                format!("{v:.0}{unit}")
-            } else {
-                format!("{v:.1}{unit}")
-            }
-        });
-        div().size_full().p(t.page_padding).child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(14.))
-                .p(t.panel_padding)
-                .rounded(t.panel_radius)
-                .bg(t.panel)
-                .border_color(t.hairline)
-                .map(|mut d| {
-                    let w = Some(t.hairline_width.into());
-                    let edges = &mut d.style().border_widths;
-                    (edges.top, edges.right, edges.bottom, edges.left) = (w, w, w, w);
-                    d
-                })
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(7.))
-                        .text_size(t.panel_title)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(Icon::new(self.tab.icon()).size_4().text_color(t.text_secondary))
-                        .child(self.tab.label()),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .child(
-                            div()
-                                .text_size(t.card_label)
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(t.text_secondary)
-                                .child(label.to_uppercase()),
-                        )
-                        .child(
-                            div()
-                                .text_size(t.card_value)
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .font_features(t.numbers.clone())
-                                .child(value),
-                        ),
-                ),
-        )
-    }
 }

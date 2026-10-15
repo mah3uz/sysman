@@ -22,6 +22,7 @@ pub struct Sparkline {
     gap_s: f64,
     fixed: Option<(f64, SharedString)>,
     caption: Option<SharedString>,
+    fit: bool,
 }
 
 impl Sparkline {
@@ -34,12 +35,19 @@ impl Sparkline {
             gap_s,
             fixed: None,
             caption: None,
+            fit: false,
         }
     }
 
     /// Scale from zero to `max` instead of to the data, and say so.
     pub fn fixed(mut self, max: f64, label: impl Into<SharedString>) -> Self {
         self.fixed = Some((max, label.into()));
+        self
+    }
+
+    /// Scale from the data's lowest to its highest value, so a slow climb fills the strip.
+    pub fn fit(mut self) -> Self {
+        self.fit = true;
         self
     }
 
@@ -61,6 +69,12 @@ impl Sparkline {
             None => visible.iter().map(|b| b.avg).fold(0., f64::max),
         }
         .max(f64::EPSILON);
+        let min = if self.fit {
+            visible.iter().map(|b| b.avg).fold(f64::INFINITY, f64::min).min(max)
+        } else {
+            0.
+        };
+        let range = (max - min).max(f64::EPSILON);
         let (left, width) = (f32::from(bounds.left()), f32::from(bounds.size.width) - 4.);
         let (bottom, height) = (
             f32::from(bounds.bottom()) - 3.,
@@ -69,7 +83,7 @@ impl Sparkline {
         let at = |b: &Bucket| {
             let t = (b.t as f64 + self.width_s / 2.).min(to);
             let x = left + width * ((t - from) / (to - from).max(1.)) as f32;
-            (x, bottom - height * (b.avg / max).clamp(0., 1.) as f32)
+            (x, bottom - height * ((b.avg - min) / range).clamp(0., 1.) as f32)
         };
         let ts: Vec<i64> = visible.iter().map(|b| b.t).collect();
         let mut end = None;
