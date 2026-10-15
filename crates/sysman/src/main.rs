@@ -76,7 +76,7 @@ fn open(shell: Entity<Shell>, cx: &mut App) {
             appears_transparent: true,
             traffic_light_position: None,
         }),
-        app_id: Some("sysman".into()),
+        app_id: Some(app_id().into()),
         window_decorations: Some(WindowDecorations::Client),
         ..Default::default()
     };
@@ -86,4 +86,13 @@ fn open(shell: Entity<Shell>, cx: &mut App) {
     })
     .expect("open window");
     cx.activate(true);
+}
+
+/// Debug builds can take another app id so a compositor rule can route test windows off-screen.
+fn app_id() -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(id) = std::env::var("SYSMAN_DEV_APP_ID") {
+        return id;
+    }
+    "sysman".to_string()
 }
