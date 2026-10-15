@@ -40,8 +40,8 @@ From the AUR, either `sysman` (builds the release from source) or `sysman-bin`
 just install          # builds the sysman package from this checkout, installs it, starts the collector
 ```
 
-The package installs both binaries, the systemd user unit, a desktop entry and
-hicolor icons. `just uninstall` removes it. Maintainers cut a release with
+The package installs the three binaries, the systemd user unit, the helper's
+system unit (not enabled), a desktop entry and hicolor icons. `just uninstall` removes it. Maintainers cut a release with
 `just release`: it tags `v<version>`, builds the source and binary tarballs for
 the GitHub release, and updates both PKGBUILDs and their `.SRCINFO`.
 
@@ -177,11 +177,32 @@ on most systems (RAPL is root-only), disk I/O and open files of other users'
 processes, and per-process network traffic. The app shows them as "not
 permitted" rather than as zero.
 
+The optional privileged helper, `sysman-helper`, reads exactly these and
+nothing else. It is installed as a system service but not enabled; turn it on
+in the app's Settings, or:
+
+```bash
+sudo systemctl enable --now sysman-helper
+```
+
+It runs as root, limited by systemd to the capabilities it needs, with a
+read-only system and no network. It answers only on
+`/run/sysman-helper/helper.sock`, which members of `wheel` can open, and
+`sysmand` picks it up on its next tick. SATA drive health needs
+`smartmontools`; NVMe health, CPU power, other users' I/O and per-process
+network traffic need nothing more. Each source works on its own, and
+`{"cmd":"status"}` says which ones do on this machine:
+
+```bash
+echo '{"cmd":"status"}' | socat - UNIX-CONNECT:/run/sysman-helper/helper.sock | jq .
+```
+
 ## Development
 
 ```
 crates/schema    record types, DB schema and series naming shared by daemon and app
 crates/sysmand   the collector daemon
+crates/sysman-helper  the optional privileged helper (builds an eBPF program; needs clang)
 crates/sysman    the GPUI app
 dist/            systemd unit, desktop entry, file layout, Arch PKGBUILDs
 docs/            app design

@@ -35,8 +35,10 @@ GPUI app (`sysman`) that shows them live and as history.
 Cargo.toml                 workspace
 crates/schema              record types (serde), shared by daemon and app
 crates/sysmand             daemon: config, collectors, scheduler, JSONL, SQLite, socket
+crates/sysman-helper       optional privileged helper: RAPL, /proc I/O, SMART, eBPF network
 crates/sysman              GPUI app (not started)
 dist/sysmand.service       systemd user unit
+dist/sysman-helper.service systemd system unit for the helper (not enabled)
 ```
 
 | What | Path |
@@ -69,6 +71,7 @@ malformed process, a vanished device) is skipped, never a module failure.
 | --- | --- | --- | --- |
 | system, cpu, memory, pressure, hwmon, gpu, disk, net | 2 s | | |
 | processes, cgroups | 10 s | yes | `processes.table` (all rows) is not logged to JSONL |
+| helper | 10 s | | |
 | fs | 30 s | | |
 | netinfo, storage, power | 60 s | yes | |
 
@@ -181,28 +184,58 @@ these and nothing else.
 - **Confinement.** Runs as root, limited by systemd to
   `CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_BPF
   CAP_PERFMON`, with `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
-  `PrivateNetwork`, no writable paths except its runtime directory. It runs a
-  fixed set of read-only queries; it never executes anything a client sends.
+  `PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `ProtectKernelTunables`,
+  `ProtectKernelModules`, `MemoryDenyWriteExecute` and a `@system-service`
+  syscall filter plus `bpf`, no writable paths except its runtime directory.
+  Device nodes stay visible (no `PrivateDevices`/`DevicePolicy`) because SMART
+  opens them. It runs a fixed set of read-only queries; it never executes
+  anything a client sends (the only child is `smartctl` with fixed arguments).
 - **Access.** Unix socket `/run/sysman-helper/helper.sock`, mode 0660, group
-  `wheel` (configurable): only administrators, who could read this data as root
-  anyway. Each client gets at most one answer per second.
+  `wheel` (`--group`; the unit's `Group=` must match, so the socket is created
+  with that group and no `CAP_CHOWN` is needed): only administrators, who could
+  read this data as root anyway. Each connection gets at most one answer per
+  second (later requests wait), at most 8 connections are served at once, and
+  a request line is at most 256 bytes.
 - **Protocol.** Line-delimited JSON, one request per line:
-  `{"cmd":"status"}` → version and which features work; `{"cmd":"read"}` →
-  RAPL energy counters (µJ, per zone, with wrap range), per-process cumulative
-  counters for every pid (`read_bytes`, `write_bytes`, `fds`, eBPF `net_rx_bytes`,
-  `net_tx_bytes`, keyed by pid and start time), and the latest SMART readings.
-  Rates are computed in `sysmand` with its usual `Deltas`.
-- **Sources.** RAPL from `/sys/class/powercap`; `/proc/<pid>/{io,fd}` for every
-  pid; SMART every 10 minutes, NVMe through the admin `Get Log Page` ioctl and
-  SATA through `smartctl -j` when installed, never waking a drive in standby;
-  network from a CO-RE eBPF program (`fexit` on `tcp_sendmsg`,
-  `tcp_cleanup_rbuf`, `udp_sendmsg`, `udp_recvmsg` and their IPv6 variants,
-  loopback excluded) that sums bytes per process in a BPF hash map.
-- **In sysmand.** A `HelperClient` asks once per tick when the socket exists and
-  feeds `cpu.power_w`, the process rows (`read_bps`, `write_bps`, `fds`,
-  `net_rx_bps`, `net_tx_bps`) and `storage.smart`. A `helper` module (10 s)
-  reports `state` (`running`, `stopped`, `error`), `version` and `features`, so
-  the app knows what to offer.
+  `{"cmd":"status"}` → version, `features` (`rapl`, `proc_io`, `smart`, `net`
+  → works) and `errors` (feature → why it is off or partial);
+  `{"cmd":"read"}` → RAPL energy counters (µJ, per powercap zone, with
+  `max_energy_range_uj`), per-process cumulative counters for every pid
+  (`read_bytes`, `write_bytes`, `fds`, eBPF `net_rx_bytes`, `net_tx_bytes`,
+  keyed by pid and `start_ticks`, field 22 of `stat`), and the latest SMART
+  readings by block device. A field whose source is off is absent. The types
+  are `schema::helper::{Request, Status, Reading}`. Rates are computed in
+  `sysmand` with its usual `Deltas`; RAPL power reuses the collector's own
+  wrap-aware step.
+- **Sources.** Each is optional: one that fails is `false` in `features` and
+  never stops the others.
+  - RAPL from `/sys/class/powercap`, read on each request.
+  - `/proc/<pid>/{stat,io,fd}` for every pid, read on each request.
+  - SMART every 10 minutes on its own thread. NVMe through
+    `NVME_IOCTL_ADMIN_CMD` Get Log Page 0x02 (the 512-byte health log); SATA
+    through `smartctl -j -n standby -H -A -i` when installed (30 s limit), so a
+    drive in standby is skipped, not spun up. A runtime-suspended device is not
+    opened. A skipped drive keeps its previous reading.
+  - Network from a CO-RE eBPF program (`src/bpf/net.bpf.c`, skeleton generated
+    by `libbpf-cargo` at build time, so building needs clang; linked against
+    the system libbpf): `fexit` on `tcp_sendmsg`, `tcp_cleanup_rbuf`,
+    `udp_sendmsg`, `udp_recvmsg`, `udpv6_sendmsg` and `udpv6_recvmsg` sums
+    bytes per tgid in a BPF hash map. Loopback is excluded when the socket's
+    destination or bound address, or a UDP message's address, is 127/8, `::1`
+    or v4-mapped 127/8. A `tp_btf/sched_process_exit` program removes a
+    process's entry when it exits, keeping the map bounded and a reused pid at
+    zero. Kernel structs are declared by hand with `preserve_access_index`, so
+    no `vmlinux.h` is needed; the kernel must have BTF.
+- **In sysmand.** A `HelperClient`, shared through `Sys`, asks once per tick
+  when the socket exists: one connection per request, a 500 ms limit, and one
+  reading shared by every module of the tick. It feeds `cpu.power_w` (only
+  when `energy_uj` is not readable directly), the process rows (`read_bps`,
+  `write_bps` and `fds` where the scan could not read them; `net_rx_bps` and
+  `net_tx_bps` for all; matched by pid and start time) and `storage.smart`.
+  The socket's `processes` answer gets the same. A `helper` module (10 s, not
+  snapshotted) reports `state` (`running`, `stopped`, `error`), `version`,
+  `features` and `error`, so the app knows what to offer. Without the socket
+  every other module's output is unchanged.
 - **In the app.** Settings → Privileged data: what the helper reads and why it
   needs privileges, its state, and the toggle. Every card or column that lacks
   this data shows one line saying so and an "Enable…" button that opens
