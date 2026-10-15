@@ -13,3 +13,6 @@
 *~
 .DS_Store
 
+
+# Claude Code local state (worktrees, settings)
+.claude/
