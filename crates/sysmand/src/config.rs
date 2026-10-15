@@ -126,6 +126,12 @@ pub fn data_dir() -> PathBuf {
     xdg("XDG_DATA_HOME", ".local/share").join("sysman")
 }
 
+/// `None` when `XDG_RUNTIME_DIR` is unset or not absolute.
+pub fn socket_path() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
+    dir.is_absolute().then(|| dir.join("sysman.sock"))
+}
+
 fn xdg(var: &str, fallback: &str) -> PathBuf {
     match std::env::var_os(var) {
         // the spec says relative values are invalid and must be ignored

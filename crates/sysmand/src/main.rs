@@ -6,11 +6,13 @@ mod db;
 mod deltas;
 mod jsonl;
 mod pool;
+mod socket;
 mod sys;
 #[cfg(test)]
 mod testutil;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -77,6 +79,19 @@ fn run() -> Result<()> {
         .map(|s| s.name.to_string())
         .collect();
     let mut history = db::Writer::spawn(db::Db::open(&data.join("history.db"), retention, snapshots)?);
+    let hub = Arc::new(socket::Hub::default());
+    match config::socket_path() {
+        // two daemons would interleave writes to the same log and database
+        Some(path) if socket::in_use(&path) => bail!("{} is in use; is another sysmand running?", path.display()),
+        Some(path) => {
+            if let Err(e) = socket::serve(&path, hub.clone(), Sys::host()) {
+                eprintln!("socket: {e:#}; running without it");
+            }
+        }
+        None => eprintln!("XDG_RUNTIME_DIR is not set; running without the socket"),
+    }
+    // every module on the first tick, so slow ones are not missing for up to a minute after a start
+    let mut first = true;
     loop {
         let now = unix_now();
         thread::sleep(Duration::from_secs_f64(base as f64 - now % base as f64));
@@ -86,11 +101,15 @@ fn run() -> Result<()> {
             log.open(today)?;
             let meta = daemon.meta_record();
             log.write(&meta)?;
+            hub.publish(&meta);
             history.send(meta);
         }
         let tick = (now / base as f64).round() as u64;
-        if let Some(record) = daemon.sample_record(Some(tick)) {
+        let due = if first { None } else { Some(tick) };
+        first = false;
+        if let Some(record) = daemon.sample_record(due) {
             log.write(&record)?;
+            hub.publish(&record);
             history.send(record);
         }
     }
