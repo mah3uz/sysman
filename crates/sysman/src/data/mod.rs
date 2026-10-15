@@ -1,4 +1,5 @@
 pub mod desktop;
+pub mod groups;
 pub mod history;
 pub mod live;
 pub mod net;

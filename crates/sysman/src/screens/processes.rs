@@ -353,7 +353,7 @@ fn signal_name(signal: Signal) -> &'static str {
 }
 
 /// An app icon from its `.desktop` file, else a generic glyph; kernel threads have no command line.
-fn process_icon(p: &Process, icons: &IconIndex, size: f32, cx: &App) -> AnyElement {
+pub(crate) fn process_icon(p: &Process, icons: &IconIndex, size: f32, cx: &App) -> AnyElement {
     let glyph = if p.cmdline.is_empty() {
         IconName::Cpu
     } else {
@@ -591,7 +591,7 @@ struct HierarchyMode(bool);
 impl Global for HierarchyMode {}
 
 /// Built once per run on the background executor.
-struct Icons(Arc<IconIndex>);
+pub(crate) struct Icons(pub(crate) Arc<IconIndex>);
 
 impl Global for Icons {}
 
