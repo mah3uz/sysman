@@ -1,0 +1,14 @@
+post_install() {
+  echo '==> Start the collector for your user:'
+  echo '      systemctl --user enable --now sysmand'
+}
+
+post_upgrade() {
+  echo '==> Restart the collector to run the new version:'
+  echo '      systemctl --user restart sysmand'
+}
+
+pre_remove() {
+  echo '==> Stop the collector first if it is running:'
+  echo '      systemctl --user disable --now sysmand'
+}

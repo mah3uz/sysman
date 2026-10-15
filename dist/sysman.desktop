@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=sysman
+GenericName=System Monitor
+Comment=Live and recorded CPU, memory, GPU, disk, network and sensor metrics
+Exec=sysman
+Icon=sysman
+Terminal=false
+StartupNotify=true
+StartupWMClass=sysman
+Categories=System;Monitor;
+Keywords=cpu;gpu;memory;ram;disk;network;temperature;sensors;process;task manager;performance;

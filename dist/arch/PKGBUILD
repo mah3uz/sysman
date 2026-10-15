@@ -1,0 +1,66 @@
+# Maintainer: Mahfuz Shaikh <mah3uz@gmail.com>
+
+pkgname=sysman-git
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc='System monitor for Linux: a metrics collector daemon with crash log and history, and a GPUI app'
+arch=('x86_64')
+license=('MIT')
+depends=(
+  'gcc-libs' 'glibc'
+  'iproute2'
+  'libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'libxau' 'libxdmcp'
+  'wayland' 'libglvnd' 'vulkan-icd-loader'
+  'adwaita-fonts'
+)
+makedepends=('cargo' 'git' 'librsvg')
+optdepends=('nvidia-utils: NVIDIA GPU metrics through NVML')
+provides=('sysman')
+conflicts=('sysman')
+install=sysman.install
+# builds the committed state of the checkout this PKGBUILD lives in
+source=("sysman::git+file://$(realpath "$startdir/../..")")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd sysman
+  printf '%s.r%s.g%s' \
+    "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd sysman
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd sysman
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p sysmand -p sysman
+}
+
+check() {
+  cd sysman
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo test --frozen --release --workspace
+}
+
+package() {
+  cd sysman
+  install -Dm755 target/release/sysmand target/release/sysman -t "$pkgdir/usr/bin/"
+  sed 's|^ExecStart=.*|ExecStart=/usr/bin/sysmand|' dist/sysmand.service \
+    | install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/sysmand.service"
+  install -Dm644 dist/sysman.desktop -t "$pkgdir/usr/share/applications/"
+  install -Dm644 assets/logo.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/sysman.svg"
+  local size
+  for size in 16 22 24 32 48 64 128 256 512; do
+    install -dm755 "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps"
+    rsvg-convert -w "$size" -h "$size" assets/logo.svg \
+      -o "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/sysman.png"
+  done
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
+}

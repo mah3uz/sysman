@@ -31,6 +31,17 @@ kernel documentation and are marked unverified.
 
 ## Install
 
+### Arch Linux
+
+```bash
+just install          # builds dist/arch/PKGBUILD, installs it with pacman, starts the collector
+```
+
+The package (`sysman-git`) installs both binaries, the systemd user unit, a
+desktop entry and hicolor icons. `just uninstall` removes it.
+
+### From source
+
 Requires Linux, a recent stable Rust (edition 2024) and, for the app, a Wayland
 or X11 session with Vulkan.
 
@@ -167,14 +178,15 @@ permitted" rather than as zero.
 crates/schema    record types, DB schema and series naming shared by daemon and app
 crates/sysmand   the collector daemon
 crates/sysman    the GPUI app
-dist/            systemd unit
+dist/            systemd unit, desktop entry, Arch PKGBUILD
 docs/            app design
 ```
 
 ```bash
-cargo test                 # the whole workspace
-cargo clippy --all-targets
-cargo fmt
+just check                 # format check, clippy, tests, single-gpui guard
+just run                   # the app from this checkout
+just once                  # one collector sample, nothing written
+just                       # every recipe
 ```
 
 Collectors read `/proc` and `/sys` through a root that tests point at fixture
