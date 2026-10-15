@@ -22,3 +22,4 @@
 /dist/arch/*/pkg/
 /dist/arch/*/*.tar.gz
 /dist/arch/*/*.pkg.tar.*
+/dist/arch/*/.SRCINFO
