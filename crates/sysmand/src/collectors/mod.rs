@@ -2,6 +2,7 @@ pub mod cgroups;
 pub mod cpu;
 pub mod disk;
 pub mod fs;
+pub mod gpu;
 pub mod hwmon;
 pub mod memory;
 pub mod net;

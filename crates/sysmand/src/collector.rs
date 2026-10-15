@@ -49,6 +49,12 @@ pub const MODULES: &[Spec] = &[
         build: |o, sys| Ok(Box::new(collectors::fs::Fs::new(options(o)?, sys)?)),
     },
     Spec {
+        name: "gpu",
+        default_interval: 2,
+        snapshot: false,
+        build: |o, sys| Ok(Box::new(collectors::gpu::Gpu::new(options(o)?, sys)?)),
+    },
+    Spec {
         name: "hwmon",
         default_interval: 2,
         snapshot: false,

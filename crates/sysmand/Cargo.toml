@@ -10,6 +10,7 @@ schema.workspace = true
 anyhow.workspace = true
 jiff.workspace = true
 libc.workspace = true
+nvml-wrapper.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true
 serde.workspace = true

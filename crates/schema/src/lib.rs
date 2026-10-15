@@ -7,6 +7,7 @@ pub mod cgroups;
 pub mod cpu;
 pub mod disk;
 pub mod fs;
+pub mod gpu;
 pub mod hwmon;
 pub mod memory;
 pub mod net;
@@ -56,6 +57,8 @@ pub struct Sample {
     pub disk: Option<disk::Disk>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fs: Option<fs::Fs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<gpu::Gpu>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hwmon: Option<hwmon::Hwmon>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

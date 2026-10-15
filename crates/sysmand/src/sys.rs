@@ -25,6 +25,13 @@ impl Sys {
         self.root.join(path.strip_prefix("/").unwrap_or(path))
     }
 
+    /// `path` resolved under the root, written into a reusable buffer.
+    pub fn path_into(&self, buf: &mut PathBuf, path: &str) {
+        buf.clear();
+        buf.push(&self.root);
+        buf.push(path.strip_prefix('/').unwrap_or(path));
+    }
+
     /// The trimmed contents of a file that must exist.
     pub fn read(&self, path: impl AsRef<Path>) -> Result<String> {
         let full = self.path(path);
