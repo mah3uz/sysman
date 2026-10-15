@@ -1,9 +1,9 @@
 # sysman — design
 
 A Linux system monitor: a collector daemon (`sysmand`) that records metrics, and a
-GPUI app (`sysman`) that shows them live and as history. It replaces the Python
-`sensor-log` collector, which stays as the reference implementation (outside the
-repository) until `sysmand` has run alongside it and been compared.
+GPUI app (`sysman`) that shows them live and as history. It replaced the Python
+`sensor-log` collector on 2026-10-15; that collector's history (from 2026-10-12)
+was loaded into `history.db` by hand and the collector was removed.
 
 ## Decisions
 
@@ -12,7 +12,7 @@ repository) until `sysmand` has run alongside it and been compared.
 | Order | Collector first (done apart from per-process history), then the app. |
 | History | SQLite, plus a small fsync'd JSONL file kept as crash evidence. |
 | Live data | The daemon serves it over a Unix socket. |
-| Paths | XDG directories. Existing `sensor-log` data is not migrated. |
+| Paths | XDG directories. The product has no import feature. |
 | DB model | Numeric series with rollups; list-shaped data as JSON snapshots. |
 | Processes | Every process recorded every 10 s (48 h raw, 7 days of 1-minute rollups); top N in the crash log; the full table also on the socket. |
 | JSONL | Today and yesterday, uncompressed. |
@@ -207,10 +207,9 @@ daemon at startup with a message naming them.
 
 ## Status and next steps
 
-1. ~~Core, modules, SQLite, socket.~~ Done; 160+ tests.
-2. Per-process history (in progress).
-3. Install the service; run alongside sensor-log for a day; compare; switch off
-   sensor-log.
+1. ~~Core, modules, SQLite, socket.~~ Done.
+2. ~~Per-process history.~~ Done.
+3. ~~Install the service; retire sensor-log.~~ Done 2026-10-15.
 4. The app: screen design from the mac-performance-monitor reference, then build.
 5. Alerts in `sysmand`; DMS bar widget.
 
