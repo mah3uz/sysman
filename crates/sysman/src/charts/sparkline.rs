@@ -35,6 +35,8 @@ pub struct Sparkline {
     fixed: Option<(f64, SharedString)>,
     caption: Option<SharedString>,
     fit: bool,
+    /// Height, and the room above the line for the caption.
+    size: (Pixels, Pixels),
 }
 
 impl Sparkline {
@@ -57,7 +59,14 @@ impl Sparkline {
             fixed: None,
             caption: None,
             fit: false,
+            size: (HEIGHT, TOP),
         }
+    }
+
+    /// A strip `height` tall with no caption room, for a table row.
+    pub fn compact(mut self, height: Pixels) -> Self {
+        self.size = (height, px(0.));
+        self
     }
 
     /// Scale from zero to `max` instead of to the data, and say so.
@@ -123,7 +132,7 @@ impl Sparkline {
         let (left, width) = (f32::from(bounds.left()), f32::from(bounds.size.width) - 4.);
         let (bottom, height) = (
             f32::from(bounds.bottom()) - 3.,
-            f32::from(bounds.size.height - TOP) - 4.,
+            f32::from(bounds.size.height - self.size.1) - 4.,
         );
         let at = |b: &Bucket| {
             let t = (b.t as f64 + self.width_s / 2.).min(to);
@@ -169,7 +178,7 @@ impl RenderOnce for Sparkline {
         div()
             .relative()
             .w_full()
-            .h(HEIGHT)
+            .h(self.size.0)
             .when_some(caption, |d, caption| {
                 d.child(
                     div()
