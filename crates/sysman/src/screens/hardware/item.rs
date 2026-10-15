@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, canvas, div, point, prelude::FluentBuilder, px, size,
+    AnyElement, App, ClipboardItem, Context, Div, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, canvas, div, point, prelude::FluentBuilder, px, size,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{Icon, Sizable};
@@ -14,7 +14,7 @@ use schema::cpu::CpuMeta;
 use schema::hwmon::HwmonMeta;
 
 use super::{Hardware, Selection, capacity_bar, category_icon, module, props_table, ring};
-use crate::charts::format::{Unit, bytes};
+use crate::charts::format::{self, TempUnit, Unit, bytes};
 use crate::charts::stacked_bar::{Segment, stacked_bar};
 use crate::charts::trend::{ChartState, TrendChart, YScale};
 use crate::data::hardware::item::{
@@ -24,7 +24,7 @@ use crate::data::hardware::{Category, Item, Node, gib, temp_axis_top, threads_pe
 use crate::data::history::{Bucket, History, bucket_width, db_path};
 use crate::data::source::{Combine, Source};
 use crate::ui::shell::Tab;
-use crate::ui::theme::{Theme, theme};
+use crate::ui::theme::{Theme, rem_px, theme};
 use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::panel::{frame, heading};
 use crate::ui::widgets::range::{Range, range_picker_of, remember};
@@ -136,18 +136,18 @@ fn load_colour(load: f64, t: &Theme) -> Hsla {
     }
 }
 
-fn status_chip(text: impl Into<SharedString>, colour: Hsla) -> Div {
+fn status_chip(t: &Theme, text: impl Into<SharedString>, colour: Hsla) -> Div {
     div()
         .flex()
         .flex_row()
         .items_center()
-        .h(px(20.))
-        .px(px(8.))
+        .h(rem_px(20.))
+        .px(rem_px(8.))
         .rounded_full()
         .bg(colour.opacity(0.14))
         .text_color(colour)
-        .text_size(px(11.))
-        .font_weight(FontWeight::MEDIUM)
+        .text_size(rem_px(11.))
+        .font_weight(t.weight_medium)
         .whitespace_nowrap()
         .child(text.into())
 }
@@ -187,17 +187,17 @@ fn kv(rows: Vec<(&str, Option<String>)>, t: &Theme) -> Div {
         .min_w_0()
         .flex()
         .flex_col()
-        .gap(px(6.))
-        .text_size(px(12.))
+        .gap(rem_px(6.))
+        .text_size(rem_px(12.))
         .children(rows.into_iter().filter_map(|(label, value)| {
             Some(
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(12.))
+                    .gap(rem_px(12.))
                     .child(
                         div()
-                            .w(px(130.))
+                            .w(rem_px(130.))
                             .flex_shrink_0()
                             .text_color(t.text_secondary)
                             .child(label.to_owned()),
@@ -214,8 +214,8 @@ fn big(value: String, label: &str, colour: Hsla, t: &Theme) -> Div {
         .gap(px(1.))
         .child(
             div()
-                .text_size(px(20.))
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(rem_px(20.))
+                .font_weight(t.weight_semibold)
                 .text_color(colour)
                 .font_features(t.numbers.clone())
                 .child(value),
@@ -404,7 +404,9 @@ impl Hardware {
             .y(spec.y)
             .height(px(spec.height));
         if spec.unit == Unit::Celsius {
-            chart = chart.compact_axis(px(40.), |v| format!("{v:.0}°"));
+            chart = chart.compact_axis(rem_px(40.).to_pixels(theme(cx).text_size.rem_size()), |v| {
+                format!("{:.0}°", TempUnit::current().convert(v))
+            });
         }
         for (data, colour, label) in lines {
             chart = chart.line(data, colour, label);
@@ -437,8 +439,8 @@ impl Hardware {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(5.))
-                        .child(div().size(px(8.)).rounded_full().bg(*colour))
+                        .gap(rem_px(5.))
+                        .child(div().size(rem_px(8.)).rounded_full().bg(*colour))
                         .child(div().text_color(t.text_secondary).child(label.clone()))
                         .child(
                             div()
@@ -484,29 +486,29 @@ impl Hardware {
         let header = frame(cx)
             .flex_row()
             .items_start()
-            .gap(px(14.))
+            .gap(rem_px(14.))
             .child(
                 div()
-                    .size(px(52.))
+                    .size(rem_px(52.))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(12.))
+                    .rounded(rem_px(12.))
                     .bg(t.blue.opacity(0.14))
-                    .child(Icon::new(category_icon(c)).size(px(28.)).text_color(t.blue)),
+                    .child(Icon::new(category_icon(c)).size(rem_px(28.)).text_color(t.blue)),
             )
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(5.))
+                    .gap(rem_px(5.))
                     .flex_1()
                     .min_w_0()
                     .child(
                         div()
-                            .text_size(px(18.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(rem_px(18.))
+                            .font_weight(t.weight_semibold)
                             .child(node.title.clone()),
                     )
                     .children(
@@ -514,7 +516,7 @@ impl Hardware {
                             .into_iter()
                             .flatten()
                             .reduce(|a, b| if a == b { a } else { format!("{a} · {b}") })
-                            .map(|s| div().text_size(px(12.)).text_color(t.text_secondary).child(s)),
+                            .map(|s| div().text_size(rem_px(12.)).text_color(t.text_secondary).child(s)),
                     )
                     .when(!chips.is_empty(), |d| {
                         d.child(
@@ -522,7 +524,7 @@ impl Hardware {
                                 .flex()
                                 .flex_row()
                                 .flex_wrap()
-                                .gap(px(6.))
+                                .gap(rem_px(6.))
                                 .pt(px(2.))
                                 .children(chips),
                         )
@@ -533,7 +535,7 @@ impl Hardware {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(rem_px(8.))
                     .flex_shrink_0()
                     .when(charts, |d| {
                         d.child(range_picker_of(
@@ -583,7 +585,7 @@ impl Hardware {
             .flex_row()
             .items_center()
             .gap(px(4.))
-            .text_size(px(12.))
+            .text_size(rem_px(12.))
             .text_color(t.blue)
             .cursor_pointer()
             .hover(|d| d.opacity(0.75))
@@ -621,23 +623,25 @@ impl Hardware {
             (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
         };
         let mut chips = vec![status_chip(
+            t,
             format!("{} cores · {} threads", mine.len() as u32 / tpc, mine.len()),
             t.blue,
         )];
         if let Some(l) = mean_load {
-            chips.push(status_chip(format!("{l:.0}% load"), t.green));
+            chips.push(status_chip(t, format!("{l:.0}% load"), t.green));
         }
         if let Some(mhz_now) = cpu.and_then(|c| c.avg_mhz) {
-            chips.push(status_chip(mhz(mhz_now as f64), t.purple));
+            chips.push(status_chip(t, mhz(mhz_now as f64), t.purple));
         }
         if let Some(temp) = cpu.and_then(|c| c.temp_c) {
             chips.push(status_chip(
-                format!("{temp:.0} °C"),
+                t,
+                format::temperature(temp, 0),
                 super::heat_colour(crate::data::hardware::heat(temp, None)),
             ));
         }
         if let Some(gov) = &meta.governor {
-            chips.push(status_chip(gov.clone(), t.text_secondary));
+            chips.push(status_chip(t, gov.clone(), t.text_secondary));
         }
 
         let mut body = Vec::new();
@@ -665,7 +669,7 @@ impl Hardware {
                 .child(
                     div()
                         .text_size(t.small_caption)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(t.weight_semibold)
                         .pb(px(3.))
                         .child(title),
                 )
@@ -679,13 +683,13 @@ impl Hardware {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(8.))
-                        .h(px(STRIP_ROW))
+                        .gap(rem_px(8.))
+                        .h(rem_px(STRIP_ROW))
                         .child(
                             div()
-                                .w(px(26.))
-                                .text_size(px(9.))
-                                .line_height(px(STRIP_ROW))
+                                .w(rem_px(26.))
+                                .text_size(rem_px(9.))
+                                .line_height(rem_px(STRIP_ROW))
                                 .text_color(t.text_tertiary)
                                 .font_features(t.numbers.clone())
                                 .child(c.to_string()),
@@ -727,11 +731,11 @@ impl Hardware {
                         )
                         .child(
                             div()
-                                .w(px(34.))
+                                .w(rem_px(34.))
                                 .flex()
                                 .justify_end()
-                                .text_size(px(9.))
-                                .line_height(px(STRIP_ROW))
+                                .text_size(rem_px(9.))
+                                .line_height(rem_px(STRIP_ROW))
                                 .text_color(now.map_or(t.text_tertiary, |l| load_colour(l.max(30.), t)))
                                 .font_features(t.numbers.clone())
                                 .child(now.map_or("–".into(), |l| format!("{l:.0}%"))),
@@ -743,12 +747,13 @@ impl Hardware {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(6.))
+                .gap(rem_px(6.))
                 .text_size(t.small_caption)
                 .text_color(t.text_secondary)
                 .child("Idle")
                 .children(
-                    [0., 25., 50., 75., 100.].map(|l| div().w(px(18.)).h(px(7.)).rounded(px(2.)).bg(load_colour(l, t))),
+                    [0., 25., 50., 75., 100.]
+                        .map(|l| div().w(rem_px(18.)).h(rem_px(7.)).rounded(px(2.)).bg(load_colour(l, t))),
                 )
                 .child("Saturated")
                 .child(div().flex_1())
@@ -800,7 +805,7 @@ impl Hardware {
         let best = ranking.iter().flatten().copied().max();
         let tree =
             pane(IconName::ListTree, "Topology and cache", None, cx)
-                .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child(format!(
+                .child(div().text_size(rem_px(12.)).font_weight(t.weight_medium).child(format!(
                     "{} package{}, {} cores, {} threads",
                     meta.topology.packages.unwrap_or(1),
                     if meta.topology.packages.unwrap_or(1) == 1 {
@@ -822,17 +827,17 @@ impl Hardware {
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(6.))
-                        .pl(px(10.))
+                        .gap(rem_px(6.))
+                        .pl(rem_px(10.))
                         .border_l_2()
                         .border_color(t.blue.opacity(0.4))
                         .child(
                             div()
                                 .flex()
                                 .flex_row()
-                                .gap(px(8.))
-                                .text_size(px(12.))
-                                .child(div().font_weight(FontWeight::SEMIBOLD).child(
+                                .gap(rem_px(8.))
+                                .text_size(rem_px(12.))
+                                .child(div().font_weight(t.weight_semibold).child(
                                     if meta.topology.l3_groups.is_empty() {
                                         "Cores".to_owned()
                                     } else {
@@ -859,11 +864,11 @@ impl Hardware {
                                             .iter()
                                             .any(|c| ranking.get(*c as usize).copied().flatten() == best);
                                     div()
-                                        .px(px(6.))
+                                        .px(rem_px(6.))
                                         .py(px(2.))
                                         .rounded(px(4.))
                                         .bg(if preferred { t.orange.opacity(0.18) } else { t.card })
-                                        .text_size(px(10.))
+                                        .text_size(rem_px(10.))
                                         .font_features(t.numbers.clone())
                                         .text_color(if preferred { t.orange } else { t.text_secondary })
                                         .child(threads.iter().map(u32::to_string).collect::<Vec<_>>().join("/"))
@@ -920,24 +925,25 @@ impl Hardware {
         let p = |f: &str| path(&["gpu", "devices", slot, f]);
         let mut chips = Vec::new();
         if let Some(d) = d {
-            chips.push(status_chip(format!("{} · {}", d.driver, d.backend), t.blue));
+            chips.push(status_chip(t, format!("{} · {}", d.driver, d.backend), t.blue));
             if let Some(u) = d.util_pct {
-                chips.push(status_chip(format!("{u:.0}% busy"), t.green));
+                chips.push(status_chip(t, format!("{u:.0}% busy"), t.green));
             }
             if let Some(temp) = d.temp_c {
                 chips.push(status_chip(
-                    format!("{temp:.0} °C"),
+                    t,
+                    format::temperature(temp, 0),
                     super::heat_colour(crate::data::hardware::heat(temp, None)),
                 ));
             }
             if let Some(w) = d.power_w {
-                chips.push(status_chip(Unit::Watts.format(w), t.orange));
+                chips.push(status_chip(t, Unit::Watts.format(w), t.orange));
             }
             if let Some(ps) = &d.pstate {
-                chips.push(status_chip(ps.clone(), t.purple));
+                chips.push(status_chip(t, ps.clone(), t.purple));
             }
             if let Some(ps) = &d.power_state {
-                chips.push(status_chip(format!("PCI {ps}"), t.text_secondary));
+                chips.push(status_chip(t, format!("PCI {ps}"), t.text_secondary));
             }
         }
         let mut body = Vec::new();
@@ -1044,7 +1050,7 @@ impl Hardware {
                             div()
                                 .flex()
                                 .flex_row()
-                                .text_size(px(12.))
+                                .text_size(rem_px(12.))
                                 .child(div().flex_1().child(name))
                                 .child(
                                     div()
@@ -1079,7 +1085,7 @@ impl Hardware {
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(24.))
+                    .gap(rem_px(24.))
                     .children(link_now.map(|(g, w)| big(format!("Gen {g} x{w}"), "now", t.blue, t)))
                     .children(link_max.map(|(g, w)| big(format!("Gen {g} x{w}"), "maximum", t.text, t))),
             );
@@ -1110,14 +1116,14 @@ impl Hardware {
             body.push(
                 pane(IconName::TriangleAlert, "Throttling", None, cx)
                     .child(if reasons.is_empty() {
-                        div().flex().flex_row().child(status_chip("Not throttled", t.green))
+                        div().flex().flex_row().child(status_chip(t, "Not throttled", t.green))
                     } else {
                         div()
                             .flex()
                             .flex_row()
                             .flex_wrap()
-                            .gap(px(6.))
-                            .children(reasons.iter().map(|r| status_chip(r.replace('_', " "), t.orange)))
+                            .gap(rem_px(6.))
+                            .children(reasons.iter().map(|r| status_chip(t, r.replace('_', " "), t.orange)))
                     })
                     .child(
                         div()
@@ -1141,35 +1147,44 @@ impl Hardware {
             )
             .child(if procs.is_empty() {
                 div()
-                    .text_size(px(12.))
+                    .text_size(rem_px(12.))
                     .text_color(t.text_secondary)
                     .child("No processes are using this GPU.")
             } else {
-                div().flex().flex_col().gap(px(5.)).children(procs.into_iter().map(|p| {
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap(px(10.))
-                        .text_size(px(12.))
-                        .font_features(t.numbers.clone())
-                        .child(div().flex_1().min_w_0().truncate().child(p.comm.clone()))
-                        .child(div().w(px(56.)).text_color(t.text_tertiary).child(p.pid.to_string()))
-                        .child(
-                            div()
-                                .w(px(44.))
-                                .flex()
-                                .justify_end()
-                                .child(p.util_pct.map_or("–".into(), |u| format!("{u:.0}%"))),
-                        )
-                        .child(
-                            div()
-                                .w(px(70.))
-                                .flex()
-                                .justify_end()
-                                .text_color(t.text_secondary)
-                                .child(p.mem_bytes.map_or("–".into(), |b| bytes(b as f64))),
-                        )
-                }))
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(rem_px(5.))
+                    .children(procs.into_iter().map(|p| {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(rem_px(10.))
+                            .text_size(rem_px(12.))
+                            .font_features(t.numbers.clone())
+                            .child(div().flex_1().min_w_0().truncate().child(p.comm.clone()))
+                            .child(
+                                div()
+                                    .w(rem_px(56.))
+                                    .text_color(t.text_tertiary)
+                                    .child(p.pid.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .w(rem_px(44.))
+                                    .flex()
+                                    .justify_end()
+                                    .child(p.util_pct.map_or("–".into(), |u| format!("{u:.0}%"))),
+                            )
+                            .child(
+                                div()
+                                    .w(rem_px(70.))
+                                    .flex()
+                                    .justify_end()
+                                    .text_color(t.text_secondary)
+                                    .child(p.mem_bytes.map_or("–".into(), |b| bytes(b as f64))),
+                            )
+                    }))
             })
             .into_any_element(),
         );
@@ -1226,16 +1241,18 @@ impl Hardware {
         let mut chips = Vec::new();
         if let Some(d) = drive {
             chips.push(status_chip(
+                t,
                 if d.rotational { "Hard disk" } else { "Solid state" },
                 t.blue,
             ));
         }
         if let Some(state) = sample.and_then(|s| s.storage.as_ref()?.devices.get(name)?.state.clone()) {
             let colour = if state == "live" { t.green } else { t.orange };
-            chips.push(status_chip(state, colour));
+            chips.push(status_chip(t, state, colour));
         }
         if let Some(s) = smart {
             chips.push(status_chip(
+                t,
                 if s.passed { "Health passed" } else { "Health failing" },
                 if s.passed { t.green } else { t.red },
             ));
@@ -1243,12 +1260,13 @@ impl Hardware {
         if let Some(temp) = temp_now {
             let limit = readings.first().and_then(|r| r.crit.or(r.max));
             chips.push(status_chip(
-                format!("{temp:.0} °C"),
+                t,
+                format::temperature(temp, 0),
                 super::heat_colour(crate::data::hardware::heat(temp, limit)),
             ));
         }
         if let Some(io) = io {
-            chips.push(status_chip(format!("{:.0}% busy", io.busy_pct), t.purple));
+            chips.push(status_chip(t, format!("{:.0}% busy", io.busy_pct), t.purple));
         }
 
         let mut body = Vec::new();
@@ -1318,14 +1336,14 @@ impl Hardware {
         let fs_pane =
             pane(IconName::Folder, "File systems", Some(volumes.len().to_string()), cx).child(if volumes.is_empty() {
                 div()
-                    .text_size(px(12.))
+                    .text_size(rem_px(12.))
                     .text_color(t.text_secondary)
                     .child("No mounted file systems on this drive.")
             } else {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(12.))
+                    .gap(rem_px(12.))
                     .children(volumes.into_iter().map(|(mount, f)| {
                         let frac = f.used_bytes as f64 / (f.used_bytes + f.avail_bytes).max(1) as f64;
                         let colour = if frac > 0.9 {
@@ -1345,7 +1363,7 @@ impl Hardware {
                                     .flex()
                                     .flex_row()
                                     .items_center()
-                                    .gap(px(8.))
+                                    .gap(rem_px(8.))
                                     .child(self.link(format!("vol-{mount}"), mount.clone(), target, cx))
                                     .child(
                                         div()
@@ -1384,7 +1402,7 @@ impl Hardware {
                         div()
                             .flex()
                             .flex_row()
-                            .gap(px(24.))
+                            .gap(rem_px(24.))
                             .child(big(
                                 if s.passed { "Passed".into() } else { "Failing".into() },
                                 "drive's own verdict",
@@ -1478,9 +1496,9 @@ impl Hardware {
             t.blue
         };
         let chips = vec![
-            status_chip(f.fstype.clone(), t.blue),
-            status_chip(format!("{:.0}% full", frac * 100.), colour),
-            status_chip(format!("{} free", gib(f.avail_bytes)), t.green),
+            status_chip(t, f.fstype.clone(), t.blue),
+            status_chip(t, format!("{:.0}% full", frac * 100.), colour),
+            status_chip(t, format!("{} free", gib(f.avail_bytes)), t.green),
         ];
         let holders = self.inventory.as_ref().map(|i| i.holders.clone()).unwrap_or_default();
         let disk = disk_of(&f.device, &holders);
@@ -1490,7 +1508,7 @@ impl Hardware {
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(24.))
+                    .gap(rem_px(24.))
                     .child(big(gib(f.used_bytes), "used", colour, t))
                     .child(big(gib(f.avail_bytes), "free", t.text, t)),
             )
@@ -1546,6 +1564,7 @@ impl Hardware {
         let mut chips = Vec::new();
         if let Some(s) = &state {
             chips.push(status_chip(
+                t,
                 s.clone(),
                 if s == "up" { t.green } else { t.text_secondary },
             ));
@@ -1555,6 +1574,7 @@ impl Hardware {
             .or_else(|| dev.and_then(|d| d.speed_mbps).map(|s| s as u64))
         {
             chips.push(status_chip(
+                t,
                 if m >= 1000 {
                     format!("{} Gb/s", m as f64 / 1000.)
                 } else {
@@ -1564,19 +1584,20 @@ impl Hardware {
             ));
         }
         if let Some(d) = dev.and_then(|d| d.driver.clone()) {
-            chips.push(status_chip(d, t.purple));
+            chips.push(status_chip(t, d, t.purple));
         }
         let signal = now
             .and_then(|n| n.signal_dbm)
             .or_else(|| dev.and_then(|d| d.signal_dbm));
         if let Some(s) = signal {
             chips.push(status_chip(
+                t,
                 format!("{s:.0} dBm · {}", crate::data::net::signal_quality(s)),
                 t.teal,
             ));
         }
         if info.is_some_and(|i| i.default_routes.iter().any(|r| r.interface.as_deref() == Some(name))) {
-            chips.push(status_chip("Default route", t.orange));
+            chips.push(status_chip(t, "Default route", t.orange));
         }
         let mut body = Vec::new();
         let traffic = Spec::new(
@@ -1610,12 +1631,12 @@ impl Hardware {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(10.))
+                .gap(rem_px(10.))
                 .children(session.map(|(rx, tx)| {
                     div()
                         .flex()
                         .flex_row()
-                        .gap(px(24.))
+                        .gap(rem_px(24.))
                         .child(big(bytes(rx as f64), "received this session", t.blue, t))
                         .child(big(bytes(tx as f64), "sent this session", t.orange, t))
                 }))
@@ -1679,7 +1700,7 @@ impl Hardware {
             let clean = errs.iter().all(|(_, v)| *v == 0);
             body.push(
                 pane(IconName::TriangleAlert, "Errors and drops", Some("since boot".into()), cx)
-                    .child(div().flex().flex_row().gap(px(24.)).children(errs.map(|(l, v)| {
+                    .child(div().flex().flex_row().gap(rem_px(24.)).children(errs.map(|(l, v)| {
                         big(v.to_string(), l, if v > 0 { t.orange } else { t.text }, t)
                     })))
                     .child(div().text_size(t.small_caption).text_color(t.text_secondary).child(if clean {
@@ -1751,14 +1772,19 @@ impl Hardware {
         let used_frac = m.used_bytes as f64 / m.total_bytes.max(1) as f64;
         let mut chips = vec![
             status_chip(
+                t,
                 format!("{} GB installed", crate::data::hardware::installed_gib(m.total_bytes)),
                 t.blue,
             ),
-            status_chip(format!("{:.0}% in use", used_frac * 100.), t.purple),
-            status_chip(format!("{} available", gib(m.available_bytes)), t.green),
+            status_chip(t, format!("{:.0}% in use", used_frac * 100.), t.purple),
+            status_chip(t, format!("{} available", gib(m.available_bytes)), t.green),
         ];
         if m.swap_total_bytes > 0 {
-            chips.push(status_chip(format!("{} swap used", gib(m.swap_used_bytes)), t.orange));
+            chips.push(status_chip(
+                t,
+                format!("{} swap used", gib(m.swap_used_bytes)),
+                t.orange,
+            ));
         }
         let mut body = Vec::new();
         let total = m.total_bytes as f64;
@@ -1862,7 +1888,7 @@ impl Hardware {
                     .flex()
                     .flex_row()
                     .flex_wrap()
-                    .gap(px(12.))
+                    .gap(rem_px(12.))
                     .children(dimms.iter().map(|c| {
                         self.link(
                             format!("dimm-{c}"),
@@ -1882,7 +1908,7 @@ impl Hardware {
                     div()
                         .flex()
                         .flex_row()
-                        .text_size(px(12.))
+                        .text_size(rem_px(12.))
                         .child(div().flex_1().child("Swap"))
                         .child(
                             div()
@@ -1895,7 +1921,7 @@ impl Hardware {
         } else {
             swap = swap.child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(rem_px(12.))
                     .text_color(t.text_secondary)
                     .child("No swap is configured."),
             );
@@ -1968,7 +1994,7 @@ impl Hardware {
         };
         let chips = counts
             .iter()
-            .map(|(k, n)| status_chip(format!("{n} {}", noun(k)), t.blue))
+            .map(|(k, n)| status_chip(t, format!("{n} {}", noun(k)), t.blue))
             .collect();
         let tiles: Vec<AnyElement> = readings
             .iter()
@@ -1978,7 +2004,7 @@ impl Hardware {
                     "temp" => (
                         Unit::Celsius,
                         super::heat_colour(crate::data::hardware::heat(r.value.unwrap_or(25.), r.crit.or(r.max))),
-                        |v| format!("{v:.1} °C"),
+                        |v| format::temperature(v, 1),
                     ),
                     "fan" => (Unit::Count, t.teal, |v| {
                         if v == 0. { "Off".into() } else { format!("{v:.0} rpm") }
@@ -2004,7 +2030,7 @@ impl Hardware {
                     .gap(px(4.))
                     .flex_1()
                     .min_w_0()
-                    .p(px(10.))
+                    .p(rem_px(10.))
                     .rounded(t.sub_radius)
                     .bg(t.card)
                     .child(
@@ -2012,14 +2038,14 @@ impl Hardware {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.))
+                            .gap(rem_px(6.))
                             .text_size(t.small_caption)
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(t.weight_semibold)
                                     .child(r.label.clone()),
                             )
                             .child(
@@ -2040,7 +2066,7 @@ impl Hardware {
                         {
                             Some(chart) => chart.into_any_element(),
                             None => div()
-                                .h(px(84.))
+                                .h(rem_px(84.))
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -2057,10 +2083,10 @@ impl Hardware {
                     .into_any_element()
             })
             .collect();
-        let mut grid_rows = div().flex().flex_col().gap(px(10.));
+        let mut grid_rows = div().flex().flex_col().gap(rem_px(10.));
         let mut it = tiles.into_iter().peekable();
         while it.peek().is_some() {
-            let mut row = div().flex().flex_row().gap(px(10.));
+            let mut row = div().flex().flex_row().gap(rem_px(10.));
             for _ in 0..3 {
                 row = row.child(div().flex_1().min_w_0().flex().children(it.next()));
             }
@@ -2099,12 +2125,12 @@ impl Hardware {
         };
         let aspect = aspect_label(d.width, d.height);
         let density = d.size_mm.and_then(|(w, h)| ppi(d.width, d.height, w, h));
-        let mut chips = vec![status_chip(if d.builtin { "Built-in" } else { "External" }, t.blue)];
+        let mut chips = vec![status_chip(t, if d.builtin { "Built-in" } else { "External" }, t.blue)];
         if let Some(m) = crate::data::hardware::display_mode(d) {
-            chips.push(status_chip(m, t.purple));
+            chips.push(status_chip(t, m, t.purple));
         }
         if let Some(a) = &aspect {
-            chips.push(status_chip(a.clone(), t.teal));
+            chips.push(status_chip(t, a.clone(), t.teal));
         }
         // To scale: the panel's physical shape, sized to the pane.
         let (w_mm, h_mm) = d.size_mm.unwrap_or((d.width.max(16), d.height.max(9)));
@@ -2114,19 +2140,19 @@ impl Hardware {
             div()
                 .flex()
                 .flex_row()
-                .gap(px(24.))
+                .gap(rem_px(24.))
                 .items_center()
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .items_center()
-                        .gap(px(6.))
+                        .gap(rem_px(6.))
                         .child(
                             div()
-                                .w(px(box_w))
-                                .h(px(box_h))
-                                .rounded(px(6.))
+                                .w(rem_px(box_w))
+                                .h(rem_px(box_h))
+                                .rounded(rem_px(6.))
                                 .border_2()
                                 .border_color(t.text.opacity(0.35))
                                 .bg(t.blue.opacity(0.08))
@@ -2137,8 +2163,8 @@ impl Hardware {
                                 .gap(px(2.))
                                 .child(
                                     div()
-                                        .text_size(px(22.))
-                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(rem_px(22.))
+                                        .font_weight(t.weight_semibold)
                                         .font_features(t.numbers.clone())
                                         .child(d.size_mm.map_or("–".into(), |(w, h)| {
                                             format!("{:.1}″", crate::data::hardware::diagonal_in(w, h))
@@ -2178,11 +2204,11 @@ impl Hardware {
             cx,
         )
         .child(
-            div().flex().flex_row().flex_wrap().gap(px(6.)).children(
+            div().flex().flex_row().flex_wrap().gap(rem_px(6.)).children(
                 d.resolutions
                     .iter()
                     .enumerate()
-                    .map(|(i, r)| status_chip(r.clone(), if i == 0 { t.blue } else { t.text_secondary })),
+                    .map(|(i, r)| status_chip(t, r.clone(), if i == 0 { t.blue } else { t.text_secondary })),
             ),
         );
         Page {
@@ -2210,20 +2236,16 @@ impl Hardware {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.))
-            .pl(px(depth as f32 * 16.))
-            .text_size(px(12.))
+            .gap(rem_px(6.))
+            .pl(rem_px(depth as f32 * 16.))
+            .text_size(rem_px(12.))
             .when(depth > 0, |d| {
                 d.child(Icon::new(IconName::ChevronRight).xsmall().text_color(t.text_tertiary))
             })
             .child(match (!current).then_some(target) {
                 Some(target) => self.link(format!("tree-{address}"), label, target, cx),
                 None => div()
-                    .font_weight(if current {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
+                    .font_weight(if current { t.weight_semibold } else { t.weight_body })
                     .child(label)
                     .into_any_element(),
             })
@@ -2246,13 +2268,14 @@ impl Hardware {
         };
         let mut chips = Vec::new();
         if let Some(s) = &u.speed_mbps {
-            chips.push(status_chip(format!("{s} Mb/s"), t.blue));
+            chips.push(status_chip(t, format!("{s} Mb/s"), t.blue));
         }
         if let Some(v) = &u.version {
-            chips.push(status_chip(format!("USB {}", v.trim()), t.purple));
+            chips.push(status_chip(t, format!("USB {}", v.trim()), t.purple));
         }
         if let Some(p) = &u.power {
             chips.push(status_chip(
+                t,
                 p.clone(),
                 if p == "active" { t.green } else { t.text_secondary },
             ));
@@ -2309,13 +2332,14 @@ impl Hardware {
         };
         let mut chips = Vec::new();
         if let Some(c) = &p.class_name {
-            chips.push(status_chip(c.clone(), t.blue));
+            chips.push(status_chip(t, c.clone(), t.blue));
         }
         if let Some(d) = &p.driver {
-            chips.push(status_chip(d.clone(), t.purple));
+            chips.push(status_chip(t, d.clone(), t.purple));
         }
         if let Some(ps) = &p.power_state {
             chips.push(status_chip(
+                t,
                 ps.clone(),
                 if ps == "D0" { t.green } else { t.text_secondary },
             ));
@@ -2356,7 +2380,7 @@ impl Hardware {
                         div()
                             .flex()
                             .flex_row()
-                            .gap(px(24.))
+                            .gap(rem_px(24.))
                             .children(p.link.clone().map(|l| big(l, "now", t.blue, t)))
                             .children(p.max_link.clone().map(|l| big(l, "maximum", t.text, t))),
                     )
@@ -2427,13 +2451,14 @@ impl Hardware {
             .or_else(|| s.get("STATUS").map(str::to_owned));
         let mut chips = Vec::new();
         if let Some(st) = &status {
-            chips.push(status_chip(st.clone(), t.blue));
+            chips.push(status_chip(t, st.clone(), t.blue));
         }
         if let Some(c) = charge {
-            chips.push(status_chip(format!("{c:.0}% charged"), t.green));
+            chips.push(status_chip(t, format!("{c:.0}% charged"), t.green));
         }
         if let Some(online) = now.and_then(|n| n.online).or_else(|| s.get("ONLINE")?.parse().ok()) {
             chips.push(status_chip(
+                t,
                 if online == 1 { "Online" } else { "Offline" },
                 if online == 1 { t.green } else { t.text_secondary },
             ));
@@ -2447,7 +2472,7 @@ impl Hardware {
             div()
                 .flex()
                 .flex_row()
-                .gap(px(28.))
+                .gap(rem_px(28.))
                 .items_center()
                 .when(charge.is_some(), |d| {
                     d.child(
@@ -2526,7 +2551,7 @@ impl Hardware {
                 pane(IconName::ChartLine, "History", None, cx)
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(rem_px(12.))
                             .text_color(t.text_secondary)
                             .child("This device reports no charge level over time, so there is no history to chart."),
                     )

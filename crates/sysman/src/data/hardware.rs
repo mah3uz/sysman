@@ -1406,8 +1406,8 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
         memory.push(
             Node::new(format!("Module at {address}"))
                 .item(Item::Dimm(s.chip.clone()))
-                .sub(Some(format!("{:.1} °C", s.value)))
-                .prop("Temperature", Some(format!("{:.1} °C", s.value)))
+                .sub(Some(crate::charts::format::temperature(s.value, 1)))
+                .prop("Temperature", Some(crate::charts::format::temperature(s.value, 1)))
                 .prop("Sensor", Some(s.chip.clone())),
         );
     }
@@ -1528,8 +1528,11 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
                 let value = if s.domain == Domain::Fans {
                     format!("{:.0} rpm", s.value)
                 } else {
-                    let limit = s.limit.map(|l| format!(" (limit {l:.0} °C)")).unwrap_or_default();
-                    format!("{:.1} °C{limit}", s.value)
+                    let limit = s
+                        .limit
+                        .map(|l| format!(" (limit {})", crate::charts::format::temperature(l, 0)))
+                        .unwrap_or_default();
+                    format!("{}{limit}", crate::charts::format::temperature(s.value, 1))
                 };
                 node.props.push((s.label.clone(), value));
             }
