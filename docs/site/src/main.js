@@ -1,6 +1,13 @@
+import { init as initAnalytics } from '@plausible-analytics/tracker'
 import { createApp } from 'vue'
 import App from './App.vue'
 import './style.css'
+
+initAnalytics({
+  domain: 'sysman.asmechanics.com',
+  endpoint: 'https://plus.testtlc.com/api/event',
+  outboundLinks: true,
+})
 
 const observer =
   'IntersectionObserver' in window
