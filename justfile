@@ -36,6 +36,7 @@ fmt:
 lint:
     cargo fmt --check
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets --release -- -D warnings
 
 # Fail if two copies of gpui end up in the app's dependency graph
 gpui-guard:
