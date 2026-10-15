@@ -1,7 +1,7 @@
 # Maintainer: Mahfuz Shaikh <mah3uz@gmail.com>
 
 pkgname=sysman-git
-pkgver=0.1.0.r0.g0000000
+pkgver=0.1.0.r25.gc3519b6
 pkgrel=1
 pkgdesc='System monitor for Linux: a metrics collector daemon with crash log and history, and a GPUI app'
 arch=('x86_64')
@@ -18,6 +18,8 @@ optdepends=('nvidia-utils: NVIDIA GPU metrics through NVML')
 provides=('sysman')
 conflicts=('sysman')
 install=sysman.install
+# makepkg's LTO turns the bundled SQLite into GCC bitcode that Rust's linker cannot read
+options=('!lto')
 # builds the committed state of the checkout this PKGBUILD lives in
 source=("sysman::git+file://$(realpath "$startdir/../..")")
 sha256sums=('SKIP')
