@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, AppContext, ClipboardItem, Context, Div, Entity, FontWeight, Hsla, InteractiveElement,
-    IntoElement, ParentElement, PathBuilder, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    Window, canvas, div, point, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, ClipboardItem, Context, Div, Entity, Hsla, InteractiveElement, IntoElement,
+    ParentElement, PathBuilder, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, canvas,
+    div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -21,7 +21,7 @@ use schema::cpu::CpuMeta;
 use schema::hwmon::HwmonMeta;
 use schema::{Meta, Sample};
 
-use crate::charts::format::Unit;
+use crate::charts::format::{self, TempUnit, Unit};
 use crate::charts::trend::{ChartState, TrendChart, YScale};
 use crate::data::hardware::{
     self, Category, Domain, Inventory, Node, Section, Sensor, clock_time, gib, installed_gib, product_title,
@@ -32,7 +32,7 @@ use crate::data::live::Live;
 use crate::data::source::{Combine, Source};
 use crate::screens::dashboard::Groups;
 use crate::ui::shell::Tab;
-use crate::ui::theme::{Theme, theme};
+use crate::ui::theme::{Theme, rem_px, theme};
 use crate::ui::widgets::hairline;
 use crate::ui::widgets::range::{Range, remembered};
 use crate::ui::widgets::sidebar::{self, Side, Sidebar, Widths};
@@ -432,16 +432,16 @@ impl Hardware {
     fn open_sensors(&mut self, domain: Domain, window: &mut Window, cx: &mut Context<Self>) {
         let live = self.live.clone();
         let sheet = cx.new(|cx| SensorSheet::new(live, domain, cx));
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let t = theme(cx);
             dialog
-                .w(px(480.))
+                .w(rem_px(480.).to_pixels(window.rem_size()))
                 .title(
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(7.))
+                        .gap(rem_px(7.))
                         .child(Icon::new(domain_icon(domain)).small().text_color(t.text_secondary))
                         .child(domain.title()),
                 )
@@ -473,12 +473,12 @@ impl Hardware {
         .join(", ");
         let chip = div()
             .id("hw-updated")
-            .h(px(24.))
-            .px(px(9.))
+            .h(rem_px(24.))
+            .px(rem_px(9.))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(5.))
+            .gap(rem_px(5.))
             .rounded_full()
             .bg(t.card_hover)
             .whitespace_nowrap();
@@ -508,9 +508,9 @@ impl Hardware {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(14.))
+            .gap(rem_px(14.))
             .px(t.page_padding)
-            .py(px(12.))
+            .py(rem_px(12.))
             .bg(t.card.opacity(0.6))
             .border_b_1()
             .border_color(t.hairline)
@@ -523,13 +523,13 @@ impl Hardware {
                     .min_w_0()
                     .child(
                         div()
-                            .text_size(px(17.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(rem_px(17.))
+                            .font_weight(t.weight_semibold)
                             .child("Hardware"),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(rem_px(12.))
                             .text_color(t.text_secondary)
                             .whitespace_nowrap()
                             .overflow_hidden()
@@ -543,10 +543,10 @@ impl Hardware {
             )
             .child(
                 div()
-                    .w(px(260.))
+                    .w(rem_px(260.))
                     .flex_shrink_0()
                     .children(self.search.as_ref().map(|search| {
-                        div().rounded(px(7.)).bg(t.card_hover).px(px(4.)).child(
+                        div().rounded(rem_px(7.)).bg(t.card_hover).px(px(4.)).child(
                             Input::new(search)
                                 .appearance(false)
                                 .small()
@@ -605,26 +605,26 @@ impl Hardware {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(7.))
-                .h(px(32.))
-                .px(px(8.))
-                .rounded(px(6.))
+                .gap(rem_px(7.))
+                .h(rem_px(32.))
+                .px(rem_px(8.))
+                .rounded(rem_px(6.))
                 .when(selected, |d| d.bg(t.selection))
                 .when(!selected, |d| d.hover(|d| d.bg(t.card)))
         };
         let mut list = div().flex().flex_col().gap(px(1.)).child(
             row("hw-overview".into(), self.selected == Selection::Overview)
-                .child(div().w(px(14.)))
+                .child(div().w(rem_px(14.)))
                 .child(Icon::new(IconName::LayoutDashboard).small().text_color(t.text))
-                .child(div().text_size(px(13.)).child("Overview"))
+                .child(div().text_size(rem_px(13.)).child("Overview"))
                 .on_click(cx.listener(|this, _, _, cx| this.select(Selection::Overview, cx))),
         );
         let visible = filter(&self.sections, &self.query);
         if searching && visible.is_empty() {
             list = list.child(
                 div()
-                    .px(px(8.))
-                    .py(px(6.))
+                    .px(rem_px(8.))
+                    .py(rem_px(6.))
                     .text_size(t.caption)
                     .text_color(t.text_secondary)
                     .child("No matches"),
@@ -640,7 +640,7 @@ impl Hardware {
                     .child(
                         div()
                             .id(("hw-chevron", si))
-                            .w(px(14.))
+                            .w(rem_px(14.))
                             .flex()
                             .justify_center()
                             .when(has_nodes, |d| {
@@ -663,8 +663,8 @@ impl Hardware {
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(rem_px(13.))
+                            .font_weight(t.weight_semibold)
                             .child(c.title()),
                     )
                     .when(has_nodes, |d| d.child(badge(section.nodes.len(), t)))
@@ -678,8 +678,8 @@ impl Hardware {
                             format!("hw-node-{si}-{n}").into(),
                             self.selected == Selection::Node(c, n),
                         )
-                        .h(px(if node.subtitle.is_some() { 38. } else { 26. }))
-                        .pl(px(52.))
+                        .h(rem_px(if node.subtitle.is_some() { 38. } else { 26. }))
+                        .pl(rem_px(52.))
                         .child(
                             div()
                                 .flex()
@@ -688,7 +688,7 @@ impl Hardware {
                                 .flex_1()
                                 .child(
                                     div()
-                                        .text_size(px(12.))
+                                        .text_size(rem_px(12.))
                                         .whitespace_nowrap()
                                         .overflow_hidden()
                                         .text_ellipsis()
@@ -715,7 +715,7 @@ impl Hardware {
 
 fn badge(n: usize, t: &Theme) -> impl IntoElement + use<> {
     div()
-        .px(px(6.))
+        .px(rem_px(6.))
         .rounded_full()
         .bg(t.card_hover)
         .text_size(t.small_caption)
@@ -788,17 +788,17 @@ impl Hardware {
             .flex()
             .flex_row()
             .items_start()
-            .gap(px(14.))
+            .gap(rem_px(14.))
             .child(
                 div()
-                    .size(px(44.))
+                    .size(rem_px(44.))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(10.))
+                    .rounded(rem_px(10.))
                     .bg(t.blue.opacity(0.12))
-                    .child(Icon::new(category_icon(c)).size(px(26.)).text_color(t.blue)),
+                    .child(Icon::new(category_icon(c)).size(rem_px(26.)).text_color(t.blue)),
             )
             .child(
                 div()
@@ -807,8 +807,8 @@ impl Hardware {
                     .gap(px(4.))
                     .flex_1()
                     .min_w_0()
-                    .child(div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(title))
-                    .children(subtitle.map(|s| div().text_size(px(12.)).text_color(t.text_secondary).child(s)))
+                    .child(div().text_size(rem_px(17.)).font_weight(t.weight_semibold).child(title))
+                    .children(subtitle.map(|s| div().text_size(rem_px(12.)).text_color(t.text_secondary).child(s)))
                     .child(
                         div()
                             .text_size(t.small_caption)
@@ -835,7 +835,7 @@ impl Hardware {
         div()
             .flex()
             .flex_col()
-            .gap(px(18.))
+            .gap(rem_px(18.))
             .child(crumbs)
             .child(heading)
             .children(section.note.clone().filter(|_| only.is_none()).map(|note| {
@@ -843,11 +843,11 @@ impl Hardware {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.))
-                    .p(px(10.))
+                    .gap(rem_px(8.))
+                    .p(rem_px(10.))
                     .rounded(t.sub_radius)
                     .bg(gpui::hsla(0.14, 0.9, 0.5, 0.12))
-                    .text_size(px(12.))
+                    .text_size(rem_px(12.))
                     .text_color(t.text_secondary)
                     .child(Icon::new(IconName::Info).small())
                     .child(note)
@@ -855,7 +855,7 @@ impl Hardware {
             .when(nodes.is_empty(), |d| {
                 d.child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(rem_px(12.))
                         .text_color(t.text_secondary)
                         .child(if needle.is_empty() {
                             "Nothing reported for this section."
@@ -866,7 +866,7 @@ impl Hardware {
             })
             .children(nodes.into_iter().map(|(i, node)| {
                 let props = props_table(&node.props, &needle, t);
-                let mut panel = card_frame(t).gap(px(10.));
+                let mut panel = card_frame(t).gap(rem_px(10.));
                 if only.is_none() {
                     panel = panel.child(
                         div()
@@ -874,11 +874,11 @@ impl Hardware {
                             .flex()
                             .flex_row()
                             .items_baseline()
-                            .gap(px(8.))
+                            .gap(rem_px(8.))
                             .child(
                                 div()
                                     .text_size(t.panel_title)
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(t.weight_semibold)
                                     .child(node.title.clone()),
                             )
                             .children(
@@ -898,7 +898,7 @@ impl Hardware {
 fn props_table(props: &[(String, String)], needle: &str, t: &Theme) -> impl IntoElement + use<> {
     if props.is_empty() {
         return div()
-            .text_size(px(12.))
+            .text_size(rem_px(12.))
             .text_color(t.text_secondary)
             .child("No details reported.");
     }
@@ -911,15 +911,15 @@ fn props_table(props: &[(String, String)], needle: &str, t: &Theme) -> impl Into
             div()
                 .flex()
                 .flex_row()
-                .gap(px(12.))
-                .px(px(6.))
+                .gap(rem_px(12.))
+                .px(rem_px(6.))
                 .py(px(3.))
-                .rounded(px(5.))
-                .text_size(px(12.))
+                .rounded(rem_px(5.))
+                .text_size(rem_px(12.))
                 .when(hit, |d| d.bg(gpui::hsla(0.14, 0.9, 0.5, 0.22)))
                 .child(
                     div()
-                        .w(px(LABEL_WIDTH))
+                        .w(rem_px(LABEL_WIDTH))
                         .flex_shrink_0()
                         .flex()
                         .justify_end()
@@ -956,18 +956,18 @@ fn facts(rows: Vec<(&str, Option<String>)>, label_width: f32, t: &Theme) -> impl
     div()
         .flex()
         .flex_col()
-        .gap(px(5.))
-        .text_size(px(12.))
+        .gap(rem_px(5.))
+        .text_size(rem_px(12.))
         .children(rows.into_iter().filter_map(|(label, value)| {
             let value = value?;
             Some(
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(12.))
+                    .gap(rem_px(12.))
                     .child(
                         div()
-                            .w(px(label_width))
+                            .w(rem_px(label_width))
                             .flex_shrink_0()
                             .text_color(t.text_secondary)
                             .child(label.to_owned()),
@@ -978,7 +978,7 @@ fn facts(rows: Vec<(&str, Option<String>)>, label_width: f32, t: &Theme) -> impl
 }
 
 fn capacity_bar(fraction: f64, tint: Hsla, height: f32, t: &Theme) -> impl IntoElement + use<> {
-    div().w_full().h(px(height)).rounded_full().bg(t.card_hover).child(
+    div().w_full().h(rem_px(height)).rounded_full().bg(t.card_hover).child(
         div()
             .h_full()
             .rounded_full()
@@ -989,7 +989,7 @@ fn capacity_bar(fraction: f64, tint: Hsla, height: f32, t: &Theme) -> impl IntoE
 
 fn pending(text: &str, t: &Theme) -> AnyElement {
     div()
-        .text_size(px(12.))
+        .text_size(rem_px(12.))
         .text_color(t.text_secondary)
         .child(text.to_owned())
         .into_any_element()
@@ -1003,17 +1003,17 @@ impl Hardware {
     /// A titled overview card whose "Details" link opens the category.
     fn card(&self, icon: IconName, title: &str, target: Category, cx: &mut Context<Self>) -> Div {
         let t = theme(cx);
-        card_frame(t).flex_1().min_w_0().gap(px(14.)).child(
+        card_frame(t).flex_1().min_w_0().gap(rem_px(14.)).child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(7.))
+                .gap(rem_px(7.))
                 .child(Icon::new(icon).small().text_color(t.text_secondary))
                 .child(
                     div()
                         .text_size(t.panel_title)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(t.weight_semibold)
                         .child(title.to_owned()),
                 )
                 .child(div().flex_1())
@@ -1093,11 +1093,11 @@ impl Hardware {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(10.))
+                .gap(rem_px(10.))
                 .child(
                     div()
                         .text_size(t.card_value)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(t.weight_semibold)
                         .child(self.title()),
                 )
                 .child(facts(
@@ -1142,9 +1142,9 @@ impl Hardware {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(8.))
-                .p(px(8.))
-                .min_w(px(110.))
+                .gap(rem_px(8.))
+                .p(rem_px(8.))
+                .min_w(rem_px(110.))
                 .rounded(t.sub_radius)
                 .bg(t.card)
                 .border_1()
@@ -1154,7 +1154,7 @@ impl Hardware {
                         .flex()
                         .flex_col()
                         .gap(px(1.))
-                        .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).child(title))
+                        .child(div().text_size(rem_px(12.)).font_weight(t.weight_semibold).child(title))
                         .child(
                             div()
                                 .text_size(t.small_caption)
@@ -1170,7 +1170,7 @@ impl Hardware {
                         .children((0..cores.div_ceil(per_row)).map(|r| {
                             div().flex().flex_row().gap(px(3.)).children(
                                 (0..per_row.min(cores - r * per_row))
-                                    .map(|_| div().size(px(12.)).rounded(px(3.)).bg(colour.opacity(0.85))),
+                                    .map(|_| div().size(rem_px(12.)).rounded(px(3.)).bg(colour.opacity(0.85))),
                             )
                         })),
                 )
@@ -1235,32 +1235,32 @@ impl Hardware {
                 .flex_row()
                 .items_center()
                 .gap(px(4.))
-                .child(div().size(px(9.)).rounded(px(2.)).bg(colour))
+                .child(div().size(rem_px(9.)).rounded(px(2.)).bg(colour))
                 .child(label)
         };
         card.child(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(10.))
-                .child(div().flex().flex_row().flex_wrap().gap(px(8.)).children(blocks))
+                .gap(rem_px(10.))
+                .child(div().flex().flex_row().flex_wrap().gap(rem_px(8.)).children(blocks))
                 .child(
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(8.))
-                        .px(px(12.))
-                        .py(px(8.))
+                        .gap(rem_px(8.))
+                        .px(rem_px(12.))
+                        .py(rem_px(8.))
                         .rounded(t.sub_radius)
                         .bg(t.blue.opacity(0.12))
                         .border_1()
                         .border_color(t.blue.opacity(0.35))
-                        .text_size(px(12.))
+                        .text_size(rem_px(12.))
                         .child(Icon::new(IconName::Zap).small().text_color(t.blue))
                         .child(
                             div()
-                                .font_weight(FontWeight::MEDIUM)
+                                .font_weight(t.weight_medium)
                                 .child(cpu.driver.clone().unwrap_or_else(|| "Frequency".into())),
                         )
                         .child(div().flex_1())
@@ -1271,7 +1271,7 @@ impl Hardware {
                         .flex()
                         .flex_row()
                         .flex_wrap()
-                        .gap(px(12.))
+                        .gap(rem_px(12.))
                         .text_size(t.small_caption)
                         .text_color(t.text_secondary)
                         .children(
@@ -1280,11 +1280,7 @@ impl Hardware {
                                 .iter()
                                 .map(|(label, colour, _)| legend_item(*colour, format!("{label} core").into())),
                         )
-                        .children(
-                            cpu.model
-                                .clone()
-                                .map(|m| div().font_weight(FontWeight::SEMIBOLD).child(m)),
-                        ),
+                        .children(cpu.model.clone().map(|m| div().font_weight(t.weight_semibold).child(m))),
                 ),
         )
     }
@@ -1305,20 +1301,20 @@ impl Hardware {
             let lo = dimms.iter().copied().fold(f64::INFINITY, f64::min);
             let hi = dimms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             if (hi - lo).abs() < 0.05 {
-                format!("{hi:.1} °C")
+                format::temperature(hi, 1)
             } else {
-                format!("{lo:.1}–{hi:.1} °C")
+                format!("{:.1}–{}", TempUnit::current().convert(lo), format::temperature(hi, 1))
             }
         });
         card.child(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(10.))
+                .gap(rem_px(10.))
                 .child(
                     div()
-                        .text_size(px(17.))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(rem_px(17.))
+                        .font_weight(t.weight_semibold)
                         .child(format!("{} GB", installed_gib(m.total_bytes))),
                 )
                 .child(capacity_bar(
@@ -1378,7 +1374,7 @@ impl Hardware {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(12.))
+                .gap(rem_px(12.))
                 .children(volumes.into_iter().take(5).map(|(mount, f)| {
                     div()
                         .flex()
@@ -1388,11 +1384,11 @@ impl Hardware {
                             div()
                                 .flex()
                                 .flex_row()
-                                .text_size(px(12.))
+                                .text_size(rem_px(12.))
                                 .child(
                                     div()
                                         .flex_1()
-                                        .font_weight(FontWeight::MEDIUM)
+                                        .font_weight(t.weight_medium)
                                         .child(format!("{mount}  ({})", f.fstype)),
                                 )
                                 .child(
@@ -1437,7 +1433,7 @@ impl Hardware {
                 .flex()
                 .flex_row()
                 .flex_wrap()
-                .gap(px(14.))
+                .gap(rem_px(14.))
                 .children(inv.displays.iter().map(|d| {
                     let aspect = if d.width > 0 {
                         d.height as f32 / d.width as f32
@@ -1447,15 +1443,15 @@ impl Hardware {
                     // Thumbnails are sized by resolution, so a 4K panel draws larger than a 1440p one.
                     let w = 90. + 50. * d.width as f32 / max_w as f32;
                     div()
-                        .w(px(150.))
+                        .w(rem_px(150.))
                         .flex()
                         .flex_col()
-                        .gap(px(5.))
+                        .gap(rem_px(5.))
                         .child(
                             div()
-                                .w(px(w))
-                                .h(px(w * aspect))
-                                .rounded(px(5.))
+                                .w(rem_px(w))
+                                .h(rem_px(w * aspect))
+                                .rounded(rem_px(5.))
                                 .bg(t.card_hover)
                                 .border_2()
                                 .border_color(t.text.opacity(0.3))
@@ -1465,20 +1461,20 @@ impl Hardware {
                                 .when(is_main(&d.connector), |b| {
                                     b.child(
                                         div()
-                                            .h(px(14.))
-                                            .px(px(5.))
+                                            .h(rem_px(14.))
+                                            .px(rem_px(5.))
                                             .rounded_full()
                                             .bg(t.blue.opacity(0.25))
                                             .text_size(t.small_caption)
-                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .font_weight(t.weight_semibold)
                                             .child("Main"),
                                     )
                                 }),
                         )
                         .child(
                             div()
-                                .text_size(px(12.))
-                                .font_weight(FontWeight::MEDIUM)
+                                .text_size(rem_px(12.))
+                                .font_weight(t.weight_medium)
                                 .whitespace_nowrap()
                                 .overflow_hidden()
                                 .text_ellipsis()
@@ -1542,7 +1538,7 @@ impl Hardware {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(16.))
+                    .gap(rem_px(16.))
                     .child(ring(health.map(|h| h / 100.), colour, t))
                     .child(
                         div()
@@ -1551,8 +1547,8 @@ impl Hardware {
                             .gap(px(4.))
                             .children(health.map(|h| {
                                 div()
-                                    .text_size(px(12.))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(rem_px(12.))
+                                    .font_weight(t.weight_medium)
                                     .child(format!("{h:.0}% of design capacity"))
                             }))
                             .child(facts(
@@ -1592,10 +1588,10 @@ impl Hardware {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(10.))
+                .gap(rem_px(10.))
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(rem_px(12.))
                         .text_color(t.text_secondary)
                         .child("No system battery: this computer runs on mains power."),
                 )
@@ -1609,7 +1605,7 @@ impl Hardware {
                             div()
                                 .flex()
                                 .flex_row()
-                                .text_size(px(12.))
+                                .text_size(rem_px(12.))
                                 .child(div().flex_1().child(name))
                                 .child(
                                     div()
@@ -1750,7 +1746,7 @@ impl Hardware {
                     }
                 } else {
                     (
-                        format!("{:.0}°C", hottest.value),
+                        format::temperature(hottest.value, 0),
                         heat_colour(hardware::heat(hottest.value, hottest.limit)),
                     )
                 };
@@ -1762,12 +1758,14 @@ impl Hardware {
                     chart
                         .unit(Unit::Count)
                         .y(YScale::Fixed(0., hardware::fan_axis_top(peak)))
-                        .compact_axis(px(34.), |v| format!("{v:.0}"))
+                        .compact_axis(rem_px(34.).to_pixels(t.text_size.rem_size()), |v| format!("{v:.0}"))
                 } else {
                     chart
                         .unit(Unit::Celsius)
                         .y(YScale::Fixed(0., hardware::temp_axis_top(peak)))
-                        .compact_axis(px(30.), |v| format!("{v:.0}°"))
+                        .compact_axis(rem_px(30.).to_pixels(t.text_size.rem_size()), |v| {
+                            format!("{:.0}°", TempUnit::current().convert(v))
+                        })
                 };
                 div()
                     .id(SharedString::from(format!("sensor-{}", domain.title())))
@@ -1781,9 +1779,9 @@ impl Hardware {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.))
+                            .gap(rem_px(6.))
                             .text_size(t.small_caption)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .child(Icon::new(domain_icon(domain)).xsmall().text_color(t.text_secondary))
                             .child(
                                 div()
@@ -1801,10 +1799,10 @@ impl Hardware {
                     .into_any_element()
             })
             .collect();
-        let mut grid = div().flex().flex_col().gap(px(14.));
+        let mut grid = div().flex().flex_col().gap(rem_px(14.));
         let mut blocks = blocks.into_iter().peekable();
         while blocks.peek().is_some() {
-            let mut row = div().flex().flex_row().gap(px(14.));
+            let mut row = div().flex().flex_row().gap(rem_px(14.));
             for _ in 0..SENSOR_COLUMNS {
                 row = row.child(div().flex_1().min_w_0().children(blocks.next()));
             }
@@ -1822,7 +1820,7 @@ impl Hardware {
 fn caption_upper(text: &str, t: &Theme) -> impl IntoElement + use<> {
     div()
         .text_size(t.card_label)
-        .font_weight(FontWeight::SEMIBOLD)
+        .font_weight(t.weight_semibold)
         .text_color(t.text_secondary)
         .child(text.to_uppercase())
 }
@@ -1832,14 +1830,14 @@ fn ring(fraction: Option<f64>, colour: Hsla, t: &Theme) -> impl IntoElement + us
     let track = t.card_hover;
     let label = fraction.map_or("–".to_owned(), |f| format!("{:.0}%", f * 100.));
     div()
-        .size(px(72.))
+        .size(rem_px(72.))
         .flex_shrink_0()
         .relative()
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(12.))
-        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(rem_px(12.))
+        .font_weight(t.weight_semibold)
         .font_features(t.numbers.clone())
         .child(
             canvas(
@@ -1925,7 +1923,7 @@ impl Render for Hardware {
                             .bg(t.card.opacity(0.6))
                             .border_r_1()
                             .border_color(t.hairline)
-                            .p(px(10.))
+                            .p(rem_px(10.))
                             .child(sidebar)
                             .into_any_element()
                     }),
@@ -1973,7 +1971,7 @@ impl Render for SensorSheet {
         div()
             .flex()
             .flex_col()
-            .gap(px(8.))
+            .gap(rem_px(8.))
             .child(div().text_size(t.caption).text_color(t.text_secondary).child(format!(
                 "{} {noun}{}, live",
                 list.len(),
@@ -1982,11 +1980,11 @@ impl Render for SensorSheet {
             .child(
                 div()
                     .id("sensor-sheet")
-                    .max_h(px(420.))
+                    .max_h(rem_px(420.))
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .gap(px(7.))
+                    .gap(rem_px(7.))
                     .children(list.into_iter().map(|s| {
                         let heat = hardware::heat(s.value, s.limit);
                         let colour = if fans { t.teal } else { heat_colour(heat) };
@@ -2000,17 +1998,17 @@ impl Render for SensorSheet {
                                 (s.value / 3000.).clamp(0., 1.),
                             )
                         } else {
-                            (format!("{:.1} °C", s.value), heat.max(0.02))
+                            (format::temperature(s.value, 1), heat.max(0.02))
                         };
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(12.))
-                            .text_size(px(12.))
+                            .gap(rem_px(12.))
+                            .text_size(rem_px(12.))
                             .child(
                                 div()
-                                    .w(px(200.))
+                                    .w(rem_px(200.))
                                     .flex_shrink_0()
                                     .flex()
                                     .flex_col()
@@ -2025,7 +2023,7 @@ impl Render for SensorSheet {
                             .child(div().flex_1().child(capacity_bar(fraction, colour, 7., t)))
                             .child(
                                 div()
-                                    .w(px(70.))
+                                    .w(rem_px(70.))
                                     .flex()
                                     .justify_end()
                                     .font_features(t.numbers.clone())
