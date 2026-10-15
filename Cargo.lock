@@ -6981,6 +6981,7 @@ dependencies = [
  "serde_json",
  "sysman-schema",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]

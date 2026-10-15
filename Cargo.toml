@@ -24,6 +24,7 @@ rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "1"
+uuid = { version = "1", features = ["v5"] }
 
 # gpui is too slow to use unoptimised.
 [profile.dev.package."*"]

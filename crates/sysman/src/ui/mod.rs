@@ -47,7 +47,22 @@ gpui_kit_assets::icon_assets!(
         ChartLine,
         HeartPulse,
         ChartArea,
-        CircleCheck
+        CircleCheck,
+        PcCase,
+        Gpu,
+        BatteryFull,
+        Bluetooth,
+        Usb,
+        Volume2,
+        CircuitBoard,
+        Keyboard,
+        ShieldCheck,
+        LayoutDashboard,
+        RefreshCw,
+        Share,
+        Fan,
+        Copy,
+        Radio
     ]
 );
 

@@ -18,6 +18,7 @@ use crate::data::process::{self, Interval, ProcessFeed};
 use crate::screens::dashboard::Dashboard;
 use crate::screens::disk::Disk;
 use crate::screens::gpu::Gpu;
+use crate::screens::hardware::Hardware;
 use crate::screens::network::Network;
 use crate::screens::processes::Processes;
 use crate::ui::theme::{Theme, theme};
@@ -382,6 +383,7 @@ fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App
         Tab::Gpu => cx.new(|cx| Gpu::new(live, cx)).into(),
         Tab::Network => cx.new(|cx| Network::new(live, cx)).into(),
         Tab::Disk => cx.new(|cx| Disk::new(live, feed, cx)).into(),
+        Tab::Hardware => cx.new(|cx| Hardware::new(live, cx)).into(),
         _ => cx.new(|_| Placeholder { tab, live }).into(),
     }
 }
