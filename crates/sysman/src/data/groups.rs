@@ -562,10 +562,7 @@ mod tests {
         assert_eq!(unit_name(&format!("{app}app-DashBeam@autostart.service")), "DashBeam");
         assert_eq!(unit_name("system.slice/tailscaled.service"), "tailscaled");
         assert_eq!(unit_name("system.slice/docker-cd29ba772c204c26.scope"), "docker");
-        assert_eq!(
-            unit_name("x/demo-daemon-903686bd6b2def88.scope"),
-            "demo-daemon"
-        );
+        assert_eq!(unit_name("x/demo-daemon-903686bd6b2def88.scope"), "demo-daemon");
         assert_eq!(unit_name("x/wayland-wm@hyprland.desktop.service"), "wayland-wm");
         assert_eq!(
             unit_name("x/app-gnome-org.gnome.Nautilus-1234567.scope"),
