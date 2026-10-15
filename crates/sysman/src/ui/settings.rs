@@ -16,7 +16,7 @@ use gpui_kit_assets::IconName;
 use crate::data::helper::{self, State};
 use crate::data::live::{Conn, Live};
 use crate::data::systemd::{self, COLLECTOR, HELPER, Runner, Service, Unit};
-use crate::ui::shell::{Refresh, Shell};
+use crate::ui::shell::{PauseAfter, Refresh, Shell};
 use crate::ui::theme::theme;
 use crate::ui::widgets::hairline;
 
@@ -356,6 +356,26 @@ impl Settings {
                 }
                 menu
             });
+        let pause_after = self.shell.upgrade().map(|s| s.read(cx).pause_after());
+        let shell = self.shell.clone();
+        let pause = Button::new("pause-after")
+            .ghost()
+            .small()
+            .label(pause_after.map_or("–".into(), PauseAfter::label))
+            .child(Icon::new(IconName::ChevronDown).xsmall())
+            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |mut menu, _, _| {
+                for choice in PauseAfter::CHOICES {
+                    let shell = shell.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.label())
+                            .checked(Some(choice) == pause_after)
+                            .on_click(move |_, _, cx| {
+                                shell.update(cx, |shell, cx| shell.set_pause_after(choice, cx)).ok();
+                            }),
+                    );
+                }
+                menu
+            });
         let connected = self.live.read(cx).conn == Conn::Connected;
         let status = status_value(
             if connected { "Running" } else { "Stopped" }.into(),
@@ -370,8 +390,20 @@ impl Settings {
             collector.push(error_row(e, cx));
         }
         vec![
-            group(vec![row("Refresh interval", interval, cx)], cx).into_any_element(),
-            footnote("How often charts redraw. Collection keeps its own interval.", cx).into_any_element(),
+            group(
+                vec![
+                    row("Refresh interval", interval, cx),
+                    row("Pause when not focused", pause, cx),
+                ],
+                cx,
+            )
+            .into_any_element(),
+            footnote(
+                "How often charts redraw, and when they stop while you work elsewhere. Collection keeps its own \
+                 interval, and history is recorded either way.",
+                cx,
+            )
+            .into_any_element(),
             group_title("Collector", cx).into_any_element(),
             group(collector, cx).into_any_element(),
             footnote(

@@ -146,7 +146,7 @@ fn processes(scanner: &mut Option<ProcessScanner>, sys: &Sys) -> Result<String> 
     }
     let scanner = scanner.as_mut().expect("set above");
     let mut table = scanner.scan()?.context("no rates yet")?;
-    scanner.fill_details(&mut table.rows);
+    scanner.fill_table(&mut table.rows);
     scanner.fill_helper(&mut table.rows);
     let mut reply = serde_json::to_value(table)?;
     reply["type"] = "processes".into();
@@ -163,6 +163,7 @@ mod tests {
     use std::io::Read;
 
     use super::*;
+    use crate::testutil::Fixture;
 
     fn start(hub: &Arc<Hub>) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -251,6 +252,40 @@ mod tests {
         assert!(
             rows.iter().any(|r| r["pid"].as_u64() == Some(me)),
             "the full table, not a top N, includes this test process"
+        );
+    }
+
+    #[test]
+    fn process_identities_are_cached_per_client_and_dropped_with_the_process() {
+        // the Processes tab asks every second; re-reading every cmdline and exe each time is the cost this avoids
+        let f = Fixture::new()
+            .file(
+                "proc/5/stat",
+                "5 (a) S 1 1 1 0 -1 0 0 0 0 0 10 0 0 0 20 0 1 0 7 100000 10 0 0\n",
+            )
+            .file("proc/5/cmdline", "first\0");
+        let mut scanner = None;
+        let cmdline = |reply: String| {
+            let v: Value = serde_json::from_str(&reply).unwrap();
+            v["rows"][0]["cmdline"].as_str().map(str::to_owned)
+        };
+        assert_eq!(
+            cmdline(processes(&mut scanner, &f.sys()).unwrap()).as_deref(),
+            Some("first")
+        );
+        std::fs::write(f.path().join("proc/5/cmdline"), "second\0").unwrap();
+        assert_eq!(
+            cmdline(processes(&mut scanner, &f.sys()).unwrap()).as_deref(),
+            Some("first"),
+            "a running instance keeps its cached command line"
+        );
+        assert_eq!(scanner.as_ref().unwrap().cached_identities(), 1);
+        std::fs::remove_dir_all(f.path().join("proc/5")).unwrap();
+        processes(&mut scanner, &f.sys()).unwrap();
+        assert_eq!(
+            scanner.as_ref().unwrap().cached_identities(),
+            0,
+            "an exited process leaves no entry"
         );
     }
 

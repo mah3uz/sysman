@@ -11,6 +11,7 @@ use gpui_kit_assets::IconName;
 use serde::{Deserialize, Serialize};
 
 use crate::data::prefs::{Prefs, prefs};
+use crate::ui::shell::paused;
 use crate::ui::theme::{Theme, theme};
 
 const ANIMATION: Duration = Duration::from_millis(150);
@@ -184,7 +185,7 @@ pub fn sidebar(state: &Entity<Sidebar>, content: Option<AnyElement>, window: &mu
     let s = state.read(cx);
     let now = Instant::now();
     let animating = s.animating(now);
-    if animating {
+    if animating && !paused(cx) {
         window.request_animation_frame();
     }
     let (key, side) = (s.key, s.side);

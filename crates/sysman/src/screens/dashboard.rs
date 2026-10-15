@@ -1180,7 +1180,7 @@ impl Render for Dashboard {
         #[cfg(not(debug_assertions))]
         let _ = window;
         let sample = self.live.read(cx).latest.clone();
-        let sample = sample.as_ref();
+        let sample = sample.as_deref();
         let (net_down, net_up) = sample.and_then(|s| s.net.as_ref()).map_or((0., 0.), |net| {
             net.interfaces
                 .iter()

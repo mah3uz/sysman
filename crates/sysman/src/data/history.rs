@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -102,6 +104,8 @@ fn proc_row(r: &rusqlite::Row) -> rusqlite::Result<Proc> {
 /// Read-only view of the daemon's `history.db`; WAL lets it read while the daemon writes.
 pub struct History {
     conn: Connection,
+    /// Oldest `t` per table and series or process; instances live for one load, so pruning cannot outdate it.
+    oldest: RefCell<HashMap<(&'static str, i64), Option<i64>>>,
 }
 
 pub fn db_path() -> PathBuf {
@@ -130,6 +134,7 @@ impl History {
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         Ok(Self {
             conn: Connection::open_with_flags(path, flags)?,
+            oldest: RefCell::default(),
         })
     }
 
@@ -147,7 +152,7 @@ impl History {
         let Some(id) = id else {
             return Ok(Vec::new());
         };
-        let tier = Tier::for_span(to - from);
+        let tier = self.series_tier(id, from, to)?;
         let w = width(tier, from, to, buckets);
         let (table, aggregates) = match tier {
             Tier::Raw => ("points", "min(value), avg(value), max(value)"),
@@ -178,12 +183,9 @@ impl History {
             .optional()?)
     }
 
-    /// Per-process history: `proc_points` up to 6 h, `proc_rollup_1m` beyond.
+    /// Per-process history: `proc_points` up to 6 h, `proc_rollup_1m` beyond or once the raw points are pruned.
     pub fn proc_series(&self, proc_id: i64, field: ProcField, from: i64, to: i64, buckets: u32) -> Result<Vec<Bucket>> {
-        let tier = match Tier::for_span(to - from) {
-            Tier::Raw => Tier::Raw,
-            Tier::Minute | Tier::Quarter => Tier::Minute,
-        };
+        let tier = self.proc_tier(&[proc_id], from, to)?;
         let w = width(tier, from, to, buckets);
         let (raw, [lo, avg, hi]) = field.columns();
         let (table, aggregates) = match tier {
@@ -290,10 +292,7 @@ impl History {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let tier = match Tier::for_span(to - from) {
-            Tier::Raw => Tier::Raw,
-            Tier::Minute | Tier::Quarter => Tier::Minute,
-        };
+        let tier = self.proc_tier(ids, from, to)?;
         let w = width(tier, from, to, buckets);
         let (raw, [_, avg, _]) = field.columns();
         let ids = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
@@ -324,21 +323,28 @@ impl History {
 
     /// Stored readings of a series in `[from, to)`, from the tier `series` reads.
     pub fn sample_count(&self, path: &str, from: i64, to: i64) -> Result<i64> {
-        let table = match Tier::for_span(to - from) {
+        let id: Option<i64> = self
+            .conn
+            .query_row("SELECT id FROM series WHERE path = ?1", [path], |r| r.get(0))
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(0);
+        };
+        let table = match self.series_tier(id, from, to)? {
             Tier::Raw => "SELECT count(*) FROM points",
             Tier::Minute => "SELECT coalesce(sum(count), 0) FROM rollup_1m",
             Tier::Quarter => "SELECT coalesce(sum(count), 0) FROM rollup_15m",
         };
         Ok(self.conn.query_row(
-            &format!("{table} WHERE series_id = (SELECT id FROM series WHERE path = ?1) AND t >= ?2 AND t < ?3"),
-            params![path, from, to],
+            &format!("{table} WHERE series_id = ?1 AND t >= ?2 AND t < ?3"),
+            params![id, from, to],
             |r| r.get(0),
         )?)
     }
 
     /// Stored readings of one process in `[from, to)`, from the tier `proc_series` reads.
     pub fn proc_sample_count(&self, proc_id: i64, from: i64, to: i64) -> Result<i64> {
-        let table = match Tier::for_span(to - from) {
+        let table = match self.proc_tier(&[proc_id], from, to)? {
             Tier::Raw => "SELECT count(*) FROM proc_points",
             _ => "SELECT coalesce(sum(count), 0) FROM proc_rollup_1m",
         };
@@ -347,6 +353,53 @@ impl History {
             params![proc_id, from, to],
             |r| r.get(0),
         )?)
+    }
+
+    /// The span's tier, or a coarser one when `from` predates the finer tier's data and the coarser reaches further.
+    fn series_tier(&self, id: i64, from: i64, to: i64) -> Result<Tier> {
+        let mut tier = Tier::for_span(to - from);
+        if tier == Tier::Raw && self.coarser_reaches("points", "rollup_1m", "series_id", id, from)? {
+            tier = Tier::Minute;
+        }
+        if tier == Tier::Minute && self.coarser_reaches("rollup_1m", "rollup_15m", "series_id", id, from)? {
+            tier = Tier::Quarter;
+        }
+        Ok(tier)
+    }
+
+    /// Processes have no quarter-hour tier; any member whose raw points are pruned moves them all to minutes.
+    fn proc_tier(&self, ids: &[i64], from: i64, to: i64) -> Result<Tier> {
+        if Tier::for_span(to - from) != Tier::Raw {
+            return Ok(Tier::Minute);
+        }
+        for &id in ids {
+            if self.coarser_reaches("proc_points", "proc_rollup_1m", "proc_id", id, from)? {
+                return Ok(Tier::Minute);
+            }
+        }
+        Ok(Tier::Raw)
+    }
+
+    fn coarser_reaches(&self, fine: &'static str, coarse: &'static str, key: &str, id: i64, from: i64) -> Result<bool> {
+        let Some(coarse) = self.oldest(coarse, key, id)? else {
+            return Ok(false);
+        };
+        Ok(self
+            .oldest(fine, key, id)?
+            .is_none_or(|fine| from < fine && coarse < fine))
+    }
+
+    fn oldest(&self, table: &'static str, key: &str, id: i64) -> Result<Option<i64>> {
+        if let Some(&t) = self.oldest.borrow().get(&(table, id)) {
+            return Ok(t);
+        }
+        let t = self
+            .conn
+            .query_row(&format!("SELECT min(t) FROM {table} WHERE {key} = ?1"), [id], |r| {
+                r.get(0)
+            })?;
+        self.oldest.borrow_mut().insert((table, id), t);
+        Ok(t)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -477,6 +530,76 @@ mod tests {
         assert_eq!(h.series("/cpu/total_pct", 0, 30 * DAY, 120).unwrap()[0].avg, 7.0);
         assert_eq!(h.series("/cpu/total_pct", 0, 7 * DAY, 120).unwrap()[0].avg, 1.0);
         assert!(h.series("/nope", 0, 7 * DAY, 120).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_short_window_older_than_the_raw_points_reads_the_rollups() {
+        // raw points are kept 48 h, so a 1 h window from three days ago must come from the minute rollup
+        let (dir, conn) = db();
+        let now = 200 * DAY;
+        let old = now - 3 * DAY;
+        let ancient = now - 150 * DAY;
+        conn.execute_batch(&format!(
+            "INSERT INTO points (series_id, t, value) VALUES (1, {raw}, 5), (1, {now}, 6);
+             INSERT INTO rollup_1m (series_id, t, min, avg, max, count) VALUES (1, {old}, 1, 2, 3, 30), (1, {now}, 6, 6, 6, 30);
+             INSERT INTO rollup_15m (series_id, t, min, avg, max, count) VALUES (1, {ancient}, 9, 9, 9, 450);",
+            raw = now - 2 * DAY,
+        ))
+        .unwrap();
+        let h = history(&dir);
+        let b = h.series("/cpu/total_pct", old, old + HOUR, 60).unwrap();
+        assert_eq!(b.iter().map(|b| (b.t, b.avg)).collect::<Vec<_>>(), [(old, 2.)]);
+        assert_eq!(h.sample_count("/cpu/total_pct", old, old + HOUR).unwrap(), 30);
+        let recent = h.series("/cpu/total_pct", now - HOUR, now + 1, 60).unwrap();
+        assert_eq!(
+            recent.last().map(|b| b.avg),
+            Some(6.),
+            "a window the raw points cover still reads them"
+        );
+        assert_eq!(
+            h.series("/cpu/total_pct", ancient, ancient + HOUR, 60).unwrap()[0].avg,
+            9.,
+            "past the minute rollup's retention, the quarter-hour one"
+        );
+    }
+
+    #[test]
+    fn a_series_newer_than_its_window_keeps_the_raw_tier() {
+        // the rollups lag the raw points, so a window starting before a new series must not drop to them
+        let (dir, conn) = db();
+        conn.execute_batch(
+            "INSERT INTO points (series_id, t, value) VALUES (1, 3000, 5), (1, 3590, 6);
+             INSERT INTO rollup_1m (series_id, t, min, avg, max, count) VALUES (1, 3000, 5, 5, 5, 30);",
+        )
+        .unwrap();
+        let b = history(&dir).series("/cpu/total_pct", 0, 3600, 60).unwrap();
+        assert_eq!(b.last().map(|b| (b.t, b.avg)), Some((3540, 6.)));
+    }
+
+    #[test]
+    fn process_windows_older_than_the_raw_points_read_the_minute_rollup() {
+        let (dir, conn) = db();
+        conn.execute_batch(
+            "INSERT INTO procs VALUES (1, 42, 100, 'spin', NULL, NULL, 0, 900000);
+             INSERT INTO proc_points (proc_id, t, cpu_pct) VALUES (1, 800000, 10);
+             INSERT INTO proc_rollup_1m (proc_id, t, cpu_avg, cpu_max, count) VALUES (1, 600000, 70, 90, 6);",
+        )
+        .unwrap();
+        let h = history(&dir);
+        let old = 600000;
+        assert_eq!(
+            h.proc_series(1, ProcField::Cpu, old, old + HOUR, 60).unwrap()[0].avg,
+            70.
+        );
+        assert_eq!(h.proc_sample_count(1, old, old + HOUR).unwrap(), 6);
+        assert_eq!(
+            h.procs_sum(&[1], ProcField::Cpu, old, old + HOUR, 60).unwrap()[0].avg,
+            70.
+        );
+        assert_eq!(
+            h.proc_series(1, ProcField::Cpu, 800000, 800000 + HOUR, 60).unwrap()[0].avg,
+            10.
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
@@ -46,7 +46,6 @@ const FLOW_CONSUMERS: usize = 5;
 const MAX_RUNTIME_MIN: f64 = 7. * 24. * 60.;
 /// Dot speed for a line whose watts are unknown; it animates the diagram, it is not a reading.
 const NOMINAL_W: f64 = 12.;
-const FRAME: Duration = Duration::from_millis(33);
 
 /// Which page to show: the system battery's, or the desktop's measured components.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -624,15 +623,6 @@ pub struct Energy {
 impl Energy {
     pub fn new(live: Entity<Live>, cx: &mut Context<Self>) -> Self {
         cx.observe(&live, |this, _, cx| this.refresh(cx)).detach();
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(FRAME).await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
         #[cfg(debug_assertions)]
         let fake = std::env::var_os("SYSMAN_DEV_FAKE_BATTERY").is_some();
         #[cfg(not(debug_assertions))]

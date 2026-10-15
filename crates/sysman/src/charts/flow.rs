@@ -1,4 +1,5 @@
-use std::time::Instant;
+use std::cell::Cell;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, BorderStyle, Bounds, Font, Hsla, IntoElement, ParentElement, PathBuilder, Pixels, Point, RenderOnce,
@@ -7,9 +8,16 @@ use gpui::{
 use gpui_kit_assets::IconName;
 
 use crate::charts::trend::{dot, shape};
+use crate::ui::shell::paused;
 use crate::ui::theme::theme;
 
 pub const HEIGHT: Pixels = px(240.);
+/// Each step redraws the whole window, so the dots move at this rate rather than the display's.
+const STEP: Duration = Duration::from_millis(42);
+
+thread_local! {
+    static STEP_DUE: Cell<bool> = const { Cell::new(false) };
+}
 const LEFT_X: f32 = 56.;
 const SINK_WIDTH: f32 = 132.;
 const HUB_SIZE: (f32, f32) = (86., 64.);
@@ -405,6 +413,22 @@ impl EnergyFlow {
             let r = 2.85 + (watts / 40.).clamp(0., 1.) * 1.95;
             window.paint_quad(dot(p(c.along(f as f32)), px(r as f32), link.color.opacity(0.95)));
         }
+        self.next_step(window, cx);
+    }
+
+    /// Asks for the next step only from a painted diagram, so frames stop when its tab closes or the window hides,
+    /// and at most one step is due however often the screen redraws for its own reasons.
+    fn next_step(&self, window: &Window, cx: &mut App) {
+        if !self.animate || self.links.iter().all(|l| l.watts.is_none()) || paused(cx) || STEP_DUE.replace(true) {
+            return;
+        }
+        let view = window.current_view();
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(STEP).await;
+            STEP_DUE.set(false);
+            cx.update(|cx| cx.notify(view));
+        })
+        .detach();
     }
 }
 

@@ -229,14 +229,14 @@ impl Hardware {
         };
         let live = self.live.read(cx);
         self.built_with_data = live.meta.is_some() && live.latest.is_some();
-        self.sections = Rc::new(hardware::sections(inv, live.meta.as_ref(), live.latest.as_ref()));
+        self.sections = Rc::new(hardware::sections(inv, live.meta.as_ref(), live.latest.as_deref()));
     }
 
     /// Stored history fills the charts' first five minutes after a launch, before the live rings reach back.
     fn request_seed(&mut self, cx: &mut Context<Self>) {
         let live = self.live.read(cx);
         let now = live.latest.as_ref().map_or_else(hardware::now_s, |s| s.t);
-        let sensors = hardware::sensors(live.latest.as_ref(), None);
+        let sensors = hardware::sensors(live.latest.as_deref(), None);
         let covered = sensors
             .first()
             .and_then(|s| live.series(&s.path)?.front())
@@ -952,12 +952,12 @@ impl Hardware {
         let sample = live.latest.clone();
         let rows = [
             pair(
-                self.computer_card(meta.as_ref(), sample.as_ref(), cx),
+                self.computer_card(meta.as_ref(), sample.as_deref(), cx),
                 self.processor_card(meta.as_ref(), cx),
             ),
             pair(
-                self.memory_card(sample.as_ref(), cx),
-                self.storage_card(meta.as_ref(), sample.as_ref(), cx),
+                self.memory_card(sample.as_deref(), cx),
+                self.storage_card(meta.as_ref(), sample.as_deref(), cx),
             ),
             pair(self.displays_card(window, cx), self.power_card(cx)),
             pair(self.connectivity_card(cx), self.software_card(meta.as_ref(), cx)),
@@ -967,7 +967,7 @@ impl Hardware {
             .flex_col()
             .gap(gap)
             .children(rows)
-            .child(self.sensors_card(meta.as_ref(), sample.as_ref(), cx))
+            .child(self.sensors_card(meta.as_ref(), sample.as_deref(), cx))
             .into_any_element()
     }
 
@@ -1801,7 +1801,7 @@ impl Render for Hardware {
             && let Ok(name) = std::env::var("SYSMAN_DEV_HW_SENSOR")
         {
             self.dev_sensor_opened = true;
-            let sensors = hardware::sensors(self.live.read(cx).latest.as_ref(), None);
+            let sensors = hardware::sensors(self.live.read(cx).latest.as_deref(), None);
             if let Some(d) = sensors
                 .iter()
                 .map(|s| s.domain)
@@ -1873,7 +1873,7 @@ impl Render for SensorSheet {
         let t = theme(cx);
         let live = self.live.read(cx);
         let hwmon: Option<HwmonMeta> = module(live.meta.as_ref(), "hwmon");
-        let list: Vec<Sensor> = hardware::sensors(live.latest.as_ref(), hwmon.as_ref())
+        let list: Vec<Sensor> = hardware::sensors(live.latest.as_deref(), hwmon.as_ref())
             .into_iter()
             .filter(|s| s.domain == self.domain)
             .collect();

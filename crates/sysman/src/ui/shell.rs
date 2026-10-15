@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyView, App, AppContext, Context, Entity, FontWeight, Global, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window,
     WindowControlArea, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
@@ -16,6 +16,7 @@ use gpui_kit_assets::IconName;
 
 use crate::data::helper;
 use crate::data::live::{self, Conn, Event, Live};
+use crate::data::prefs::prefs;
 use crate::data::process::{self, Interval, ProcessFeed};
 use crate::data::systemd;
 use crate::screens::dashboard::Dashboard;
@@ -154,6 +155,86 @@ impl Refresh {
     }
 }
 
+/// How long the window may stay unfocused before live work pauses; `None` never pauses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PauseAfter(Option<Duration>);
+
+impl PauseAfter {
+    pub const CHOICES: [PauseAfter; 5] = [
+        PauseAfter(Some(Duration::from_secs(60))),
+        PauseAfter(Some(Duration::from_secs(180))),
+        PauseAfter(Some(Duration::from_secs(300))),
+        PauseAfter(Some(Duration::from_secs(600))),
+        PauseAfter(None),
+    ];
+    const KEY: &str = "app.pause_after";
+
+    pub fn label(self) -> SharedString {
+        match self.0 {
+            Some(d) => format!("After {} min", d.as_secs() / 60).into(),
+            None => "Never".into(),
+        }
+    }
+
+    /// Stored as seconds, 0 for never.
+    fn load() -> Self {
+        let secs = prefs().lock().ok().and_then(|p| p.get::<u64>(Self::KEY));
+        Self::CHOICES
+            .into_iter()
+            .find(|c| Some(c.0.map_or(0, |d| d.as_secs())) == secs)
+            .unwrap_or(Self::CHOICES[0])
+    }
+
+    fn save(self) {
+        if let Ok(mut p) = prefs().lock() {
+            p.set(Self::KEY, &self.0.map_or(0, |d| d.as_secs()));
+        }
+    }
+}
+
+/// Whether live work should stop: at once while the window is hidden, or once it has been unfocused for `after`.
+#[derive(Debug, Clone, Copy)]
+struct Idle {
+    after: Option<Duration>,
+    visible: bool,
+    unfocused_since: Option<Instant>,
+}
+
+impl Idle {
+    fn new(after: Option<Duration>) -> Self {
+        Self {
+            after,
+            visible: true,
+            unfocused_since: None,
+        }
+    }
+
+    fn focus(&mut self, focused: bool, now: Instant) {
+        if focused {
+            self.unfocused_since = None;
+        } else if self.unfocused_since.is_none() {
+            self.unfocused_since = Some(now);
+        }
+    }
+
+    fn paused(&self, now: Instant) -> bool {
+        !self.visible
+            || self
+                .after
+                .zip(self.unfocused_since)
+                .is_some_and(|(after, since)| now.duration_since(since) >= after)
+    }
+}
+
+/// Set while live work is paused, for the animations that would otherwise keep asking for frames.
+struct Paused(bool);
+
+impl Global for Paused {}
+
+pub fn paused(cx: &App) -> bool {
+    cx.try_global::<Paused>().is_some_and(|p| p.0)
+}
+
 pub struct Shell {
     tab: Tab,
     active: AnyView,
@@ -165,7 +246,18 @@ pub struct Shell {
     refresh: Refresh,
     drawn: Instant,
     pending: bool,
+    /// A process table arrived since the last redraw; it is shown with the next one, so both cost one frame.
+    feed_pending: bool,
+    /// The next process table is shown on arrival: a newly opened tab should not wait a whole interval for it.
+    feed_eager: bool,
     helper_running: bool,
+    pause_after: PauseAfter,
+    idle: Idle,
+    paused: bool,
+    /// Window activation and visibility observers, made on the first render, which is the first to see the window.
+    watching: Vec<Subscription>,
+    #[cfg(debug_assertions)]
+    frames: Option<(Instant, u32)>,
 }
 
 impl Shell {
@@ -193,6 +285,14 @@ impl Shell {
             .unwrap_or(Tab::Dashboard);
         #[cfg(not(debug_assertions))]
         let tab = Tab::Dashboard;
+        let pause_after = PauseAfter::load();
+        #[cfg(debug_assertions)]
+        let idle_after = std::env::var("SYSMAN_DEV_PAUSE_AFTER_S")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map_or(pause_after.0, |s| Some(Duration::from_secs(s)));
+        #[cfg(not(debug_assertions))]
+        let idle_after = pause_after.0;
         let shell = Self {
             tab,
             active: mount(tab, &live, &feed, cx),
@@ -204,7 +304,15 @@ impl Shell {
             refresh: Refresh::CHOICES[0],
             drawn: Instant::now(),
             pending: false,
+            feed_pending: false,
+            feed_eager: true,
             helper_running: false,
+            pause_after,
+            idle: Idle::new(idle_after),
+            paused: false,
+            watching: Vec::new(),
+            #[cfg(debug_assertions)]
+            frames: std::env::var_os("SYSMAN_DEV_FRAMES").map(|_| (Instant::now(), 0)),
         };
         shell.sync_feed();
         shell
@@ -213,6 +321,7 @@ impl Shell {
     /// Only the tabs that show the process table pay for the daemon's scan; Network shows it only via the helper.
     fn sync_feed(&self) {
         let ms = match self.tab {
+            _ if self.paused => 0,
             Tab::Dashboard | Tab::Processes | Tab::Disk | Tab::Groups | Tab::Insights => {
                 self.refresh.0.as_millis() as u64
             }
@@ -220,6 +329,71 @@ impl Shell {
             _ => 0,
         };
         self.feed_interval.store(ms, Ordering::Relaxed);
+    }
+
+    pub fn pause_after(&self) -> PauseAfter {
+        self.pause_after
+    }
+
+    pub fn set_pause_after(&mut self, choice: PauseAfter, cx: &mut Context<Self>) {
+        self.pause_after = choice;
+        self.idle.after = choice.0;
+        choice.save();
+        self.update_pause(cx);
+        cx.notify();
+    }
+
+    fn watch_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        self.idle.focus(window.is_window_active(), now);
+        self.idle.visible = window.is_visible();
+        self.watching = vec![
+            cx.observe_window_activation(window, |shell, window, cx| {
+                shell.idle.focus(window.is_window_active(), Instant::now());
+                shell.update_pause(cx);
+            }),
+            cx.observe_window_visibility(window, |shell, visibility, _, cx| {
+                shell.idle.visible = visibility.is_visible();
+                shell.update_pause(cx);
+            }),
+        ];
+        #[cfg(debug_assertions)]
+        if let Ok(spec) = std::env::var("SYSMAN_DEV_DRIVE") {
+            drive(&spec, window, cx);
+        }
+        self.update_pause(cx);
+    }
+
+    fn update_pause(&mut self, cx: &mut Context<Self>) {
+        let paused = self.idle.paused(Instant::now());
+        if paused == self.paused {
+            return;
+        }
+        self.paused = paused;
+        #[cfg(debug_assertions)]
+        if self.frames.is_some() {
+            eprintln!("SYSMAN_DEV_FRAMES: {}", if paused { "paused" } else { "resumed" });
+        }
+        cx.set_global(Paused(paused));
+        self.sync_feed();
+        if !paused {
+            // One catch-up render of the open tab; the rings kept ingesting, so it draws from memory.
+            self.redraw(true, cx);
+            self.feed_eager = true;
+        }
+        cx.notify();
+    }
+
+    /// Hands what arrived since the last redraw to the screens, then marks the time.
+    fn redraw(&mut self, live: bool, cx: &mut Context<Self>) {
+        self.drawn = Instant::now();
+        if std::mem::take(&mut self.feed_pending) {
+            self.feed_eager = false;
+            self.feed.update(cx, |_, cx| cx.notify());
+        }
+        if std::mem::take(&mut self.pending) || live {
+            self.live.update(cx, |_, cx| cx.notify());
+        }
     }
 
     /// For the first-frame aid: the mounted Dashboard has a sample and its history.
@@ -250,43 +424,48 @@ impl Shell {
         active.downcast::<Disk>().is_ok_and(|v| v.read(cx).ready(cx))
     }
 
+    /// The rings ingest every sample even while paused; only the redraws they would trigger wait.
     fn drain(&mut self, cx: &mut Context<Self>) {
         if let Some(events) = &self.feed_events {
-            self.feed.update(cx, |feed, cx| {
-                let mut changed = false;
+            let mut changed = false;
+            self.feed.update(cx, |feed, _| {
                 for event in events.try_iter() {
                     changed = true;
                     feed.apply(event);
                 }
-                if changed {
-                    cx.notify();
+            });
+            self.feed_pending |= changed;
+        }
+        let mut reconnected = false;
+        if let Some(events) = &self.events {
+            let mut data = false;
+            self.live.update(cx, |live, _| {
+                for event in events.try_iter() {
+                    match &event {
+                        Event::Conn(conn) => reconnected |= live.conn != *conn,
+                        Event::Record { .. } | Event::Skipped => data = true,
+                    }
+                    live.apply(event);
                 }
             });
+            self.pending |= data;
         }
-        let Some(events) = &self.events else {
-            return;
-        };
-        let mut reconnected = false;
-        let mut data = false;
-        self.live.update(cx, |live, _| {
-            for event in events.try_iter() {
-                match &event {
-                    Event::Conn(conn) => reconnected |= live.conn != *conn,
-                    Event::Record { .. } | Event::Skipped => data = true,
-                }
-                live.apply(event);
-            }
-        });
-        self.pending |= data;
-        let running = helper::running(self.live.read(cx).latest.as_ref());
+        let running = helper::running(self.live.read(cx).latest.as_deref());
         if running != self.helper_running {
             self.helper_running = running;
             self.sync_feed();
         }
-        if reconnected || (self.pending && self.drawn.elapsed() >= self.refresh.0) {
-            self.pending = false;
-            self.drawn = Instant::now();
-            self.live.update(cx, |_, cx| cx.notify());
+        self.update_pause(cx);
+        if self.paused {
+            return;
+        }
+        let due = self.drawn.elapsed() >= self.refresh.0;
+        if reconnected || (due && (self.pending || self.feed_pending)) {
+            self.redraw(reconnected, cx);
+        } else if self.feed_pending && self.feed_eager {
+            self.feed_pending = false;
+            self.feed_eager = false;
+            self.feed.update(cx, |_, cx| cx.notify());
         }
     }
 
@@ -303,6 +482,7 @@ impl Shell {
     fn select(&mut self, tab: Tab, cx: &mut Context<Self>) {
         if tab != self.tab {
             self.tab = tab;
+            self.feed_eager = true;
             self.sync_feed();
             self.active = mount(tab, &self.live, &self.feed, cx);
             cx.notify();
@@ -431,6 +611,17 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.watching.is_empty() {
+            self.watch_window(window, cx);
+        }
+        #[cfg(debug_assertions)]
+        if let Some((since, n)) = &mut self.frames {
+            *n += 1;
+            if since.elapsed() >= Duration::from_secs(5) {
+                eprintln!("SYSMAN_DEV_FRAMES: {n} in {:.1} s", since.elapsed().as_secs_f64());
+                (*since, *n) = (Instant::now(), 0);
+            }
+        }
         let t = theme(cx);
         let waiting = self.live.read(cx).conn == Conn::Waiting;
         div()
@@ -509,4 +700,114 @@ fn banner(cx: &App) -> impl IntoElement {
                 .text_color(t.text_secondary)
                 .child(format!("waiting for sysmand at {path}")),
         )
+}
+
+/// Development aid for measuring frame cost without input, sixty events a second: `scroll,x,y` wheels whatever is
+/// under (x, y) down and back up; `hover,x0,x1,y` sweeps the pointer between x0 and x1.
+#[cfg(debug_assertions)]
+fn drive(spec: &str, window: &mut Window, cx: &mut Context<Shell>) {
+    use gpui::{Modifiers, MouseMoveEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase, point};
+    let mut parts = spec.split(',');
+    let kind = parts.next().unwrap_or_default().trim().to_owned();
+    let n: Vec<f32> = parts.filter_map(|s| s.trim().parse().ok()).collect();
+    cx.spawn_in(window, async move |_, cx| {
+        let mut step = 0u32;
+        loop {
+            cx.background_executor().timer(Duration::from_millis(16)).await;
+            step += 1;
+            let event = match (kind.as_str(), n.as_slice()) {
+                ("scroll", &[x, y]) => PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    position: point(px(x), px(y)),
+                    delta: ScrollDelta::Pixels(point(
+                        px(0.),
+                        px(if (step / 60).is_multiple_of(2) { -40. } else { 40. }),
+                    )),
+                    modifiers: Modifiers::default(),
+                    touch_phase: TouchPhase::Moved,
+                }),
+                ("hover", &[x0, x1, y]) => {
+                    let f = (step % 120) as f32 / 60.;
+                    PlatformInput::MouseMove(MouseMoveEvent {
+                        position: point(px(x0 + (x1 - x0) * if f < 1. { f } else { 2. - f }), px(y)),
+                        pressed_button: None,
+                        modifiers: Modifiers::default(),
+                    })
+                }
+                _ => {
+                    eprintln!("SYSMAN_DEV_DRIVE: expected scroll,x,y or hover,x0,x1,y");
+                    return;
+                }
+            };
+            if cx.update(|window, cx| window.dispatch_event(event, cx)).is_err() {
+                return;
+            }
+        }
+    })
+    .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn unfocused_pauses_only_once_the_chosen_time_has_passed() {
+        let t0 = Instant::now();
+        let mut idle = Idle::new(Some(MINUTE));
+        assert!(!idle.paused(t0));
+        idle.focus(false, t0);
+        assert!(
+            !idle.paused(t0 + MINUTE - Duration::from_millis(1)),
+            "a glance at another window is not idle"
+        );
+        assert!(idle.paused(t0 + MINUTE));
+        idle.focus(true, t0 + 2 * MINUTE);
+        assert!(!idle.paused(t0 + 2 * MINUTE), "focus resumes at once");
+    }
+
+    #[test]
+    fn refocusing_before_the_timer_starts_it_again() {
+        let t0 = Instant::now();
+        let mut idle = Idle::new(Some(MINUTE));
+        idle.focus(false, t0);
+        idle.focus(true, t0 + MINUTE / 2);
+        idle.focus(false, t0 + MINUTE - Duration::from_secs(1));
+        assert!(
+            !idle.paused(t0 + MINUTE + Duration::from_secs(10)),
+            "counted from the last focus loss"
+        );
+        assert!(idle.paused(t0 + 2 * MINUTE));
+    }
+
+    #[test]
+    fn a_repeated_unfocus_does_not_restart_the_timer() {
+        // activation callbacks also fire for other changes; only the first loss of focus starts the clock
+        let t0 = Instant::now();
+        let mut idle = Idle::new(Some(MINUTE));
+        idle.focus(false, t0);
+        idle.focus(false, t0 + MINUTE / 2);
+        assert!(idle.paused(t0 + MINUTE));
+    }
+
+    #[test]
+    fn hidden_pauses_at_once_even_when_set_to_never() {
+        // nobody can see a hidden window, so its redraws are pure cost whatever the focus setting says
+        let t0 = Instant::now();
+        let mut idle = Idle::new(None);
+        idle.focus(false, t0);
+        assert!(!idle.paused(t0 + 100 * MINUTE), "never pauses for focus alone");
+        idle.visible = false;
+        assert!(idle.paused(t0 + 100 * MINUTE));
+        idle.visible = true;
+        assert!(!idle.paused(t0 + 100 * MINUTE));
+    }
+
+    #[test]
+    fn the_default_is_one_minute_and_never_is_last() {
+        assert_eq!(PauseAfter::CHOICES[0], PauseAfter(Some(MINUTE)));
+        assert_eq!(PauseAfter::CHOICES[0].label(), "After 1 min");
+        assert_eq!(PauseAfter::CHOICES[4].label(), "Never");
+    }
 }
