@@ -8,6 +8,9 @@ pub enum Unit {
     Bytes,
     BytesPerSec,
     Celsius,
+    Millis,
+    /// Operations, requests: whole numbers, one decimal below 10.
+    Count,
 }
 
 impl Unit {
@@ -18,6 +21,9 @@ impl Unit {
             Self::Bytes => bytes(v),
             Self::BytesPerSec => format!("{}/s", bytes(v)),
             Self::Celsius => format!("{v:.1}°C"),
+            Self::Millis => format!("{v:.1} ms"),
+            Self::Count if v.abs() < 10. && v.fract() != 0. => format!("{v:.1}"),
+            Self::Count => format!("{v:.0}"),
         }
     }
 
@@ -85,6 +91,9 @@ mod tests {
         assert_eq!(Unit::BytesPerSec.format(164. * 1024.), "164.0 KB/s");
         assert_eq!(Unit::BytesPerSec.format(0.), "0 bytes/s");
         assert_eq!(Unit::Celsius.format(63.84), "63.8°C");
+        assert_eq!(Unit::Millis.format(0.44), "0.4 ms");
+        assert_eq!(Unit::Count.format(0.4), "0.4", "a queue-depth axis keeps its fractions");
+        assert_eq!(Unit::Count.format(8245.4), "8245");
     }
 
     #[test]

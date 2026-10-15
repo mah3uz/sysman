@@ -128,7 +128,7 @@ impl Metric {
 
 /// A physical disk: not a partition or a device-mapper/RAID layer (their I/O is already counted on the disks
 /// beneath), and not loop, RAM or zram, whose traffic is not disk I/O.
-fn whole_disk(name: &str) -> bool {
+pub(crate) fn whole_disk(name: &str) -> bool {
     if ["loop", "ram", "zram", "sr", "dm-", "md"]
         .iter()
         .any(|p| name.starts_with(p))
@@ -412,7 +412,13 @@ fn live_pressure(sample: &Sample) -> Option<f64> {
 }
 
 /// A LIVE readout: caption over a coloured value.
-fn readout(label: &str, value: String, color: Hsla, icon: Option<IconName>, cx: &App) -> impl IntoElement + use<> {
+pub(crate) fn readout(
+    label: &str,
+    value: String,
+    color: Hsla,
+    icon: Option<IconName>,
+    cx: &App,
+) -> impl IntoElement + use<> {
     let t = theme(cx);
     div()
         .flex()
@@ -437,7 +443,7 @@ fn readout(label: &str, value: String, color: Hsla, icon: Option<IconName>, cx: 
         )
 }
 
-fn caption(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
+pub(crate) fn caption(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
     let t = theme(cx);
     div()
         .text_size(t.small_caption)
@@ -445,7 +451,7 @@ fn caption(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
         .child(text.into())
 }
 
-fn top_list(rows: Vec<(String, String)>, empty: &'static str, cx: &App) -> AnyElement {
+pub(crate) fn top_list(rows: Vec<(String, String)>, empty: &'static str, cx: &App) -> AnyElement {
     let t = theme(cx);
     if rows.is_empty() {
         return caption(empty, cx).into_any_element();

@@ -16,6 +16,7 @@ use gpui_kit_assets::IconName;
 use crate::data::live::{self, Conn, Event, Live};
 use crate::data::process::{self, Interval, ProcessFeed};
 use crate::screens::dashboard::Dashboard;
+use crate::screens::disk::Disk;
 use crate::screens::processes::Processes;
 use crate::ui::theme::{Theme, theme};
 
@@ -175,7 +176,7 @@ impl Shell {
     /// Only the tabs that show the process table pay for the daemon's scan.
     fn sync_feed(&self) {
         let ms = match self.tab {
-            Tab::Dashboard | Tab::Processes => self.refresh.0.as_millis() as u64,
+            Tab::Dashboard | Tab::Processes | Tab::Disk => self.refresh.0.as_millis() as u64,
             _ => 0,
         };
         self.feed_interval.store(ms, Ordering::Relaxed);
@@ -187,9 +188,10 @@ impl Shell {
         let active = self.active.clone();
         match active.downcast::<Dashboard>() {
             Ok(dashboard) => dashboard.read(cx).ready(cx),
-            Err(active) => active
-                .downcast::<Processes>()
-                .is_ok_and(|processes| processes.read(cx).ready(cx)),
+            Err(active) => match active.downcast::<Processes>() {
+                Ok(processes) => processes.read(cx).ready(cx),
+                Err(active) => active.downcast::<Disk>().is_ok_and(|disk| disk.read(cx).ready(cx)),
+            },
         }
     }
 
@@ -369,6 +371,7 @@ fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App
     match tab {
         Tab::Dashboard => cx.new(|cx| Dashboard::new(live, feed, cx)).into(),
         Tab::Processes => cx.new(|cx| Processes::new(live, feed, cx)).into(),
+        Tab::Disk => cx.new(|cx| Disk::new(live, feed, cx)).into(),
         _ => cx.new(|_| Placeholder { tab, live }).into(),
     }
 }

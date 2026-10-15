@@ -37,7 +37,10 @@ gpui_kit_assets::icon_assets!(
         MemoryStick,
         FileText,
         AppWindow,
-        SquareTerminal
+        SquareTerminal,
+        HeartPulse,
+        ChartArea,
+        CircleCheck
     ]
 );
 
