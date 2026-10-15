@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+remove | deconfigure)
+    if [ -d /run/systemd/system ]; then
+        systemctl disable --now sysman-helper.service || true
+    fi
+    echo 'sysman: if the collector is enabled for your user, stop it with:'
+    echo '    systemctl --user disable --now sysmand'
+    ;;
+esac

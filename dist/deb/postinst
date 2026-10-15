@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+[ "$1" = configure ] || exit 0
+[ -d /run/systemd/system ] || exit 0
+
+systemctl daemon-reload || true
+
+if [ -n "$2" ]; then
+    # running services pick up the new binaries; stopped or disabled ones stay as they are
+    systemctl try-restart sysman-helper.service || true
+    restarted=
+    for user in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+        if systemctl --user -M "$user@" is-active --quiet sysmand.service 2>/dev/null &&
+            systemctl --user -M "$user@" restart sysmand.service 2>/dev/null; then
+            restarted="$restarted $user"
+        fi
+    done
+    [ -z "$restarted" ] || echo "sysman: restarted the collector for:$restarted"
+else
+    echo 'sysman: start the collector for your user:'
+    echo '    systemctl --user enable --now sysmand'
+    echo 'sysman: optional privileged helper (SMART health, CPU power, per-process I/O and network):'
+    echo '    sudo systemctl enable --now sysman-helper'
+fi
