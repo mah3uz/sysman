@@ -101,7 +101,8 @@ fn minutes(s: f64) -> String {
     format!("{:.0} min", s / 60.)
 }
 
-fn short_duration(s: f64) -> String {
+/// `45 s` under a minute, else `14m`, `2h 5m`.
+pub fn short_duration(s: f64) -> String {
     if s < 60. {
         format!("{s:.0} s")
     } else {

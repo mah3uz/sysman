@@ -24,7 +24,7 @@ use crate::data::desktop::IconIndex;
 use crate::data::history::{Bucket, History, bucket_width, db_path};
 use crate::data::insights::{
     self, DISK_WINDOW_S, Event, GPU_WINDOW_S, Growth, Insight, Kind, Minute, OOM_WINDOW_S, PRESSURE_WINDOW_S,
-    ProcHistory, Severity, Target, band_label,
+    ProcHistory, Severity, Target, band_label, short_duration,
 };
 use crate::data::live::Live;
 use crate::data::pressure::{Band, CRITICAL, WARNING};
@@ -883,7 +883,10 @@ impl Insights {
             .rule(CRITICAL, "Critical", t.red)
             .height(px(CHART_HEIGHT));
         for e in &self.events {
-            chart = chart.marker(e.t, e.peak, band_colour(e.band, t));
+            // On the plotted mean, so the dot sits on the curve rather than above it at the bucket's peak.
+            let at = (e.t - self.width_s as f64 / 2.) as i64;
+            let y = self.pressure.iter().find(|b| b.t == at).map_or(e.peak, |b| b.avg);
+            chart = chart.marker(e.t, y, band_colour(e.band, t));
         }
         let now = self.span.1;
         let body: AnyElement = if self.events.is_empty() {
@@ -927,7 +930,11 @@ impl Insights {
                                         .text_size(t.small_caption)
                                         .text_color(t.text_secondary)
                                         .font_features(t.numbers.clone())
-                                        .child(format!("peak {:.0} · lasted {}", e.peak, span_text(e.end - e.start))),
+                                        .child(format!(
+                                            "peak {:.0} · lasted {}",
+                                            e.peak,
+                                            short_duration(e.end - e.start)
+                                        )),
                                 ),
                         )
                         .child(
@@ -942,7 +949,7 @@ impl Insights {
                                     div()
                                         .text_size(t.small_caption)
                                         .text_color(t.text_secondary)
-                                        .child(format!("{} ago", span_text((now - e.t).max(0.)))),
+                                        .child(format!("{} ago", short_duration((now - e.t).max(0.)))),
                                 ),
                         )
                 }))
@@ -1260,16 +1267,6 @@ fn icon_tile(icon: IconName, tint: Hsla) -> impl IntoElement {
         .items_center()
         .justify_center()
         .child(Icon::new(icon).small().text_color(gpui::white()))
-}
-
-fn span_text(s: f64) -> String {
-    if s < 60. {
-        format!("{s:.0} s")
-    } else if s < 3600. {
-        format!("{:.0} min", s / 60.)
-    } else {
-        crate::charts::format::duration(s as u64)
-    }
 }
 
 impl Render for Insights {
