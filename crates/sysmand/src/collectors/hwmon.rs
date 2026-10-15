@@ -1,12 +1,30 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use schema::hwmon::HwmonMeta;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::collector::{Collector, NoOptions};
+use crate::collector::Collector;
+use crate::daemon::unix_now;
 use crate::sys::Sys;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Options {
+    /// Seconds between reads by chip-name prefix (longest match wins); unmatched chips are read every sample.
+    pub chip_intervals: BTreeMap<String, u64>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        // the nct67xx driver re-reads every register over port I/O when its cache is older than ~1.5 s
+        Self {
+            chip_intervals: BTreeMap::from([("nct67".to_string(), 10)]),
+        }
+    }
+}
 
 const KINDS: &[(&str, f64, &str)] = &[
     ("temp", 1000.0, "C"),
@@ -30,13 +48,41 @@ pub struct Hwmon {
     sys: Sys,
     signature: Vec<(String, Option<PathBuf>)>,
     chips: Chips,
+    intervals: BTreeMap<String, u64>,
+    /// Per chip key, the interval bucket it was last read in.
+    last_read: HashMap<String, u64>,
 }
 
 impl Hwmon {
-    pub fn new(_: NoOptions, sys: Sys) -> Result<Self> {
+    pub fn new(opts: Options, sys: Sys) -> Result<Self> {
+        if let Some((name, _)) = opts.chip_intervals.iter().find(|(_, i)| **i == 0) {
+            bail!("chip_intervals.{name} must be at least 1 second");
+        }
         let signature = sys.hwmon_signature();
         let chips = discover(&sys);
-        Ok(Self { sys, signature, chips })
+        Ok(Self {
+            sys,
+            signature,
+            chips,
+            intervals: opts.chip_intervals,
+            last_read: HashMap::new(),
+        })
+    }
+
+    /// Whether `chip` is due at unix second `now`; buckets follow the wall clock, like the daemon's ticks.
+    fn due(&mut self, chip: &str, now: u64) -> bool {
+        let name = chip.split('/').next().unwrap_or(chip);
+        let Some(interval) = self
+            .intervals
+            .iter()
+            .filter(|(prefix, _)| name.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, i)| *i)
+        else {
+            return true;
+        };
+        let bucket = now / interval;
+        self.last_read.insert(chip.to_string(), bucket) != Some(bucket)
     }
 
     fn refresh(&mut self) {
@@ -138,10 +184,18 @@ impl Collector for Hwmon {
     }
 
     fn sample(&mut self) -> Result<Option<Value>> {
+        self.sample_at(unix_now().round() as u64)
+    }
+}
+
+impl Hwmon {
+    fn sample_at(&mut self, now: u64) -> Result<Option<Value>> {
         self.refresh();
+        let chips: Vec<String> = self.chips.keys().cloned().collect();
+        let due: Vec<String> = chips.into_iter().filter(|c| self.due(c, now)).collect();
         let mut out: schema::hwmon::Hwmon = BTreeMap::new();
-        for (chip, sensors) in &self.chips {
-            for s in sensors {
+        for chip in &due {
+            for s in &self.chips[chip] {
                 let value = self
                     .sys
                     .int_opt(format!("{}_input", s.stem_path))
@@ -161,6 +215,54 @@ impl Collector for Hwmon {
 mod tests {
     use super::*;
     use crate::testutil::{Fixture, assert_schema};
+
+    fn every_sample() -> Options {
+        Options {
+            chip_intervals: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn slow_chips_are_read_once_per_interval_and_the_rest_every_sample() {
+        let f = Fixture::new()
+            .file("sys/class/hwmon/hwmon0/name", "nct6799")
+            .file("sys/class/hwmon/hwmon0/fan1_input", "1450")
+            .file("sys/class/hwmon/hwmon1/name", "k10temp")
+            .file("sys/class/hwmon/hwmon1/temp1_input", "55000");
+        link_device(&f, "hwmon0", "nct6775.656");
+        link_device(&f, "hwmon1", "0000:00:18.3");
+        let mut c = Hwmon::new(Options::default(), f.sys()).unwrap();
+        let chips = |v: Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            chips(c.sample_at(1000).unwrap().unwrap()),
+            ["k10temp/0000:00:18.3", "nct6799/nct6775.656"]
+        );
+        // same 10 s window: the Super I/O chip is not refreshed again, the CPU sensor is read
+        assert_eq!(chips(c.sample_at(1008).unwrap().unwrap()), ["k10temp/0000:00:18.3"]);
+        assert_eq!(
+            chips(c.sample_at(1010).unwrap().unwrap()),
+            ["k10temp/0000:00:18.3", "nct6799/nct6775.656"]
+        );
+    }
+
+    #[test]
+    fn longest_prefix_wins() {
+        let opts = Options {
+            chip_intervals: BTreeMap::from([("nct".to_string(), 60), ("nct67".to_string(), 10)]),
+        };
+        let mut c = Hwmon::new(opts, Fixture::new().sys()).unwrap();
+        assert!(c.due("nct6799/x", 1000));
+        // a 60 s interval would make this false; the more specific 10 s rule applies
+        assert!(c.due("nct6799/x", 1010));
+    }
+
+    #[test]
+    fn zero_chip_interval_is_rejected() {
+        let opts = Options {
+            chip_intervals: BTreeMap::from([("nvme".to_string(), 0)]),
+        };
+        assert!(Hwmon::new(opts, Fixture::new().sys()).is_err());
+    }
 
     fn link_device(f: &Fixture, hwmon: &str, target: &str) {
         let dev = f.path().join("sys/devices").join(target);
@@ -189,7 +291,7 @@ mod tests {
     #[test]
     fn reads_every_kind_scaled_and_keyed_by_device_not_hwmon_number() {
         let f = k10temp();
-        let mut c = Hwmon::new(NoOptions {}, f.sys()).unwrap();
+        let mut c = Hwmon::new(every_sample(), f.sys()).unwrap();
         let v = c.sample().unwrap().unwrap();
         assert_schema::<schema::hwmon::Hwmon>(&v);
         let chip = &v["k10temp/0000:00:18.3"];
@@ -205,7 +307,7 @@ mod tests {
     fn placeholder_values_are_reported_not_filtered() {
         // a sensor that suddenly reads a placeholder can be evidence of a crash
         let f = k10temp();
-        let mut c = Hwmon::new(NoOptions {}, f.sys()).unwrap();
+        let mut c = Hwmon::new(every_sample(), f.sys()).unwrap();
         let v = c.sample().unwrap().unwrap();
         assert_eq!(v["k10temp/0000:00:18.3"]["temp"]["temp3"], -61.0);
     }
@@ -213,7 +315,7 @@ mod tests {
     #[test]
     fn unreadable_sensor_is_null_not_zero() {
         let f = k10temp();
-        let mut c = Hwmon::new(NoOptions {}, f.sys()).unwrap();
+        let mut c = Hwmon::new(every_sample(), f.sys()).unwrap();
         std::fs::write(f.path().join("sys/class/hwmon/hwmon3/fan2_input"), "not a number\n").unwrap();
         let v = c.sample().unwrap().unwrap();
         assert_schema::<schema::hwmon::Hwmon>(&v);
@@ -230,7 +332,7 @@ mod tests {
                 .file(&format!("sys/class/hwmon/{h}/temp1_input"), "30000\n");
             link_device(&f, h, "pci0000:00/0000:00:01.1");
         }
-        let mut c = Hwmon::new(NoOptions {}, f.sys()).unwrap();
+        let mut c = Hwmon::new(every_sample(), f.sys()).unwrap();
         let v = c.sample().unwrap().unwrap();
         let keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys, ["nvme/0000:00:01.1", "nvme/0000:00:01.1#2"]);
@@ -239,7 +341,7 @@ mod tests {
     #[test]
     fn meta_has_units_and_scaled_limits() {
         let f = k10temp();
-        let mut c = Hwmon::new(NoOptions {}, f.sys()).unwrap();
+        let mut c = Hwmon::new(every_sample(), f.sys()).unwrap();
         let m = c.meta().unwrap();
         assert_schema::<HwmonMeta>(&m);
         assert_eq!(m["units"]["power"], "W");
@@ -250,7 +352,7 @@ mod tests {
     #[test]
     fn chip_without_a_device_link_or_name_still_reports() {
         let f = Fixture::new().file("sys/class/hwmon/hwmon0/temp1_input", "20000\n");
-        let mut c = Hwmon::new(NoOptions {}, f.sys()).unwrap();
+        let mut c = Hwmon::new(every_sample(), f.sys()).unwrap();
         let v = c.sample().unwrap().unwrap();
         assert_eq!(v["hwmon0/device"]["temp"]["temp1"], 20.0);
     }
@@ -267,7 +369,7 @@ mod tests {
                 .file(&format!("sys/class/hwmon/{h}/temp1_input"), &format!("{milli}\n"));
             link_device(&f, h, dev);
         }
-        let mut c = Hwmon::new(NoOptions {}, f.sys()).unwrap();
+        let mut c = Hwmon::new(every_sample(), f.sys()).unwrap();
         let v = c.sample().unwrap().unwrap();
         assert_eq!(v["nvme/0000:00:01.1"]["temp"]["temp1"], 30.0);
 

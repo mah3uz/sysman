@@ -527,7 +527,6 @@ fn pmon(text: &str, by_index: &HashMap<String, String>) -> Vec<Process> {
 
 #[cfg(test)]
 pub mod tests {
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -556,12 +555,15 @@ pub mod tests {
     pub fn script(dir: &std::path::Path, body: &str) -> PathBuf {
         let path = dir.join("nvidia-smi");
         let log = dir.join("calls");
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\necho \"$@\" >> '{}'\n{body}\n", log.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let text = format!("#!/bin/sh\necho \"$@\" >> '{}'\n{body}\n", log.display());
+        // written by a child: a write fd open in this process leaks into other tests' forks and makes exec fail with ETXTBSY
+        let ok = Command::new("sh")
+            .args(["-c", r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#, "sh", &text])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "writing the fake nvidia-smi");
         path
     }
 
