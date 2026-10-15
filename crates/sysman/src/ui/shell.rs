@@ -38,7 +38,7 @@ const STRIP_HEIGHT: Pixels = px(36.);
 const STRIP_INSET: Pixels = px(3.);
 const TAB_PADDING_X: Pixels = px(20.);
 const TAB_MIN_WIDTH: Pixels = px(64.);
-const CONTROL_HEIGHT: Pixels = px(32.);
+pub(crate) const CONTROL_HEIGHT: Pixels = px(32.);
 const TAB_FONT: Pixels = px(13.);
 /// Room each side of the centred strip: the refresh and settings controls and their margin.
 const SIDE_WIDTH: Pixels = px(150.);
@@ -639,7 +639,7 @@ impl Render for Shell {
 }
 
 /// The bordered round control of the title bar's right side.
-fn pill(button: Button, t: &Theme) -> Button {
+pub(crate) fn pill(button: Button, t: &Theme) -> Button {
     hairline(
         button
             .h(CONTROL_HEIGHT)

@@ -15,6 +15,28 @@ pub fn segmented<T: Clone + PartialEq + 'static>(
     on_select: impl Fn(T, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> Stateful<Div> {
+    build(id, options, current, on_select, false, cx)
+}
+
+/// [`segmented`] spanning its container, the segments sharing the width equally.
+pub fn segmented_full<T: Clone + PartialEq + 'static>(
+    id: impl Into<ElementId>,
+    options: impl IntoIterator<Item = (T, impl Into<SharedString>)>,
+    current: &T,
+    on_select: impl Fn(T, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Stateful<Div> {
+    build(id, options, current, on_select, true, cx)
+}
+
+fn build<T: Clone + PartialEq + 'static>(
+    id: impl Into<ElementId>,
+    options: impl IntoIterator<Item = (T, impl Into<SharedString>)>,
+    current: &T,
+    on_select: impl Fn(T, &mut Window, &mut App) + 'static,
+    full: bool,
+    cx: &App,
+) -> Stateful<Div> {
     let t = theme(cx);
     let id: ElementId = id.into();
     let on_select = Rc::new(on_select);
@@ -22,6 +44,7 @@ pub fn segmented<T: Clone + PartialEq + 'static>(
         .id(id.clone())
         .flex()
         .flex_row()
+        .when(full, |d| d.w_full())
         .p(px(2.))
         .rounded(px(6.))
         .bg(t.card)
@@ -35,6 +58,7 @@ pub fn segmented<T: Clone + PartialEq + 'static>(
                 .px(px(8.))
                 .flex()
                 .items_center()
+                .when(full, |d| d.flex_1().justify_center())
                 .rounded(px(4.))
                 .when(selected, |d| d.bg(t.blue).text_color(gpui::white()))
                 .when(!selected, |d| {
