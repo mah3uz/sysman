@@ -1,9 +1,13 @@
+pub mod app_icon;
 pub mod card;
+pub mod detail_sheet;
 pub mod hint;
 pub mod legend;
 pub mod panel;
 pub mod range;
+pub mod segmented;
 pub mod sidebar;
+pub mod text;
 
 use gpui::{Pixels, Styled};
 

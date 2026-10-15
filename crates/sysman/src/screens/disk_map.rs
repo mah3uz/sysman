@@ -25,8 +25,8 @@ use crate::charts::format::bytes;
 use crate::charts::trend::shape;
 use crate::data::diskmap::{self, DIR, FOLD, HARD_LINK, Kind, OTHER_FS, ROOT, SYMLINK, Scan, Tree, UNREADABLE};
 use crate::data::live::Live;
-use crate::screens::disk::segmented;
 use crate::ui::theme::theme;
+use crate::ui::widgets::segmented::segmented;
 use crate::ui::widgets::sidebar::{self, Side, Sidebar, Widths};
 
 const RAIL: Widths = Widths::new(340., 280., 480.);
@@ -866,13 +866,11 @@ impl DiskMap {
             let this = cx.entity().downgrade();
             segmented(
                 "disk-map-mode",
-                Mode::ALL
-                    .iter()
-                    .map(|m| (SharedString::from(m.label()), *m == self.mode))
-                    .collect(),
-                move |i, _, cx| {
+                Mode::ALL.iter().map(|m| (*m, m.label())),
+                &self.mode,
+                move |mode, _, cx| {
                     this.update(cx, |this, cx| {
-                        this.mode = Mode::ALL[i];
+                        this.mode = mode;
                         cx.notify();
                     })
                     .ok();
@@ -1259,11 +1257,8 @@ impl DiskMap {
                     .gap(px(10.))
                     .child(segmented(
                         "disk-map-age",
-                        AGE_CHOICES
-                            .iter()
-                            .enumerate()
-                            .map(|(i, (l, _))| (SharedString::from(*l), i == self.age))
-                            .collect(),
+                        AGE_CHOICES.iter().enumerate().map(|(i, (l, _))| (i, *l)),
+                        &self.age,
                         move |i, _, cx| {
                             this.update(cx, |this, cx| {
                                 this.age = i;
@@ -1275,11 +1270,8 @@ impl DiskMap {
                     ))
                     .child(segmented(
                         "disk-map-size",
-                        SIZE_CHOICES
-                            .iter()
-                            .enumerate()
-                            .map(|(i, (l, _))| (SharedString::from(*l), i == self.min_size))
-                            .collect(),
+                        SIZE_CHOICES.iter().enumerate().map(|(i, (l, _))| (i, *l)),
+                        &self.min_size,
                         move |i, _, cx| {
                             this2
                                 .update(cx, |this, cx| {
