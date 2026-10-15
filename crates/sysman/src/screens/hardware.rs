@@ -1,3 +1,5 @@
+mod item;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -12,6 +14,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{Disableable, Icon, Sizable, WindowExt};
 use gpui_kit_assets::IconName;
 use schema::cpu::CpuMeta;
@@ -28,8 +31,10 @@ use crate::data::history::{Bucket, History, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::source::{Combine, Source};
 use crate::screens::dashboard::Groups;
+use crate::ui::shell::Tab;
 use crate::ui::theme::{Theme, theme};
 use crate::ui::widgets::hairline;
+use crate::ui::widgets::range::{Range, remembered};
 use crate::ui::widgets::sidebar::{self, Side, Sidebar, Widths};
 
 const OUTLINE: Widths = Widths::new(300., 240., 440.);
@@ -141,6 +146,12 @@ pub struct Hardware {
     seeding: bool,
     charts: RefCell<HashMap<Domain, Rc<RefCell<ChartState>>>>,
     version: u64,
+    range: Range,
+    view: item::ItemView,
+    /// hwmon chips and file systems in the sample the outline was built from.
+    chips: usize,
+    #[cfg(debug_assertions)]
+    dev_node: Option<(Category, String)>,
 }
 
 impl Hardware {
@@ -148,22 +159,38 @@ impl Hardware {
         cx.observe(&live, |this, _, cx| {
             this.version += 1;
             let live = this.live.read(cx);
-            if !this.built_with_data && live.meta.is_some() && live.latest.is_some() {
+            let chips = live.latest.as_ref().map_or(0, |s| {
+                s.hwmon.as_ref().map_or(0, |h| h.len()) + s.fs.as_ref().map_or(0, |f| f.len())
+            });
+            // Slow modules (file systems) and chips that failed a read arrive after the outline was first built.
+            if (!this.built_with_data && live.meta.is_some() && live.latest.is_some())
+                || (this.built_with_data && chips > this.chips)
+            {
+                this.chips = chips;
                 this.rebuild(cx);
             }
             this.request_seed(cx);
+            #[cfg(debug_assertions)]
+            this.dev_select_node();
+            this.refresh_item(cx);
             cx.notify();
         })
         .detach();
+        // `Storage` selects a category; `Storage/990` the first of its nodes whose title holds `990`, `Storage/1` the second.
         #[cfg(debug_assertions)]
-        let selected = std::env::var("SYSMAN_DEV_HW_SELECT")
-            .ok()
-            .and_then(|name| {
-                Category::ALL
-                    .into_iter()
-                    .find(|c| c.title().eq_ignore_ascii_case(&name))
-            })
-            .map_or(Selection::Overview, Selection::Category);
+        let dev_select = std::env::var("SYSMAN_DEV_HW_SELECT").ok().and_then(|v| {
+            let (name, node) = v
+                .split_once('/')
+                .map_or((v.as_str(), None), |(a, b)| (a, Some(b.to_owned())));
+            let c = Category::ALL
+                .into_iter()
+                .find(|c| c.title().eq_ignore_ascii_case(name))?;
+            Some((c, node))
+        });
+        #[cfg(debug_assertions)]
+        let selected = dev_select
+            .as_ref()
+            .map_or(Selection::Overview, |(c, _)| Selection::Category(*c));
         #[cfg(not(debug_assertions))]
         let selected = Selection::Overview;
         let mut this = Self {
@@ -187,7 +214,15 @@ impl Hardware {
             seeding: false,
             charts: RefCell::default(),
             version: 0,
+            range: remembered(Tab::Hardware, cx),
+            view: item::ItemView::default(),
+            chips: 0,
+            #[cfg(debug_assertions)]
+            dev_node: dev_select.and_then(|(c, n)| Some((c, n?))),
         };
+        if !item::RANGES.contains(&this.range) {
+            this.range = Range::M30;
+        }
         if let Selection::Category(c) = selected {
             this.expanded.insert(c);
         }
@@ -229,7 +264,41 @@ impl Hardware {
         };
         let live = self.live.read(cx);
         self.built_with_data = live.meta.is_some() && live.latest.is_some();
+        let item = self.selected_node().and_then(|(_, _, n)| n.item.clone());
         self.sections = Rc::new(hardware::sections(inv, live.meta.as_ref(), live.latest.as_deref()));
+        if let Some(item) = item {
+            let found = self.sections.iter().find_map(|s| {
+                let i = s.nodes.iter().position(|n| n.item.as_ref() == Some(&item))?;
+                Some(Selection::Node(s.category, i))
+            });
+            if let (None, Selection::Node(c, _)) = (found, self.selected) {
+                self.selected = Selection::Category(c);
+            }
+            self.selected = found.unwrap_or(self.selected);
+        }
+        #[cfg(debug_assertions)]
+        self.dev_select_node();
+    }
+
+    /// Selects the node `SYSMAN_DEV_HW_SELECT` names once the outline lists it.
+    #[cfg(debug_assertions)]
+    fn dev_select_node(&mut self) {
+        let Some((c, q)) = &self.dev_node else {
+            return;
+        };
+        let Some(s) = self.section(*c) else {
+            return;
+        };
+        let q = q.to_lowercase();
+        let i = q
+            .parse::<usize>()
+            .ok()
+            .filter(|i| *i < s.nodes.len())
+            .or_else(|| s.nodes.iter().position(|n| n.title.to_lowercase().contains(&q)));
+        if let Some(i) = i {
+            self.selected = Selection::Node(*c, i);
+            self.dev_node = None;
+        }
     }
 
     /// Stored history fills the charts' first five minutes after a launch, before the live rings reach back.
@@ -290,6 +359,7 @@ impl Hardware {
         if let Selection::Category(c) | Selection::Node(c, _) = selection {
             self.expanded.insert(c);
         }
+        self.refresh_item(cx);
         cx.notify();
     }
 
@@ -401,20 +471,35 @@ impl Hardware {
         .flatten()
         .collect::<Vec<_>>()
         .join(", ");
+        let chip = div()
+            .id("hw-updated")
+            .h(px(24.))
+            .px(px(9.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.))
+            .rounded_full()
+            .bg(t.card_hover)
+            .whitespace_nowrap();
         let status = match (&self.inventory, self.reading) {
-            (_, true) => div().child("Reading…").into_any_element(),
-            (Some(inv), false) => div()
-                .flex()
-                .flex_col()
-                .items_end()
-                .child(format!("Updated {}", clock_time(inv.at as u64, "%H:%M:%S")))
-                .child(
-                    div()
-                        .text_size(t.small_caption)
-                        .text_color(t.text_tertiary)
-                        .child(format!("{:.1} s", inv.took_s)),
-                )
+            (_, true) => chip
+                .child(Icon::new(IconName::RefreshCw).xsmall().text_color(t.text_tertiary))
+                .child("Reading…")
                 .into_any_element(),
+            (Some(inv), false) => {
+                let tip: SharedString = format!(
+                    "Read at {} in {:.1} s from {} sources",
+                    clock_time(inv.at as u64, "%H:%M:%S"),
+                    inv.took_s,
+                    inv.sources
+                )
+                .into();
+                chip.child(Icon::new(IconName::Clock).xsmall().text_color(t.text_tertiary))
+                    .child(format!("Updated {}", hardware::item::ago(hardware::now_s() - inv.at)))
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .into_any_element()
+            }
             (None, false) => div().into_any_element(),
         };
         let this = cx.entity().downgrade();
@@ -668,6 +753,12 @@ impl Hardware {
             .child(crumb("Hardware".into(), Selection::Overview, false))
             .child(div().text_color(t.text_tertiary).child("›"))
             .child(crumb(c.title().into(), Selection::Category(c), only.is_none()));
+        if let Some(node) = only.and_then(|i| section.nodes.get(i)) {
+            let crumbs = crumbs
+                .child(div().text_color(t.text_tertiary).child("›"))
+                .child(div().child(node.title.clone()));
+            return self.item_page(c, node, crumbs, cx);
+        }
         let (title, subtitle, summary) = match only.and_then(|i| section.nodes.get(i)) {
             Some(node) => {
                 crumbs = crumbs
@@ -1960,6 +2051,7 @@ mod tests {
                     title: (*t).to_owned(),
                     subtitle: None,
                     props: vec![("Driver".into(), format!("{}-drv", t.to_lowercase()))],
+                    item: None,
                 })
                 .collect(),
         }
