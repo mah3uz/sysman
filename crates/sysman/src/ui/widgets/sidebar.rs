@@ -66,6 +66,8 @@ pub struct Sidebar {
     /// The width shown when the running collapse or expand began.
     from: Option<(f32, Instant)>,
     dragging: bool,
+    /// Collapses to nothing rather than to a strip, as the caller shows it only when it has content.
+    on_demand: bool,
 }
 
 impl EventEmitter<Toggled> for Sidebar {}
@@ -82,6 +84,15 @@ impl Sidebar {
         this
     }
 
+    /// Starts hidden and leaves no strip; the caller shows it, so only its width is restored.
+    pub fn on_demand(key: &'static str, side: Side, widths: Widths) -> Self {
+        Self {
+            collapsed: true,
+            on_demand: true,
+            ..Self::new(key, side, widths)
+        }
+    }
+
     fn load(key: &'static str, side: Side, widths: Widths, prefs: &Prefs) -> Self {
         let stored = prefs.get::<Stored>(key);
         Self {
@@ -92,6 +103,7 @@ impl Sidebar {
             collapsed: stored.is_some_and(|s| s.collapsed),
             from: None,
             dragging: false,
+            on_demand: false,
         }
     }
 
@@ -134,7 +146,11 @@ impl Sidebar {
     }
 
     fn target(&self) -> f32 {
-        if self.collapsed { STRIP } else { self.width }
+        match (self.collapsed, self.on_demand) {
+            (false, _) => self.width,
+            (true, false) => STRIP,
+            (true, true) => 0.,
+        }
     }
 
     fn shown(&self, now: Instant) -> f32 {
@@ -190,6 +206,9 @@ pub fn sidebar(state: &Entity<Sidebar>, content: Option<AnyElement>, window: &mu
     }
     let (key, side) = (s.key, s.side);
     if s.collapsed && !animating {
+        if s.on_demand {
+            return div().into_any_element();
+        }
         return strip(state, key, side, t);
     }
     let id = state.entity_id();
@@ -433,5 +452,25 @@ mod tests {
         assert!(s.animating(start + ANIMATION / 2));
         assert!(!s.animating(start + ANIMATION));
         assert_eq!(s.shown(start + ANIMATION * 2), STRIP);
+    }
+
+    #[test]
+    fn an_on_demand_sidebar_slides_all_the_way_out_and_keeps_its_width() {
+        // it is hidden whenever there is nothing to show, so a strip would only waste room
+        let mut s = Sidebar::load("t.right", Side::Right, W, &Prefs::load(Default::default()));
+        s.on_demand = true;
+        s.width = 350.;
+        let start = Instant::now();
+        s.from = Some((350., start));
+        s.collapsed = true;
+        assert!(s.shown(start + ANIMATION / 2) > 0.);
+        assert_eq!(s.shown(start + ANIMATION), 0.);
+        s.from = Some((0., start));
+        s.collapsed = false;
+        assert_eq!(
+            s.shown(start + ANIMATION),
+            350.,
+            "it comes back at the width it was dragged to"
+        );
     }
 }

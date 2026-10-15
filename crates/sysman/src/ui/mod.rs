@@ -100,6 +100,7 @@ gpui_kit_assets::icon_assets!(
         TrendingUp,
         ChartColumn,
         Skull,
+        Columns3,
     ]
 );
 
