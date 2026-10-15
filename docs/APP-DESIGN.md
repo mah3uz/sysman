@@ -16,7 +16,7 @@ differs from the reference, and why.
 | Fonts | Adwaita Sans (UI, tabular digits), Adwaita Mono (paths, ids) | Installed; Adwaita Sans is Inter-derived, the nearest to SF Pro |
 | Data | `schema` crate types; socket client; read-only SQLite | Same types as the daemon, so a format change breaks the build, not the screen |
 
-Guard against two gpui copies: CI step `cargo tree -d -p sysman | grep -q gpui && fail`.
+Guard against two gpui copies: CI step `cargo tree -d --depth 0 -p sysman | grep -q gpui && fail` (without `--depth 0` the listing names gpui as a parent of other duplicates).
 
 ## 2. Architecture
 

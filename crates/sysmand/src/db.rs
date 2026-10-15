@@ -5,47 +5,14 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, Transaction, params};
+use schema::db::SCHEMA;
 use schema::processes::Process;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::config::Retention;
+use schema::series::{escape, flatten};
 
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS series (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-CREATE TABLE IF NOT EXISTS points (
-    series_id INTEGER NOT NULL, t INTEGER NOT NULL, value REAL NOT NULL,
-    PRIMARY KEY (series_id, t)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS rollup_1m (
-    series_id INTEGER NOT NULL, t INTEGER NOT NULL,
-    min REAL NOT NULL, avg REAL NOT NULL, max REAL NOT NULL, count INTEGER NOT NULL,
-    PRIMARY KEY (series_id, t)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS rollup_15m (
-    series_id INTEGER NOT NULL, t INTEGER NOT NULL,
-    min REAL NOT NULL, avg REAL NOT NULL, max REAL NOT NULL, count INTEGER NOT NULL,
-    PRIMARY KEY (series_id, t)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS snapshots (
-    module TEXT NOT NULL, t INTEGER NOT NULL, data TEXT NOT NULL,
-    PRIMARY KEY (module, t)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS errors (
-    t INTEGER NOT NULL, module TEXT NOT NULL, message TEXT NOT NULL,
-    PRIMARY KEY (t, module)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS meta (t INTEGER PRIMARY KEY, data TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS procs (
-    id INTEGER PRIMARY KEY, pid INTEGER NOT NULL, start_time INTEGER NOT NULL, comm TEXT NOT NULL,
-    cmdline TEXT, user TEXT, first_t INTEGER NOT NULL, last_t INTEGER NOT NULL,
-    UNIQUE (pid, start_time));
-CREATE TABLE IF NOT EXISTS proc_points (
-    proc_id INTEGER NOT NULL, t INTEGER NOT NULL, cpu_pct REAL, rss_bytes INTEGER, threads INTEGER,
-    fds INTEGER, read_bps REAL, write_bps REAL,
-    PRIMARY KEY (proc_id, t)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS proc_rollup_1m (
-    proc_id INTEGER NOT NULL, t INTEGER NOT NULL, cpu_avg REAL, cpu_max REAL, rss_avg REAL, rss_max INTEGER,
-    threads_max INTEGER, fds_max INTEGER, read_bps_avg REAL, write_bps_avg REAL, count INTEGER NOT NULL,
-    PRIMARY KEY (proc_id, t)) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS procs_comm ON procs (comm);
-CREATE INDEX IF NOT EXISTS procs_last ON procs (last_t);
-";
+use crate::config::Retention;
 
 const ENVELOPE: [&str; 5] = ["type", "schema", "t", "time", "errors"];
 
@@ -529,43 +496,6 @@ fn prune_procs(tx: &Transaction, r: &Retention, now: i64) -> Result<()> {
     Ok(())
 }
 
-/// Numeric leaves keyed by JSON pointer. Arrays of objects are skipped: a
-/// ranked list's index is not an identity, so it cannot be a series.
-fn flatten(value: &Value, path: &mut String, out: &mut Vec<(String, f64)>) {
-    match value {
-        Value::Number(n) => {
-            if let Some(v) = n.as_f64() {
-                out.push((path.clone(), v));
-            }
-        }
-        Value::Bool(b) => out.push((path.clone(), f64::from(u8::from(*b)))),
-        Value::Object(map) => {
-            for (k, v) in map {
-                let len = path.len();
-                path.push('/');
-                path.push_str(&escape(k));
-                flatten(v, path, out);
-                path.truncate(len);
-            }
-        }
-        Value::Array(items) if items.iter().all(|i| i.is_number() || i.is_null()) => {
-            for (i, v) in items.iter().enumerate() {
-                let len = path.len();
-                path.push('/');
-                path.push_str(&i.to_string());
-                flatten(v, path, out);
-                path.truncate(len);
-            }
-        }
-        Value::Array(_) | Value::String(_) | Value::Null => {}
-    }
-}
-
-/// RFC 6901: chip keys such as `k10temp/0000:00:18.3` contain `/`.
-fn escape(key: &str) -> String {
-    key.replace('~', "~0").replace('/', "~1")
-}
-
 /// Runs the database on its own thread behind a bounded queue, so a slow disk
 /// or a long prune never delays the crash log.
 pub struct Writer {
@@ -643,26 +573,6 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect()
-    }
-
-    #[test]
-    fn series_paths_escape_slashes_in_keys() {
-        let mut out = Vec::new();
-        flatten(
-            &json!({"k10temp/0000:00:18.3": {"a~b": 1}}),
-            &mut "/hwmon".into(),
-            &mut out,
-        );
-        assert_eq!(out, [("/hwmon/k10temp~10000:00:18.3/a~0b".to_string(), 1.0)]);
-    }
-
-    #[test]
-    fn ranked_lists_are_not_series_but_number_arrays_are() {
-        let mut out = Vec::new();
-        let v = json!({"core_pct": [5, null, 7], "top_cpu": [{"pid": 1, "cpu_pct": 50}], "name": "x", "on": true});
-        flatten(&v, &mut "/m".into(), &mut out);
-        let paths: Vec<_> = out.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(paths, ["/m/core_pct/0", "/m/core_pct/2", "/m/on"]);
     }
 
     #[test]

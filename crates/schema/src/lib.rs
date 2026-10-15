@@ -5,6 +5,7 @@ use serde_json::Value;
 
 pub mod cgroups;
 pub mod cpu;
+pub mod db;
 pub mod disk;
 pub mod fs;
 pub mod gpu;
@@ -15,6 +16,7 @@ pub mod netinfo;
 pub mod power;
 pub mod pressure;
 pub mod processes;
+pub mod series;
 pub mod storage;
 pub mod system;
 
