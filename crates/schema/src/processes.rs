@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// `read_bps`, `write_bps`, `user` and `fds` are absent for processes the daemon's user may not inspect.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// `read_bps`, `write_bps`, `user`, `fds` and `exe` are absent for processes the daemon's user may not inspect.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Process {
     pub pid: u32,
     pub ppid: u32,
@@ -29,6 +29,19 @@ pub struct Process {
     /// Absolute Unix seconds; with `pid` it identifies the process instance.
     #[serde(default)]
     pub start_time: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nice: Option<i64>,
+    /// The kernel's scheduling priority: 0–39 for normal tasks, negative for real-time ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vsize_bytes: Option<u64>,
+    /// User plus system CPU time since the process started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_time_s: Option<f64>,
+    /// Target of `/proc/<pid>/exe`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
 }
 
 /// Processes sharing a `comm`, summed. Shared memory is counted once per process.

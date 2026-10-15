@@ -263,6 +263,7 @@ mod tests {
             net_tx_bps: tx,
             cmdline: String::new(),
             start_time: 0,
+            ..Default::default()
         }
     }
 
