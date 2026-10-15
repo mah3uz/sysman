@@ -17,8 +17,8 @@
 # Claude Code local state (worktrees, settings)
 .claude/
 
-# makepkg run directly in dist/arch
-/dist/arch/src/
-/dist/arch/pkg/
-/dist/arch/sysman/
-/dist/arch/*.pkg.tar.*
+# makepkg run directly in dist/arch/<package>
+/dist/arch/*/src/
+/dist/arch/*/pkg/
+/dist/arch/*/*.tar.gz
+/dist/arch/*/*.pkg.tar.*

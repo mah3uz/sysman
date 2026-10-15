@@ -33,12 +33,17 @@ kernel documentation and are marked unverified.
 
 ### Arch Linux
 
+From the AUR, either `sysman` (builds the release from source) or `sysman-bin`
+(prebuilt). From a checkout:
+
 ```bash
-just install          # builds dist/arch/PKGBUILD, installs it with pacman, starts the collector
+just install          # builds the sysman package from this checkout, installs it, starts the collector
 ```
 
-The package (`sysman-git`) installs both binaries, the systemd user unit, a
-desktop entry and hicolor icons. `just uninstall` removes it.
+The package installs both binaries, the systemd user unit, a desktop entry and
+hicolor icons. `just uninstall` removes it. Maintainers cut a release with
+`just release`: it tags `v<version>`, builds the source and binary tarballs for
+the GitHub release, and updates both PKGBUILDs and their `.SRCINFO`.
 
 ### From source
 
@@ -178,7 +183,7 @@ permitted" rather than as zero.
 crates/schema    record types, DB schema and series naming shared by daemon and app
 crates/sysmand   the collector daemon
 crates/sysman    the GPUI app
-dist/            systemd unit, desktop entry, Arch PKGBUILD
+dist/            systemd unit, desktop entry, file layout, Arch PKGBUILDs
 docs/            app design
 ```
 

@@ -1,0 +1,46 @@
+# Maintainer: Mahfuz Shaikh <mah3uz@gmail.com>
+
+pkgname=sysman
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='System monitor for Linux: a metrics collector daemon with crash log and history, and a GPUI app'
+arch=('x86_64')
+url='https://github.com/mah3uz/sysman'
+license=('MIT')
+depends=(
+  'gcc-libs' 'glibc'
+  'iproute2'
+  'libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'libxau' 'libxdmcp'
+  'wayland' 'libglvnd' 'vulkan-icd-loader'
+  'adwaita-fonts'
+)
+makedepends=('cargo' 'librsvg')
+optdepends=('nvidia-utils: NVIDIA GPU metrics through NVML')
+install=sysman.install
+# makepkg's LTO turns the bundled SQLite into GCC bitcode that Rust's linker cannot read
+options=('!lto')
+source=("$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p sysmand -p sysman
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo test --frozen --release --workspace
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  dist/stage.sh target/release "$pkgdir" "$pkgname"
+}
