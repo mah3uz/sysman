@@ -1,4 +1,5 @@
 mod catalog;
+mod goto;
 mod model;
 
 use std::cell::{Cell, RefCell};
@@ -8,22 +9,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, Entity, Focusable, FontWeight, Hsla, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::calendar::{Calendar, CalendarState, Date};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::popover::Popover;
-use gpui_component::time_field::{TimeField, TimeFieldState, TimePrecision};
 use gpui_component::{Disableable, Icon, Selectable, Sizable, WindowExt};
 use gpui_kit_assets::IconName;
 
-use jiff::tz::TimeZone;
 use schema::cpu::CpuMeta;
 use schema::system::SystemMeta;
 
@@ -34,7 +32,7 @@ use crate::data::live::Live;
 use crate::data::source::Source;
 use crate::ui::theme::{Theme, theme};
 use crate::ui::widgets::hint::helper_hint;
-use crate::ui::widgets::segmented::segmented;
+use crate::ui::widgets::segmented::segmented_full;
 use crate::ui::widgets::sidebar::{self, Side, Sidebar, Toggled, Widths};
 use crate::ui::widgets::text::key_value;
 use catalog::{CHARTS, ChartDef, Group, HELPER_CHART, Hue, Preset, Scope, chart};
@@ -93,11 +91,17 @@ struct RawLine {
 struct Read {
     known: Vec<String>,
     charts: Vec<(&'static str, Vec<RawLine>)>,
+    oldest: Option<f64>,
 }
 
 fn read(req: &Request) -> Result<Read> {
     let history = History::open(&db_path())?;
     let known = history.paths("/")?;
+    let oldest: Option<i64> = history.conn().query_row(
+        "SELECT min(t) FROM (SELECT min(t) AS t FROM rollup_15m UNION ALL SELECT min(t) FROM meta)",
+        [],
+        |row| row.get(0),
+    )?;
     let refs: Vec<&str> = known.iter().map(String::as_str).collect();
     let mut charts = Vec::new();
     for id in &req.charts {
@@ -135,7 +139,11 @@ fn read(req: &Request) -> Result<Read> {
         }
         charts.push((*id, lines));
     }
-    Ok(Read { known, charts })
+    Ok(Read {
+        known,
+        charts,
+        oldest: oldest.map(|t| t as f64),
+    })
 }
 
 struct Selected {
@@ -202,8 +210,9 @@ pub struct Explorer {
     top_loading: bool,
     drag: Option<Drag>,
     goto_open: bool,
-    calendar: Option<Entity<CalendarState>>,
-    time_field: Option<Entity<TimeFieldState>>,
+    goto: Option<goto::Goto>,
+    /// The first recorded reading, the earliest time the picker offers.
+    oldest: Option<f64>,
     #[cfg(debug_assertions)]
     dev_proc: Option<String>,
     #[cfg(debug_assertions)]
@@ -252,8 +261,8 @@ impl Explorer {
             top_loading: false,
             drag: None,
             goto_open: false,
-            calendar: None,
-            time_field: None,
+            goto: None,
+            oldest: None,
             #[cfg(debug_assertions)]
             dev_proc: dev("PROC"),
             #[cfg(debug_assertions)]
@@ -361,6 +370,7 @@ impl Explorer {
                     Ok(read) => {
                         this.error = None;
                         this.known = read.known;
+                        this.oldest = read.oldest;
                         this.apply_preset_once();
                         this.lines = read
                             .charts
@@ -566,54 +576,6 @@ impl Explorer {
         self.pin_at(t, cx);
     }
 
-    fn open_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let now = self.now(cx);
-        let t = self.inspected_time(now);
-        let calendar = self
-            .calendar
-            .get_or_insert_with(|| cx.new(|cx| CalendarState::new(window, cx)))
-            .clone();
-        let time = self
-            .time_field
-            .get_or_insert_with(|| cx.new(|cx| TimeFieldState::new(window, cx).precision(TimePrecision::Second)))
-            .clone();
-        if let Ok(date) = clock(t, "%Y-%m-%d").parse() {
-            calendar.update(cx, |c, cx| c.set_date(Date::Single(Some(date)), window, cx));
-        }
-        if let Ok(at) = clock(t, "%H:%M:%S").parse() {
-            time.update(cx, |f, cx| f.set_time(at, window, cx));
-        }
-        self.goto_open = true;
-        cx.notify();
-    }
-
-    fn go_to(&mut self, cx: &mut Context<Self>) {
-        let (Some(calendar), Some(time)) = (&self.calendar, &self.time_field) else {
-            return;
-        };
-        let Date::Single(Some(date)) = calendar.read(cx).date() else {
-            return;
-        };
-        let text = format!(
-            "{}T{}",
-            date.format("%Y-%m-%d"),
-            time.read(cx).time().format("%H:%M:%S")
-        );
-        let Some(t) = text
-            .parse::<jiff::civil::DateTime>()
-            .ok()
-            .and_then(|dt| dt.to_zoned(TimeZone::system()).ok())
-            .map(|z| z.timestamp().as_second() as f64)
-        else {
-            return;
-        };
-        self.goto_open = false;
-        let now = self.now(cx);
-        let t = t.min(now);
-        self.view.centre_on(t, now);
-        self.pin_at(t, cx);
-    }
-
     fn visible_charts(&self) -> Vec<&'static ChartDef> {
         match self.focused {
             Some(id) => chart(id).into_iter().collect(),
@@ -662,8 +624,11 @@ impl Explorer {
         .detach();
     }
 
-    /// Builds what needs a window: the two filter fields.
+    /// Builds what needs a window: the two filter fields and the go-to-time picker.
     fn ensure_widgets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.goto.is_none() {
+            self.goto = Some(goto::Goto::new(window, cx));
+        }
         if self.filter.is_none() {
             let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter metrics"));
             cx.subscribe(&filter, |this, input, event: &InputEvent, cx| {
@@ -766,55 +731,31 @@ impl Explorer {
         let tool = |id: &'static str, icon: IconName, tip: &'static str| {
             Button::new(id).small().icon(Icon::new(icon)).tooltip(tip)
         };
-        let calendar = self.calendar.clone();
-        let time = self.time_field.clone();
-        let goto_entity = cx.entity().downgrade();
+        let me = cx.entity().downgrade();
         let goto = Popover::new("goto-popover")
             .anchor(gpui::Anchor::TopLeft)
             .open(self.goto_open)
-            .on_open_change(cx.listener(|this, open: &bool, _, cx| {
-                this.goto_open = *open;
-                cx.notify();
+            .on_open_change(cx.listener(|this, open: &bool, window, cx| {
+                if *open {
+                    this.open_goto(window, cx);
+                } else {
+                    this.close_goto(cx);
+                }
             }))
+            .when_some(self.goto.as_ref(), |p, g| p.track_focus(&g.input.focus_handle(cx)))
+            .bg(t.tooltip)
+            .text_color(t.text)
+            .border_1()
+            .border_color(t.control_border)
+            .rounded(t.card_radius)
+            .shadow_lg()
+            .p(px(14.))
             .trigger(tool("goto", IconName::Calendar, "Go to time"))
             .content(move |_, _, cx| {
-                let t = theme(cx);
-                let go = goto_entity.clone();
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .p(px(6.))
-                    .w(px(280.))
-                    .child(
-                        div()
-                            .text_size(t.panel_title)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Go to time"),
-                    )
-                    .children(calendar.as_ref().map(Calendar::new))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(div().text_size(t.caption).text_color(t.text_secondary).child("Time"))
-                            .children(time.as_ref().map(TimeField::new)),
-                    )
-                    .child(
-                        div().flex().flex_row().justify_end().child(
-                            Button::new("goto-go")
-                                .primary()
-                                .small()
-                                .label("Go")
-                                .on_click(move |_, _, cx| {
-                                    go.update(cx, |this, cx| this.go_to(cx)).ok();
-                                }),
-                        ),
-                    )
+                me.upgrade()
+                    .map(|e| e.read(cx).goto_panel(me.clone(), cx))
+                    .unwrap_or_else(|| div().into_any_element())
             });
-        let open_goto = cx.listener(|this, _: &MouseDownEvent, window, cx| this.open_goto(window, cx));
         let sources = !self.left.read(cx).collapsed();
         let inspector = !self.right.read(cx).collapsed();
         div()
@@ -874,7 +815,7 @@ impl Explorer {
                         menu
                     }),
             )
-            .child(div().on_mouse_down(MouseButton::Left, open_goto).child(goto))
+            .child(goto)
             .child(
                 tool("zoom-in", IconName::ZoomIn, "Zoom in around the cursor")
                     .on_click(cx.listener(|this, _, _, cx| this.zoom(ZOOM_IN, cx))),
@@ -958,7 +899,7 @@ impl Explorer {
     fn sidebar(&self, cx: &Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let entity = cx.entity().downgrade();
-        let tabs = segmented(
+        let tabs = segmented_full(
             "source-tabs",
             [(SourceTab::Metrics, "Metrics"), (SourceTab::Processes, "Processes")],
             &self.source_tab,
@@ -1509,7 +1450,7 @@ impl Explorer {
     fn inspector(&self, now: f64, cx: &Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let entity = cx.entity().downgrade();
-        let tabs = segmented(
+        let tabs = segmented_full(
             "inspector-tabs",
             [
                 (InspectorTab::Values, "Values"),
