@@ -5,6 +5,10 @@ version.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+# builds libbpf, libelf and zlib from source and links them statically, for binaries that run on distributions without them
+static-libbpf = ["libbpf-rs/static", "libbpf-rs/vendored"]
+
 [dependencies]
 schema.workspace = true
 anyhow.workspace = true

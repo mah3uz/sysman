@@ -1,0 +1,37 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Tag matches the workspace version
+        run: |
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$ver" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match version $ver" >&2; exit 1; }
+
+      - name: Build in ubuntu:22.04
+        run: dist/ci/run.sh build
+
+      - name: Install tests in fresh containers
+        run: dist/ci/run.sh test
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: release-assets
+          path: target/release-assets/*/
+
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "sysman ${GITHUB_REF_NAME#v}" \
+            --generate-notes target/release-assets/*/*

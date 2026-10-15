@@ -191,8 +191,10 @@ these and nothing else.
   opens them. It runs a fixed set of read-only queries; it never executes
   anything a client sends (the only child is `smartctl` with fixed arguments).
 - **Access.** Unix socket `/run/sysman-helper/helper.sock`, mode 0660, group
-  `wheel` (`--group`; the unit's `Group=` must match, so the socket is created
-  with that group and no `CAP_CHOWN` is needed): only administrators, who could
+  `wheel` on Arch; under `install.sh` whichever of `wheel` and `sudo` exists
+  (`wheel` first); `sudo` in the .deb. The group is given as `--group` and as
+  the unit's `Group=`, which must match, so the socket is created with that
+  group and no `CAP_CHOWN` is needed. Only administrators, who could
   read this data as root anyway. Each connection gets at most one answer per
   second (later requests wait), at most 8 connections are served at once, and
   a request line is at most 256 bytes.

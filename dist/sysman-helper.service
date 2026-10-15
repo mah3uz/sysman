@@ -5,7 +5,7 @@ Description=sysman privileged helper (SMART, CPU power, per-process I/O and netw
 ExecStart=/usr/bin/sysman-helper
 Restart=on-failure
 RestartSec=10
-# Creating the socket with this group lets the helper hand it to wheel without CAP_CHOWN; keep it equal to --group.
+# Creating the socket with this group lets the helper hand it to the group without CAP_CHOWN; keep it equal to --group.
 Group=wheel
 
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_BPF CAP_PERFMON

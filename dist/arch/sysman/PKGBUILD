@@ -13,7 +13,6 @@ depends=(
   'libbpf'
   'libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'libxau' 'libxdmcp'
   'wayland' 'libglvnd' 'vulkan-icd-loader'
-  'adwaita-fonts'
 )
 makedepends=('cargo' 'clang' 'libbpf' 'librsvg')
 optdepends=(
