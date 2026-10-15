@@ -1,6 +1,6 @@
 use gpui::{
-    AnyElement, App, AppContext, Context, ElementId, Entity, Focusable, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, ElementId, Entity, Focusable, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
@@ -12,7 +12,7 @@ use jiff::{Timestamp, ToSpan, Zoned};
 
 use super::Explorer;
 use crate::charts::trend::clock;
-use crate::ui::theme::theme;
+use crate::ui::theme::{rem_px, theme};
 
 const CELL_W: f32 = 32.;
 const CELL_H: f32 = 26.;
@@ -212,17 +212,17 @@ impl Explorer {
                 me.update(cx, |this, cx| f(this, window, cx)).ok();
             }
         };
-        let chip_row = div().flex().flex_row().flex_wrap().gap(px(6.)).children(
+        let chip_row = div().flex().flex_row().flex_wrap().gap(rem_px(6.)).children(
             chips(now, boot, &tz).into_iter().enumerate().map(|(i, (label, at))| {
                 let at = at.filter(|&a| self.oldest.is_none_or(|o| a >= o) && a <= now);
                 let me = me.clone();
                 div()
                     .id(ElementId::NamedInteger("goto-chip".into(), i as u64))
-                    .px(px(8.))
-                    .h(px(22.))
+                    .px(rem_px(8.))
+                    .h(rem_px(22.))
                     .flex()
                     .items_center()
-                    .rounded(px(11.))
+                    .rounded(rem_px(11.))
                     .bg(t.control)
                     .border_1()
                     .border_color(t.control_border)
@@ -264,7 +264,7 @@ impl Explorer {
             .child(
                 div()
                     .text_size(t.caption)
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(t.weight_semibold)
                     .child(month.strftime("%B %Y").to_string()),
             )
             .child(nav("goto-next-month", IconName::ChevronRight, later_month, 1));
@@ -273,7 +273,7 @@ impl Explorer {
             .flex_row()
             .children(["M", "T", "W", "T", "F", "S", "S"].map(|d| {
                 div()
-                    .w(px(CELL_W))
+                    .w(rem_px(CELL_W))
                     .flex()
                     .justify_center()
                     .text_size(t.small_caption)
@@ -295,12 +295,12 @@ impl Explorer {
                         let inside = day.month() == month.month();
                         div()
                             .id(ElementId::NamedInteger("goto-day".into(), (row * 7 + col) as u64))
-                            .w(px(CELL_W))
-                            .h(px(CELL_H))
+                            .w(rem_px(CELL_W))
+                            .h(rem_px(CELL_H))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(6.))
+                            .rounded(rem_px(6.))
                             .text_size(t.caption)
                             .font_features(t.numbers.clone())
                             .child(day.day().to_string())
@@ -343,11 +343,11 @@ impl Explorer {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.))
+            .gap(rem_px(8.))
             .child(div().text_size(t.caption).text_color(t.text_secondary).child("Time"))
             .child(
                 div()
-                    .w(px(76.))
+                    .w(rem_px(76.))
                     .capture_action({
                         let me = me.clone();
                         move |_: &MoveUp, window, cx| {
@@ -392,7 +392,7 @@ impl Explorer {
             .flex_row()
             .items_center()
             .justify_end()
-            .gap(px(6.))
+            .gap(rem_px(6.))
             .child(
                 Button::new("goto-cancel")
                     .ghost()
@@ -412,8 +412,8 @@ impl Explorer {
         div()
             .flex()
             .flex_col()
-            .gap(px(10.))
-            .w(px(CELL_W * 7.))
+            .gap(rem_px(10.))
+            .w(rem_px(CELL_W * 7.))
             .capture_action({
                 let me = me.clone();
                 move |_: &Escape, _, cx| {
@@ -424,7 +424,7 @@ impl Explorer {
             .child(
                 div()
                     .text_size(t.panel_title)
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(t.weight_semibold)
                     .child("Go to time"),
             )
             .child(chip_row)

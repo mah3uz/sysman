@@ -9,9 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, Focusable, FontWeight, Hsla, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, Entity, Focusable, Hsla, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Rems, Render, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
@@ -30,7 +30,7 @@ use crate::charts::trend::{ChartState, GUTTER, TrendChart, clock};
 use crate::data::history::{Bucket, History, Proc, ProcPoint, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::source::Source;
-use crate::ui::theme::{Theme, theme};
+use crate::ui::theme::{Theme, rem_px, theme};
 use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::segmented::segmented_full;
 use crate::ui::widgets::sidebar::{self, Side, Sidebar, Toggled, Widths};
@@ -46,9 +46,9 @@ const MACHINE_INTERVAL_S: f64 = 2.;
 const PROCESS_INTERVAL_S: f64 = 10.;
 const SIDEBAR: Widths = Widths::new(280., 220., 420.);
 const INSPECTOR: Widths = Widths::new(320., 260., 480.);
-const TOOLBAR_HEIGHT: Pixels = px(44.);
-const HEADER_HEIGHT: Pixels = px(30.);
-const STATUS_HEIGHT: Pixels = px(26.);
+const TOOLBAR_HEIGHT: Rems = rem_px(44.);
+const HEADER_HEIGHT: Rems = rem_px(30.);
+const STATUS_HEIGHT: Rems = rem_px(26.);
 const TILE_PAD_X: Pixels = px(12.);
 const CHART_HEIGHT: Pixels = px(150.);
 const LIST_CHART_HEIGHT: Pixels = px(190.);
@@ -708,7 +708,7 @@ fn hairline_top<E: Styled>(mut e: E, t: &Theme) -> E {
 }
 
 fn dot(color: Hsla, size: f32) -> impl IntoElement {
-    div().size(px(size)).rounded_full().bg(color).flex_shrink_0()
+    div().size(rem_px(size)).rounded_full().bg(color).flex_shrink_0()
 }
 
 fn stat_row(label: &'static str, value: String, cx: &App) -> impl IntoElement {
@@ -749,7 +749,7 @@ impl Explorer {
             .border_color(t.control_border)
             .rounded(t.card_radius)
             .shadow_lg()
-            .p(px(14.))
+            .p(rem_px(14.))
             .trigger(tool("goto", IconName::Calendar, "Go to time"))
             .content(move |_, _, cx| {
                 me.upgrade()
@@ -764,8 +764,8 @@ impl Explorer {
             .items_center()
             .flex_shrink_0()
             .h(TOOLBAR_HEIGHT)
-            .px(px(14.))
-            .gap(px(6.))
+            .px(rem_px(14.))
+            .gap(rem_px(6.))
             .map(|d| hairline_bottom(d, t))
             .child(
                 tool(
@@ -781,10 +781,10 @@ impl Explorer {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(7.))
-                    .mr(px(6.))
+                    .gap(rem_px(7.))
+                    .mr(rem_px(6.))
                     .text_size(t.panel_title)
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(t.weight_semibold)
                     .child(Icon::new(IconName::Activity).size_4().text_color(t.text_secondary))
                     .child("Explorer"),
             )
@@ -922,7 +922,7 @@ impl Explorer {
             .size_full()
             .bg(t.panel.opacity(0.5))
             .map(|d| hairline_right(d, t))
-            .child(div().p(px(10.)).child(tabs))
+            .child(div().p(rem_px(10.)).child(tabs))
             .child(match self.source_tab {
                 SourceTab::Metrics => self.metric_sources(cx).into_any_element(),
                 SourceTab::Processes => self.process_sources(cx).into_any_element(),
@@ -966,15 +966,15 @@ impl Explorer {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(7.))
+                    .gap(rem_px(7.))
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(5.))
+                            .gap(rem_px(5.))
                             .text_size(t.small_caption)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .text_color(t.text_secondary)
                             .child(Icon::new(group.icon()).size_3())
                             .child(group.title()),
@@ -1003,23 +1003,23 @@ impl Explorer {
             .min_h_0()
             .child(
                 div()
-                    .px(px(10.))
+                    .px(rem_px(10.))
                     .children(self.filter.as_ref().map(|f| Input::new(f).small().cleanable(true))),
             )
-            .child(div().flex().flex_row().px(px(6.)).py(px(4.)).child(views))
+            .child(div().flex().flex_row().px(rem_px(6.)).py(rem_px(4.)).child(views))
             .child(
                 div()
                     .id("metric-list")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px(px(12.))
-                    .pt(px(4.))
-                    .pb(px(12.))
-                    .text_size(px(12.))
+                    .px(rem_px(12.))
+                    .pt(rem_px(4.))
+                    .pb(rem_px(12.))
+                    .text_size(rem_px(12.))
                     .flex()
                     .flex_col()
-                    .gap(px(14.))
+                    .gap(rem_px(14.))
                     .children(groups)
                     .when(self.known.is_empty() && !self.loading, |d| {
                         d.child(
@@ -1041,15 +1041,15 @@ impl Explorer {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .gap(px(8.))
+            .gap(rem_px(8.))
             .child(
                 div()
-                    .px(px(10.))
+                    .px(rem_px(10.))
                     .children(self.search.as_ref().map(|s| Input::new(s).small().cleanable(true))),
             )
             .child(
                 div()
-                    .px(px(12.))
+                    .px(rem_px(12.))
                     .text_size(t.small_caption)
                     .text_color(t.text_secondary)
                     .child(format!("Compared: {} of {MAX_PROCESSES}", self.selected.len())),
@@ -1059,9 +1059,9 @@ impl Explorer {
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(6.))
-                        .px(px(12.))
-                        .pb(px(8.))
+                        .gap(rem_px(6.))
+                        .px(rem_px(12.))
+                        .pb(rem_px(8.))
                         .map(|d| hairline_bottom(d, t))
                         .children(self.selected.iter().map(|s| {
                             let proc = s.proc.clone();
@@ -1069,7 +1069,7 @@ impl Explorer {
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                .gap(px(6.))
+                                .gap(rem_px(6.))
                                 .text_size(t.caption)
                                 .child(dot(Hue::PROCESSES[s.slot].color(t), 7.))
                                 .child(div().flex_1().min_w_0().truncate().child(s.label()))
@@ -1105,9 +1105,9 @@ impl Explorer {
                             .id(("proc", p.id as u64))
                             .flex()
                             .flex_row()
-                            .gap(px(8.))
-                            .px(px(12.))
-                            .py(px(6.))
+                            .gap(rem_px(8.))
+                            .px(rem_px(12.))
+                            .py(rem_px(6.))
                             .when(chosen.is_none() && full, |d| d.opacity(0.5))
                             .when(chosen.is_some() || !full, |d| d.hover(|d| d.bg(t.card)))
                             .child(
@@ -1126,7 +1126,7 @@ impl Explorer {
                                     .flex_col()
                                     .min_w_0()
                                     .gap(px(1.))
-                                    .child(div().text_size(px(12.)).truncate().child(p.comm.clone()))
+                                    .child(div().text_size(rem_px(12.)).truncate().child(p.comm.clone()))
                                     .child(
                                         div()
                                             .text_size(t.small_caption)
@@ -1141,7 +1141,7 @@ impl Explorer {
                     .when(self.results.is_empty(), |d| {
                         d.child(
                             div()
-                                .p(px(12.))
+                                .p(rem_px(12.))
                                 .text_size(t.caption)
                                 .text_color(t.text_secondary)
                                 .child("No recorded processes match"),
@@ -1158,9 +1158,9 @@ impl Explorer {
             .flex_row()
             .items_center()
             .flex_shrink_0()
-            .gap(px(8.))
+            .gap(rem_px(8.))
             .h(HEADER_HEIGHT)
-            .px(px(14.))
+            .px(rem_px(14.))
             .text_size(t.caption)
             .font_features(t.numbers.clone())
             .map(|d| hairline_bottom(d, t))
@@ -1218,15 +1218,15 @@ impl Explorer {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(7.))
+            .gap(rem_px(7.))
             .child(Icon::new(def.group.icon()).size_3p5().text_color(t.text_secondary))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(rem_px(12.))
+                    .font_weight(t.weight_semibold)
                     .child(def.title),
             )
             .child(
@@ -1258,7 +1258,7 @@ impl Explorer {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap(px(8.))
+                .gap(rem_px(8.))
                 .text_size(t.caption)
                 .text_color(t.text_secondary)
                 .child("No processes selected")
@@ -1282,7 +1282,7 @@ impl Explorer {
                     d.child(
                         div()
                             .absolute()
-                            .top(px(40.))
+                            .top(rem_px(40.))
                             .left(GUTTER)
                             .right_0()
                             .flex()
@@ -1347,26 +1347,26 @@ impl Explorer {
             .flex()
             .flex_row()
             .flex_wrap()
-            .gap_x(px(12.))
+            .gap_x(rem_px(12.))
             .gap_y(px(2.))
-            .pl(px(2.))
+            .pl(rem_px(2.))
             .text_size(t.small_caption)
-            .font_weight(FontWeight::MEDIUM)
+            .font_weight(t.weight_medium)
             .children(legend.into_iter().map(|(color, label)| {
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(5.))
+                    .gap(rem_px(5.))
                     .child(dot(color, 6.))
                     .child(label)
             }));
         div()
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(rem_px(6.))
             .px(TILE_PAD_X)
-            .py(px(10.))
+            .py(rem_px(10.))
             .when(self.selected_chart == Some(id), |d| d.bg(t.blue.opacity(0.035)))
             .child(header)
             .child(body)
@@ -1431,13 +1431,13 @@ impl Explorer {
             .children(
                 self.error
                     .clone()
-                    .map(|e| div().p(px(14.)).text_size(t.caption).text_color(t.orange).child(e)),
+                    .map(|e| div().p(rem_px(14.)).text_size(t.caption).text_color(t.orange).child(e)),
             )
             .children(rows)
             .when(count == 0, |d| {
                 d.child(
                     div()
-                        .p(px(40.))
+                        .p(rem_px(40.))
                         .flex()
                         .justify_center()
                         .text_size(t.caption)
@@ -1479,15 +1479,15 @@ impl Explorer {
             .size_full()
             .bg(t.panel.opacity(0.3))
             .map(|d| hairline_left(d, t))
-            .child(div().p(px(10.)).child(tabs))
+            .child(div().p(rem_px(10.)).child(tabs))
             .child(
                 div()
                     .id("inspector-body")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px(px(12.))
-                    .pb(px(12.))
+                    .px(rem_px(12.))
+                    .pb(rem_px(12.))
                     .child(body),
             )
     }
@@ -1509,7 +1509,7 @@ impl Explorer {
         let mut col = div()
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(rem_px(10.))
             .child(
                 div()
                     .flex()
@@ -1521,7 +1521,7 @@ impl Explorer {
                         div()
                             .flex_1()
                             .text_size(t.caption)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .child(if pinned { "Pinned time" } else { "At cursor" }),
                     )
                     .child(
@@ -1544,7 +1544,7 @@ impl Explorer {
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(rem_px(12.))
                     .font_features(t.numbers.clone())
                     .child(clock(at, "%-d %b %Y at %H:%M:%S")),
             );
@@ -1559,7 +1559,7 @@ impl Explorer {
         col = col.child(
             div()
                 .text_size(t.panel_title)
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(t.weight_semibold)
                 .child(def.title),
         );
         let lines = self.lines.get(def.id);
@@ -1585,9 +1585,9 @@ impl Explorer {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.))
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .gap(rem_px(6.))
+                            .text_size(rem_px(12.))
+                            .font_weight(t.weight_semibold)
                             .child(dot(color, 7.))
                             .child(line.label.clone()),
                     )
@@ -1601,7 +1601,7 @@ impl Explorer {
                     .child(
                         div()
                             .text_size(t.card_value)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .font_features(t.numbers.clone())
                             .child(bucket.map_or("–".into(), |b| def.unit.format(b.avg))),
                     )
@@ -1626,10 +1626,10 @@ impl Explorer {
         }
         col = col.child(
             div()
-                .pt(px(8.))
+                .pt(rem_px(8.))
                 .map(|d| hairline_top(d, t))
                 .text_size(t.panel_title)
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(t.weight_semibold)
                 .child("Window statistics"),
         );
         for line in lines.into_iter().flatten() {
@@ -1648,7 +1648,7 @@ impl Explorer {
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(rem_px(12.))
                             .font_features(t.numbers.clone())
                             .child(value.map_or("–".into(), |v| def.unit.format(v))),
                     )
@@ -1658,15 +1658,15 @@ impl Explorer {
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(5.))
+                        .gap(rem_px(5.))
                         .child(
                             div()
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                .gap(px(6.))
-                                .text_size(px(12.))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .gap(rem_px(6.))
+                                .text_size(rem_px(12.))
+                                .font_weight(t.weight_semibold)
                                 .child(dot(line.hue.color(t), 7.))
                                 .child(line.label.clone()),
                         )
@@ -1674,7 +1674,7 @@ impl Explorer {
                             div()
                                 .flex()
                                 .flex_row()
-                                .gap(px(6.))
+                                .gap(rem_px(6.))
                                 .child(cell("Average", s.map(|s| s.average)))
                                 .child(cell("Minimum", s.map(|s| s.minimum)))
                                 .child(cell("Maximum", s.map(|s| s.maximum))),
@@ -1697,16 +1697,21 @@ impl Explorer {
         div()
             .flex()
             .flex_col()
-            .gap(px(8.))
-            .child(div().text_size(px(12.)).font_features(t.numbers.clone()).child(format!(
-                "{} at {}",
-                if self.pin.get().is_some() {
-                    "Pinned"
-                } else {
-                    "Window end"
-                },
-                clock(at, "%-d %b %H:%M:%S")
-            )))
+            .gap(rem_px(8.))
+            .child(
+                div()
+                    .text_size(rem_px(12.))
+                    .font_features(t.numbers.clone())
+                    .child(format!(
+                        "{} at {}",
+                        if self.pin.get().is_some() {
+                            "Pinned"
+                        } else {
+                            "Window end"
+                        },
+                        clock(at, "%-d %b %H:%M:%S")
+                    )),
+            )
             .child(
                 div()
                     .text_size(t.small_caption)
@@ -1728,7 +1733,7 @@ impl Explorer {
                     .flex()
                     .flex_col()
                     .gap(px(3.))
-                    .py(px(6.))
+                    .py(rem_px(6.))
                     .map(|d| hairline_bottom(d, t))
                     .child(
                         div()
@@ -1741,8 +1746,8 @@ impl Explorer {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(12.))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(rem_px(12.))
+                                    .font_weight(t.weight_medium)
                                     .child(p.comm.clone()),
                             )
                             .child(
@@ -1768,7 +1773,7 @@ impl Explorer {
                         div()
                             .flex()
                             .flex_row()
-                            .gap(px(8.))
+                            .gap(rem_px(8.))
                             .text_size(t.small_caption)
                             .text_color(t.text_secondary)
                             .font_features(t.numbers.clone())
@@ -1854,11 +1859,11 @@ impl Explorer {
         div()
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(rem_px(10.))
             .child(
                 div()
                     .text_size(t.caption)
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(t.weight_semibold)
                     .text_color(t.text_secondary)
                     .child("Current inventory, not historical"),
             )
@@ -1896,9 +1901,9 @@ impl Explorer {
             .flex_row()
             .items_center()
             .flex_shrink_0()
-            .gap(px(12.))
+            .gap(rem_px(12.))
             .h(STATUS_HEIGHT)
-            .px(px(14.))
+            .px(rem_px(14.))
             .text_size(t.small_caption)
             .text_color(t.text_secondary)
             .font_features(t.numbers.clone())
@@ -1908,7 +1913,7 @@ impl Explorer {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(rem_px(6.))
                     .child(dot(if self.view.live { t.green } else { t.text_tertiary }, 6.))
                     .child(status),
             )
