@@ -288,16 +288,52 @@ impl Default for Options {
 
 const FOLD_MIN_FILES: usize = 24;
 
+/// One entry of the level a running scan reports, as far as the scan has got.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Top {
+    pub name: String,
+    pub bytes: u64,
+    pub kind: Kind,
+    pub dir: bool,
+    /// Every folder below it has been listed, so `bytes` is final.
+    pub done: bool,
+}
+
+/// The first level below the scanned folder with more than one entry, and its entries.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Level {
+    pub path: PathBuf,
+    pub tops: Vec<Top>,
+}
+
 #[derive(Default)]
 pub struct Progress {
     pub items: AtomicU64,
     pub bytes: AtomicU64,
+    /// Folders listed so far.
+    pub folders: AtomicU64,
     cancel: AtomicBool,
+    current: Mutex<PathBuf>,
+    level: Mutex<Level>,
 }
 
 impl Progress {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// The folder listed last.
+    pub fn current(&self) -> PathBuf {
+        self.current.lock().unwrap().clone()
+    }
+
+    /// Empty until the level's folder has been listed.
+    pub fn level(&self) -> Level {
+        self.level.lock().unwrap().clone()
     }
 }
 
@@ -393,6 +429,10 @@ fn allocated(meta: &Metadata) -> u64 {
 
 struct Builder {
     nodes: Vec<Node>,
+    /// The folder whose entries the progress reports: the root, or below it while it holds a single folder.
+    focus: u32,
+    /// Per entry of the focus, listings still to merge below it.
+    outstanding: Vec<usize>,
     counts: Counts,
     seen: HashSet<(u64, u64)>,
     root_dev: u64,
@@ -408,6 +448,7 @@ impl Builder {
     }
 
     fn merge(&mut self, listing: Listing, progress: &Progress) -> Vec<Job> {
+        progress.folders.fetch_add(1, Ordering::Relaxed);
         let (node, path, entries) = match listing {
             Listing::Failed { node, error } => {
                 if error == io::ErrorKind::NotFound {
@@ -416,6 +457,7 @@ impl Builder {
                     self.counts.unreadable += 1;
                     self.nodes[node as usize].flags |= UNREADABLE;
                 }
+                self.report(node, 0, 0, progress);
                 return Vec::new();
             }
             Listing::Read { node, path, entries } => (node, path, entries),
@@ -528,7 +570,72 @@ impl Builder {
         }
         progress.items.fetch_add(items, Ordering::Relaxed);
         progress.bytes.fetch_add(total, Ordering::Relaxed);
+        *progress.current.lock().unwrap() = path;
+        self.report(node, total, jobs.len(), progress);
         jobs
+    }
+
+    fn path_of(&self, id: u32) -> PathBuf {
+        let mut names = vec![&*self.nodes[id as usize].name];
+        let mut at = id;
+        while at != ROOT {
+            at = self.nodes[at as usize].parent;
+            names.push(&*self.nodes[at as usize].name);
+        }
+        names.into_iter().rev().collect()
+    }
+
+    /// Credits a merged listing of `node` to the entry of the focus it lies in; the focus's own listing
+    /// creates the entries, or moves the focus down when it holds a single folder.
+    fn report(&mut self, node: u32, total: u64, jobs: usize, progress: &Progress) {
+        let mut level = progress.level.lock().unwrap();
+        let children = &self.nodes[node as usize].children;
+        if node == self.focus {
+            if let [only] = children[..]
+                && self.nodes[only as usize].is(DIR)
+                && !self.nodes[only as usize].is(OTHER_FS)
+            {
+                self.focus = only;
+                *level = Level {
+                    path: self.path_of(only),
+                    tops: Vec::new(),
+                };
+                return;
+            }
+            level.path = self.path_of(node);
+            for &id in children {
+                let n = &self.nodes[id as usize];
+                let pending = n.is(DIR) && !n.is(OTHER_FS);
+                self.outstanding.push(usize::from(pending));
+                level.tops.push(Top {
+                    name: n.name.to_string_lossy().into_owned(),
+                    bytes: n.bytes,
+                    kind: n.kind,
+                    dir: n.is(DIR),
+                    done: !pending,
+                });
+            }
+            return;
+        }
+        let mut at = node;
+        while self.nodes[at as usize].parent != self.focus {
+            if at == ROOT {
+                return;
+            }
+            at = self.nodes[at as usize].parent;
+        }
+        // the focus's entries were pushed in one listing, so their ids are consecutive
+        let first = self.nodes[self.focus as usize].children.first().copied().unwrap_or(at);
+        let Some(i) = at
+            .checked_sub(first)
+            .map(|i| i as usize)
+            .filter(|i| *i < self.outstanding.len())
+        else {
+            return;
+        };
+        self.outstanding[i] = (self.outstanding[i] + jobs).saturating_sub(1);
+        level.tops[i].bytes += total;
+        level.tops[i].done = self.outstanding[i] == 0;
     }
 
     fn finish(mut self, started: Instant, partial: bool) -> Tree {
@@ -573,6 +680,8 @@ pub fn walk(root: &Path, opts: &Options, progress: &Progress) -> io::Result<Tree
             kind: Kind::Folder,
             flags: DIR,
         }],
+        focus: ROOT,
+        outstanding: Vec::new(),
         counts: Counts::default(),
         seen: HashSet::new(),
         root_dev: (opts.dev)(root, &meta),
@@ -613,10 +722,30 @@ pub fn walk(root: &Path, opts: &Options, progress: &Progress) -> io::Result<Tree
                 queue.push(job);
                 pending += 1;
             }
+            #[cfg(debug_assertions)]
+            dev_throttle(progress);
         }
         queue.close();
     });
     Ok(builder.finish(started, partial))
+}
+
+/// `SYSMAN_DEV_DISKMAP_SCAN=<ms>` waits that long after each folder; `pause:<n>` stops after `n` folders
+/// until the scan is cancelled, so the scanning state holds still for a screenshot.
+#[cfg(debug_assertions)]
+fn dev_throttle(progress: &Progress) {
+    static SETTING: LazyLock<Option<(Duration, u64)>> = LazyLock::new(|| {
+        let v = std::env::var("SYSMAN_DEV_DISKMAP_SCAN").ok()?;
+        match v.strip_prefix("pause:") {
+            Some(n) => Some((Duration::ZERO, n.parse().ok()?)),
+            None => Some((Duration::from_millis(v.parse().ok()?), u64::MAX)),
+        }
+    });
+    let Some((delay, pause_at)) = *SETTING else { return };
+    thread::sleep(delay);
+    while progress.folders.load(Ordering::Relaxed) >= pause_at && !progress.cancelled() {
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// One scan of one folder, shared by every view of it.
@@ -923,6 +1052,57 @@ mod tests {
         let tree = tree.unwrap();
         assert_eq!(tree.counts.unreadable, 1);
         assert!(tree.node(find(&tree, "locked")).is(UNREADABLE));
+    }
+
+    #[test]
+    fn the_top_level_progress_ends_with_the_same_sizes_as_the_tree() {
+        // the scanning view draws these as the partial map, so a top folder marked done must already be final
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("a/b/c")).unwrap();
+        write(&root.join("a/b/c/deep.bin"), 300_000);
+        write(&root.join("a/one.txt"), 5_000);
+        fs::create_dir(root.join("empty")).unwrap();
+        write(&root.join("loose.mkv"), 70_000);
+        let progress = Progress::default();
+        let tree = walk(root, &opts(Arc::new(|_, m| m.dev())), &progress).unwrap();
+        let level = progress.level();
+        assert_eq!(level.path, root);
+        let tops = level.tops;
+        assert_eq!(tops.len(), tree.node(ROOT).children.len());
+        for top in &tops {
+            let n = tree.node(find(&tree, &top.name));
+            assert!(top.done, "{} is still pending after the walk", top.name);
+            assert_eq!(top.bytes, n.bytes, "{}", top.name);
+            assert_eq!(top.dir, n.is(DIR));
+        }
+        assert_eq!(
+            progress.folders.load(Ordering::Relaxed),
+            5,
+            "the root, a, a/b, a/b/c and empty"
+        );
+        assert!(progress.current().starts_with(root));
+    }
+
+    #[test]
+    fn a_folder_holding_one_folder_reports_the_level_below() {
+        // a home folder with one user in it would otherwise draw as a single tile for the whole scan
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("user/x")).unwrap();
+        write(&root.join("user/x/big.bin"), 200_000);
+        write(&root.join("user/notes.txt"), 9_000);
+        let progress = Progress::default();
+        let tree = walk(root, &opts(Arc::new(|_, m| m.dev())), &progress).unwrap();
+        let level = progress.level();
+        assert_eq!(level.path, root.join("user"));
+        let names: Vec<&str> = level.tops.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"x") && names.contains(&"notes.txt"));
+        for top in &level.tops {
+            assert!(top.done);
+            assert_eq!(top.bytes, tree.node(find(&tree, &top.name)).bytes, "{}", top.name);
+        }
     }
 
     #[test]

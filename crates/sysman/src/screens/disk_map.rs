@@ -3,14 +3,14 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, App, AppContext, BorderStyle, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, DispatchPhase,
     Entity, FocusHandle, Font, FontWeight, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement, Styled, TextAlign, WeakEntity, Window, canvas, div, fill, outline, point,
-    prelude::FluentBuilder, px, relative, rgb, size,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Pixels, Render, SharedString,
+    StatefulInteractiveElement, Styled, TextAlign, WeakEntity, Window, canvas, div, fill, linear_color_stop,
+    linear_gradient, outline, point, prelude::FluentBuilder, px, relative, rgb, size,
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
@@ -23,15 +23,16 @@ use schema::fs::{Filesystem, Fs};
 
 use crate::charts::format::bytes;
 use crate::charts::trend::shape;
-use crate::data::diskmap::{self, DIR, FOLD, HARD_LINK, Kind, OTHER_FS, ROOT, SYMLINK, Scan, Tree, UNREADABLE};
+use crate::data::diskmap::{self, DIR, FOLD, HARD_LINK, Kind, OTHER_FS, ROOT, SYMLINK, Scan, Top, Tree, UNREADABLE};
 use crate::data::live::Live;
+use crate::ui::shell::paused;
 use crate::ui::theme::theme;
 use crate::ui::widgets::segmented::segmented;
-use crate::ui::widgets::sidebar::{self, Side, Sidebar, Widths};
+use crate::ui::widgets::sidebar::{self, Side, Sidebar, Toggled, Widths};
 
 const RAIL: Widths = Widths::new(340., 280., 480.);
 const ROW_LIMIT: usize = 200;
-const STRIP: f32 = 16.;
+const STRIP: f32 = 19.;
 const PAD: f32 = 2.;
 const OPEN_MIN_W: f32 = 40.;
 const OPEN_MIN_H: f32 = 28.;
@@ -39,8 +40,15 @@ const MAX_DEPTH: u8 = 6;
 /// Children smaller than this many square pixels join the folder's "N more" tile.
 const MIN_TILE_AREA: f64 = 120.;
 const MAX_TILES_PER_FOLDER: usize = 400;
-const LABEL_MIN_W: f32 = 44.;
-const LABEL_MIN_H: f32 = 15.;
+const LABEL_MIN_W: f32 = 56.;
+const LABEL_MIN_H: f32 = 20.;
+/// Treemap labels never shrink below these; a tile too small for them goes unlabelled.
+const TILE_NAME: f32 = 12.;
+const TILE_SIZE: f32 = 11.;
+const TILE_LINE: f32 = 15.;
+/// The list rows' text and height.
+const ROW_TEXT: f32 = 14.;
+const ROW_H: f32 = 30.;
 const DEFAULT_ROOT: &str = "/home";
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -348,6 +356,212 @@ fn filesystem_of<'a>(fs: &'a Fs, root: &Path) -> Option<&'a Filesystem> {
     fs.values().find(|f| f.mounts.iter().any(|m| Path::new(m) == root))
 }
 
+/// The filesystem holding `root` and the mount point it is reached by: the longest one containing it.
+fn filesystem_holding<'a>(fs: &'a Fs, root: &Path) -> Option<(&'a Filesystem, &'a str)> {
+    fs.values()
+        .flat_map(|f| f.mounts.iter().map(move |m| (f, m.as_str())))
+        .filter(|(_, m)| root.starts_with(m))
+        .max_by_key(|(_, m)| Path::new(m).components().count())
+}
+
+/// `text` cut to at most `max` characters by dropping its middle, so both ends of a path stay readable.
+fn middle_ellipsis(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let head = keep / 2;
+    let tail = keep - head;
+    chars[..head]
+        .iter()
+        .chain(['…'].iter())
+        .chain(&chars[chars.len() - tail..])
+        .collect()
+}
+
+/// `m:ss`, or `h:mm:ss` from an hour on.
+fn clock(seconds: u64) -> String {
+    let (h, m, s) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+const GLIDE: Duration = Duration::from_millis(320);
+const RING_EASE: Duration = Duration::from_millis(400);
+const DONE_FADE: Duration = Duration::from_millis(450);
+/// Top-level entries drawn while scanning; the rest are too small to see.
+const SCAN_TILES: usize = 80;
+
+fn ease_out(t: f32) -> f32 {
+    1. - (1. - t).powi(3)
+}
+
+fn eased(since: Instant, now: Instant, over: Duration) -> f32 {
+    ease_out((now.saturating_duration_since(since).as_secs_f32() / over.as_secs_f32()).min(1.))
+}
+
+fn lerp_rect(a: Rect, b: Rect, k: f32) -> Rect {
+    Rect {
+        x: a.x + (b.x - a.x) * k,
+        y: a.y + (b.y - a.y) * k,
+        w: a.w + (b.w - a.w) * k,
+        h: a.h + (b.h - a.h) * k,
+    }
+}
+
+/// Tiles that move to each new layout over [`GLIDE`] rather than jumping, one slot per top-level entry.
+#[derive(Default)]
+struct Glide {
+    from: Vec<Option<Rect>>,
+    to: Vec<Option<Rect>>,
+    since: Option<Instant>,
+    /// The area laid out; a new one is a resize, which snaps.
+    area: (f32, f32),
+}
+
+impl Glide {
+    fn retarget(&mut self, to: Vec<Option<Rect>>, area: (f32, f32), now: Instant) {
+        if to == self.to {
+            return;
+        }
+        if area != self.area && !self.to.is_empty() {
+            self.area = area;
+            self.to = to;
+            self.since = None;
+            return;
+        }
+        self.area = area;
+        self.from = self.at(now);
+        self.to = to;
+        self.since = Some(now);
+    }
+
+    fn at(&self, now: Instant) -> Vec<Option<Rect>> {
+        let k = self.since.map_or(1., |since| eased(since, now, GLIDE));
+        self.to
+            .iter()
+            .enumerate()
+            .map(|(i, to)| {
+                let to = (*to)?;
+                // a new tile grows out of its own centre
+                let from = self.from.get(i).copied().flatten().unwrap_or(Rect {
+                    x: to.x + to.w / 2.,
+                    y: to.y + to.h / 2.,
+                    w: 0.,
+                    h: 0.,
+                });
+                Some(lerp_rect(from, to, k))
+            })
+            .collect()
+    }
+}
+
+/// A number that eases to each new value over [`RING_EASE`].
+#[derive(Default)]
+struct Eased {
+    from: f32,
+    to: f32,
+    since: Option<Instant>,
+}
+
+impl Eased {
+    fn set(&mut self, to: f32, now: Instant) {
+        if to != self.to {
+            self.from = self.at(now);
+            self.to = to;
+            self.since = Some(now);
+        }
+    }
+
+    fn at(&self, now: Instant) -> f32 {
+        let k = self.since.map_or(1., |since| eased(since, now, RING_EASE));
+        self.from + (self.to - self.from) * k
+    }
+}
+
+/// What the scanning view animates, kept across frames for one scan.
+#[derive(Default)]
+struct ScanVisual {
+    /// The scan and the level drawn; either changing starts the animation afresh.
+    key: (usize, PathBuf),
+    ring: Eased,
+    glide: Glide,
+    /// When each top-level entry was first seen complete, for its fade to colour.
+    done_at: Vec<Option<Instant>>,
+}
+
+/// A circular arc from `from` to `to` turns, clockwise from twelve o'clock.
+fn arc(c: gpui::Point<Pixels>, r: f32, from: f32, to: f32, width: f32) -> Option<gpui::Path<Pixels>> {
+    let steps = ((to - from).abs() * 160.).ceil().max(2.) as usize;
+    let mut path = PathBuilder::stroke(px(width));
+    for i in 0..=steps {
+        let a = (from + (to - from) * i as f32 / steps as f32 - 0.25) * std::f32::consts::TAU;
+        let p = point(c.x + px(r * a.cos()), c.y + px(r * a.sin()));
+        if i == 0 {
+            path.move_to(p);
+        } else {
+            path.line_to(p);
+        }
+    }
+    path.build().ok()
+}
+
+/// The progress ring: a track, the share found so far with a soft glow, and a comet that keeps circling.
+fn paint_ring(
+    bounds: Bounds<Pixels>,
+    fraction: Option<f32>,
+    turn: f32,
+    (track, start, end): (Hsla, Hsla, Hsla),
+    window: &mut Window,
+) {
+    let c = bounds.center();
+    let r = f32::from(bounds.size.width.min(bounds.size.height)) / 2. - 20.;
+    let stroke = 12.;
+    if let Some(p) = arc(c, r, 0., 1., stroke) {
+        window.paint_path(p, track);
+    }
+    let gradient = || linear_gradient(135., linear_color_stop(start, 0.), linear_color_stop(end, 1.));
+    let (from, to) = match fraction {
+        Some(f) => (0., f.clamp(0., 1.)),
+        None => (turn, turn + 0.3),
+    };
+    if to - from > 0.002 {
+        let length = (to - from) * r * std::f32::consts::TAU;
+        let glow = (length / 120.).min(1.);
+        for (width, alpha) in [(stroke + 22., 0.05), (stroke + 14., 0.08), (stroke + 6., 0.14)] {
+            if let Some(p) = arc(c, r, from, to, width) {
+                window.paint_path(p, start.opacity(alpha * glow));
+            }
+        }
+        if let Some(p) = arc(c, r, from, to, stroke) {
+            window.paint_path(p, gradient());
+        }
+        let a = (to - 0.25) * std::f32::consts::TAU;
+        let head = point(c.x + px(r * a.cos()), c.y + px(r * a.sin()));
+        let dot = px(stroke + 4.);
+        window.paint_quad(
+            fill(
+                Bounds::new(head - point(dot / 2., dot / 2.), size(dot, dot)),
+                gpui::white().opacity(0.92),
+            )
+            .corner_radii(dot / 2.),
+        );
+    }
+    if fraction.is_some() {
+        // a faint comet on the track, so a slow stretch of the scan still visibly runs
+        let head = turn;
+        for (k, alpha) in [(0.10, 0.10), (0.05, 0.16), (0.02, 0.24)] {
+            if let Some(p) = arc(c, r, head - k, head, stroke) {
+                window.paint_path(p, gpui::white().opacity(alpha));
+            }
+        }
+    }
+}
+
 fn now_s() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -430,6 +644,8 @@ pub struct DiskMap {
     colour: Colour,
     zoom: u32,
     selected: Option<u32>,
+    /// What the rail shows: the selection, kept through the rail's slide out after a deselect.
+    shown: Option<u32>,
     refusal: Option<&'static str>,
     hover: Rc<Cell<Option<usize>>>,
     scene: Rc<RefCell<Option<SceneCache>>>,
@@ -440,6 +656,7 @@ pub struct DiskMap {
     rows: Option<(RowsKey, Rc<Vec<u32>>)>,
     kinds: Option<(usize, KindTotals)>,
     focus: FocusHandle,
+    visual: Rc<RefCell<ScanVisual>>,
     #[cfg(debug_assertions)]
     dev_select: bool,
 }
@@ -472,7 +689,7 @@ impl DiskMap {
         let mode = Mode::Map;
         let mut this = Self {
             live,
-            rail: cx.new(|_| Sidebar::new("disk_map.right", Side::Right, RAIL)),
+            rail: cx.new(|_| Sidebar::transient("disk_map.right", Side::Right, RAIL)),
             root: PathBuf::new(),
             tree: None,
             scan: None,
@@ -481,6 +698,7 @@ impl DiskMap {
             colour: dev_colour(),
             zoom: ROOT,
             selected: None,
+            shown: None,
             refusal: None,
             hover: Rc::default(),
             scene: Rc::default(),
@@ -491,9 +709,17 @@ impl DiskMap {
             rows: None,
             kinds: None,
             focus: cx.focus_handle(),
+            visual: Rc::default(),
             #[cfg(debug_assertions)]
             dev_select: std::env::var_os("SYSMAN_DEV_DISKMAP_SELECT").is_some(),
         };
+        // the rail's own hide button closes it; that is a deselect too
+        cx.subscribe(&this.rail, |this, rail, _: &Toggled, cx| {
+            if rail.read(cx).collapsed() && this.selected.is_some() {
+                this.select(None, cx);
+            }
+        })
+        .detach();
         this.choose(PathBuf::from(root), cx);
         this
     }
@@ -506,24 +732,25 @@ impl DiskMap {
         if cached.is_none() && self.scan.is_none() {
             self.scan = Some(diskmap::start(&self.root));
         }
-        self.set_tree(cached);
+        self.set_tree(cached, cx);
         if self.scan.is_some() {
             self.watch(cx);
         }
         cx.notify();
     }
 
-    fn set_tree(&mut self, tree: Option<Arc<Tree>>) {
+    fn set_tree(&mut self, tree: Option<Arc<Tree>>, cx: &mut Context<Self>) {
         self.tree = tree;
         self.zoom = ROOT;
         self.hover.set(None);
-        self.select(None);
+        self.select(None, cx);
+        self.shown = None;
         #[cfg(debug_assertions)]
         if self.dev_select
             && let Some(tree) = &self.tree
         {
             let biggest = tree.largest(tree.files(), 1).first().copied();
-            self.select(biggest);
+            self.select(biggest, cx);
         }
     }
 
@@ -539,7 +766,7 @@ impl DiskMap {
             loop {
                 cx.background_executor().timer(Duration::from_millis(250)).await;
                 let running = this.update(cx, |this, cx| {
-                    this.poll();
+                    this.poll(cx);
                     cx.notify();
                     this.scan.is_some()
                 });
@@ -551,23 +778,29 @@ impl DiskMap {
         .detach();
     }
 
-    fn poll(&mut self) {
+    fn poll(&mut self, cx: &mut Context<Self>) {
         let Some(outcome) = self.scan.as_ref().and_then(|s| s.outcome()) else {
             return;
         };
         self.scan = None;
         match outcome {
-            Ok(tree) => self.set_tree(Some(tree)),
+            Ok(tree) => self.set_tree(Some(tree), cx),
             Err(e) => self.error = Some(format!("Could not scan {}: {e}", self.root.display()).into()),
         }
     }
 
-    fn select(&mut self, node: Option<u32>) {
+    /// The rail slides in with a selection and out without one.
+    fn select(&mut self, node: Option<u32>, cx: &mut Context<Self>) {
         self.selected = node;
+        if node.is_some() {
+            self.shown = node;
+        }
         self.refusal = match (node, &self.tree) {
             (Some(id), Some(tree)) => Some(self.refuse(tree, id)).flatten(),
             _ => None,
         };
+        self.rail.update(cx, |rail, cx| rail.set_collapsed(node.is_none(), cx));
+        cx.notify();
     }
 
     fn refuse(&self, tree: &Tree, id: u32) -> Option<&'static str> {
@@ -604,15 +837,12 @@ impl DiskMap {
         let Some(tree) = &self.tree else { return };
         let parent = if node == ROOT { ROOT } else { tree.node(node).parent };
         self.mode = Mode::Map;
-        self.select(Some(node));
+        self.select(Some(node), cx);
         self.zoom_to(parent, cx);
     }
 
     fn clicked(&mut self, tile: Tile, clicks: usize, cx: &mut Context<Self>) {
-        match tile.shape {
-            Shape::More { .. } => self.select(Some(tile.node)),
-            _ => self.select(Some(tile.node)),
-        }
+        self.select(Some(tile.node), cx);
         if clicks >= 2
             && !matches!(tile.shape, Shape::More { .. })
             && self.tree.as_ref().is_some_and(|t| t.openable(tile.node))
@@ -662,7 +892,7 @@ impl DiskMap {
                 diskmap::store(patched.clone());
                 let parent = tree.node(id).parent;
                 self.tree = Some(patched);
-                self.select(Some(parent));
+                self.select(Some(parent), cx);
                 window.push_notification(Notification::success(format!("Moved “{name}” to the Trash")), cx);
             }
             Err(e) => window.push_notification(
@@ -1296,25 +1526,25 @@ impl DiskMap {
                 .into_any_element(),
         };
         let widths = |d: gpui::Stateful<gpui::Div>, c: Col| match c {
-            Col::Name => d.flex_1().min_w(px(160.)),
-            Col::Size => d.w(px(80.)).flex().justify_end(),
-            Col::Modified => d.w(px(104.)).pl(px(16.)),
-            Col::Kind => d.w(px(150.)),
-            Col::Location => d.flex_1().min_w(px(140.)),
+            Col::Name => d.flex_1().min_w(px(180.)),
+            Col::Size => d.w(px(96.)).flex().justify_end(),
+            Col::Modified => d.w(px(124.)).pl(px(16.)),
+            Col::Kind => d.w(px(170.)),
+            Col::Location => d.flex_1().min_w(px(160.)),
         };
         let header = div()
             .flex()
             .flex_row()
             .gap(px(10.))
             .px(px(16.))
-            .py(px(5.))
-            .text_size(t.small_caption)
+            .py(px(7.))
+            .text_size(t.panel_title)
             .font_weight(FontWeight::SEMIBOLD)
             .child(widths(self.header_cell(Col::Name, "Name", cx), Col::Name))
             .child(widths(self.header_cell(Col::Size, "Size", cx), Col::Size))
             .child(
                 div()
-                    .w(px(56.))
+                    .w(px(64.))
                     .flex()
                     .justify_end()
                     .text_color(t.text_secondary)
@@ -1333,9 +1563,9 @@ impl DiskMap {
                 .flex_row()
                 .items_center()
                 .gap(px(10.))
-                .h(px(24.))
+                .h(px(ROW_H))
                 .px(px(16.))
-                .text_size(t.caption)
+                .text_size(px(ROW_TEXT))
                 .when(i % 2 == 1, |d| d.bg(t.text.opacity(0.025)))
                 .when(selected == Some(id), |d| d.bg(t.selection))
                 .hover(|d| d.bg(t.card_hover))
@@ -1344,9 +1574,9 @@ impl DiskMap {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(6.))
+                        .gap(px(8.))
                         .overflow_hidden()
-                        .child(swatch(kind_colour(n.kind), 8.))
+                        .child(swatch(kind_colour(n.kind), 10.))
                         .child(
                             div()
                                 .overflow_hidden()
@@ -1362,7 +1592,7 @@ impl DiskMap {
                 )
                 .child(
                     div()
-                        .w(px(56.))
+                        .w(px(64.))
                         .flex()
                         .justify_end()
                         .text_color(t.text_secondary)
@@ -1395,8 +1625,7 @@ impl DiskMap {
                     if e.click_count() >= 2 {
                         this.reveal(id, cx);
                     } else {
-                        this.select(Some(id));
-                        cx.notify();
+                        this.select(Some(id), cx);
                     }
                 }))
         });
@@ -1466,9 +1695,9 @@ impl DiskMap {
                 .id(("disk-map-kind", kind as usize))
                 .flex()
                 .flex_col()
-                .gap(px(4.))
+                .gap(px(5.))
                 .px(px(12.))
-                .py(px(7.))
+                .py(px(9.))
                 .rounded(px(6.))
                 .when(current == Some(kind), |d| d.bg(t.selection))
                 .hover(|d| d.bg(t.card_hover))
@@ -1477,9 +1706,9 @@ impl DiskMap {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(6.))
-                        .text_size(px(12.))
-                        .child(swatch(color, 9.))
+                        .gap(px(8.))
+                        .text_size(px(ROW_TEXT))
+                        .child(swatch(color, 10.))
                         .child(div().flex_1().child(kind.label()))
                         .child(div().font_features(t.numbers.clone()).child(bytes(b as f64))),
                 )
@@ -1494,7 +1723,7 @@ impl DiskMap {
                 )
                 .child(
                     div()
-                        .text_size(t.small_caption)
+                        .text_size(t.panel_title - px(1.))
                         .text_color(t.text_secondary)
                         .font_features(t.numbers.clone())
                         .child(format!(
@@ -1517,7 +1746,7 @@ impl DiskMap {
             .child(
                 div()
                     .id("disk-map-kinds")
-                    .w(px(280.))
+                    .w(px(300.))
                     .flex_shrink_0()
                     .overflow_y_scroll()
                     .p(px(8.))
@@ -1530,33 +1759,8 @@ impl DiskMap {
             .child(self.table(tree, cx))
     }
 
-    fn rail(&self, tree: &Arc<Tree>, cx: &Context<Self>) -> impl IntoElement {
+    fn rail(&self, tree: &Arc<Tree>, id: u32, cx: &Context<Self>) -> impl IntoElement {
         let t = theme(cx);
-        let content: AnyElement = match self.selected {
-            None => div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(10.))
-                .pt(px(60.))
-                .child(Icon::new(IconName::Info).size(px(24.)).text_color(t.text_tertiary))
-                .child(
-                    div()
-                        .text_size(t.panel_title)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(t.text_secondary)
-                        .child("Select an item"),
-                )
-                .child(
-                    div()
-                        .text_size(t.caption)
-                        .text_color(t.text_tertiary)
-                        .text_center()
-                        .child("Its size, age and location appear here, with Open, Show in file manager and Move to Trash."),
-                )
-                .into_any_element(),
-            Some(id) => self.details(tree, id, cx).into_any_element(),
-        };
         div()
             .id("disk-map-rail")
             .size_full()
@@ -1564,7 +1768,7 @@ impl DiskMap {
             .border_l(t.hairline_width)
             .border_color(t.hairline)
             .p(px(14.))
-            .child(content)
+            .child(self.details(tree, id, cx))
     }
 
     fn details(&self, tree: &Arc<Tree>, id: u32, cx: &Context<Self>) -> impl IntoElement {
@@ -1653,6 +1857,7 @@ impl DiskMap {
                     )
                     .child(
                         div()
+                            .flex_1()
                             .flex()
                             .flex_col()
                             .min_w_0()
@@ -1669,6 +1874,14 @@ impl DiskMap {
                                     .text_color(t.text_secondary)
                                     .child(kind_label),
                             ),
+                    )
+                    .child(
+                        Button::new("disk-map-close")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::X))
+                            .tooltip("Close (Escape)")
+                            .on_click(cx.listener(|this, _, _, cx| this.select(None, cx))),
                     ),
             )
             .child(
@@ -1855,27 +2068,375 @@ impl DiskMap {
                                     ),
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select(Some(c));
-                                    cx.notify();
+                                    this.select(Some(c), cx);
                                 }))
                         })),
                 )
             })
     }
 
+    fn scanning(&self, scan: &Arc<Scan>, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let t = theme(cx);
+        let now = Instant::now();
+        let progress = &scan.progress;
+        let items = progress.items.load(Ordering::Relaxed);
+        let found = progress.bytes.load(Ordering::Relaxed);
+        let folders = progress.folders.load(Ordering::Relaxed);
+        let elapsed = scan.started.elapsed();
+        let rate = (elapsed.as_secs_f64() >= 1.).then(|| folders as f64 / elapsed.as_secs_f64());
+        let level = progress.level();
+        let tops = Rc::new(level.tops);
+        let fs = self.live.read(cx).latest.as_ref().and_then(|s| s.fs.clone());
+        let holding = fs
+            .as_ref()
+            .and_then(|fs| filesystem_holding(fs, &self.root))
+            .map(|(f, m)| (f.clone(), m == self.root.as_os_str()));
+        let used = holding
+            .as_ref()
+            .filter(|(f, whole)| *whole && f.used_bytes > 0)
+            .map(|(f, _)| f.used_bytes);
+        let fraction = used.map(|used| (found as f64 / used as f64).min(1.) as f32);
+        {
+            let mut v = self.visual.borrow_mut();
+            let key = (Arc::as_ptr(scan) as usize, level.path.clone());
+            if v.key != key {
+                *v = ScanVisual {
+                    key,
+                    ..Default::default()
+                };
+            }
+            if let Some(f) = fraction {
+                v.ring.set(f, now);
+            }
+            v.done_at.resize(tops.len(), None);
+            for (i, top) in tops.iter().enumerate() {
+                if top.done && v.done_at[i].is_none() {
+                    v.done_at[i] = Some(now);
+                }
+            }
+        }
+
+        let subtitle = holding.as_ref().map(|(f, whole)| {
+            let place = if *whole {
+                format!("{} · {}", f.device, f.fstype)
+            } else {
+                let mount = f
+                    .mounts
+                    .iter()
+                    .filter(|m| self.root.starts_with(m))
+                    .max_by_key(|m| m.len())
+                    .cloned()
+                    .unwrap_or_default();
+                format!("On {mount} · {} · {}", f.device, f.fstype)
+            };
+            format!(
+                "{place} · {} capacity · {} used",
+                bytes(f.total_bytes as f64),
+                bytes(f.used_bytes as f64)
+            )
+        });
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(14.))
+            .child(
+                div()
+                    .size(px(48.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(12.))
+                    .bg(t.blue.opacity(0.16))
+                    .child(Icon::new(IconName::HardDrive).size(px(24.)).text_color(t.blue)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(t.small_caption)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.blue)
+                            .child(if progress.cancelled() { "STOPPING" } else { "SCANNING" }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(22.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(self.root.display().to_string()),
+                    )
+                    .when_some(subtitle, |d, sub| {
+                        d.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(t.text_secondary)
+                                .font_features(t.numbers.clone())
+                                .child(sub),
+                        )
+                    }),
+            )
+            .child(
+                Button::new("disk-map-cancel-scan")
+                    .outline()
+                    .icon(Icon::new(IconName::X))
+                    .label("Cancel")
+                    .tooltip("Stop scanning and map what has been found")
+                    .disabled(progress.cancelled())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(scan) = &this.scan {
+                            scan.progress.cancel();
+                        }
+                        cx.notify();
+                    })),
+            );
+
+        let ring = {
+            let visual = self.visual.clone();
+            let started = scan.started;
+            let determinate = fraction.is_some();
+            let colours = (t.text.opacity(0.07), t.blue, t.teal);
+            let (big, small) = match (fraction, used) {
+                (Some(f), Some(used)) => (
+                    format!("{:.0}%", (f * 100.).floor()),
+                    format!("of {} used", bytes(used as f64)),
+                ),
+                _ => (bytes(found as f64), "found so far".to_string()),
+            };
+            div()
+                .size(px(212.))
+                .flex_shrink_0()
+                .relative()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(2.))
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            let now = Instant::now();
+                            let turn = (now.saturating_duration_since(started).as_secs_f32() * 0.55).fract();
+                            let f = determinate.then(|| visual.borrow().ring.at(now));
+                            paint_ring(bounds, f, turn, colours, window);
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(
+                    div()
+                        .text_size(px(if determinate { 40. } else { 28. }))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_features(t.numbers.clone())
+                        .child(big),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(t.text_secondary)
+                        .font_features(t.numbers.clone())
+                        .child(small),
+                )
+        };
+
+        let stat = |label: &'static str, value: String| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .px(px(14.))
+                .py(px(10.))
+                .rounded(px(10.))
+                .bg(t.text.opacity(0.035))
+                .border_1()
+                .border_color(t.hairline)
+                .child(
+                    div()
+                        .text_size(t.small_caption)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.text_tertiary)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(px(20.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_features(t.numbers.clone())
+                        .whitespace_nowrap()
+                        .child(value),
+                )
+        };
+        let counters = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(10.))
+                    .child(stat("ITEMS", compact(items)))
+                    .child(stat("FOUND", bytes(found as f64))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(10.))
+                    .child(stat(
+                        "FOLDERS / S",
+                        rate.map_or("–".into(), |r| compact(r.round() as u64)),
+                    ))
+                    .child(stat("ELAPSED", clock(elapsed.as_secs()))),
+            );
+
+        let done = tops.iter().filter(|top| top.done).count();
+        let place = level.path.display().to_string();
+        let map_title = if tops.is_empty() {
+            format!("Listing {}…", middle_ellipsis(&place, 60))
+        } else {
+            format!(
+                "{done} of {} complete in {}",
+                compact(tops.len() as u64),
+                middle_ellipsis(&place, 60)
+            )
+        };
+        let legend = |label: &'static str, color: Hsla| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(5.))
+                .child(swatch(color, 9.))
+                .child(label)
+        };
+        let partial = {
+            let visual = self.visual.clone();
+            let tops = tops.clone();
+            let started = scan.started;
+            let font = gpui::font(t.font.clone());
+            div().flex_1().min_h_0().child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, cx| paint_partial(bounds, &tops, &visual, started, &font, window, cx),
+                )
+                .size_full(),
+            )
+        };
+        let map_card = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .p(px(12.))
+            .rounded(px(12.))
+            .bg(t.text.opacity(0.025))
+            .border_1()
+            .border_color(t.hairline)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(14.))
+                    .text_size(t.caption)
+                    .text_color(t.text_secondary)
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.text)
+                            .font_features(t.numbers.clone())
+                            .child(map_title),
+                    )
+                    .child(legend("Complete", t.blue))
+                    .child(legend("Still counting", t.text.opacity(0.16))),
+            )
+            .child(partial);
+
+        let current = progress.current();
+        let path_line = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.))
+            .px(px(14.))
+            .py(px(9.))
+            .rounded(px(8.))
+            .bg(t.text.opacity(0.035))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(t.caption)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(t.text_tertiary)
+                    .child("READING"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .font_family(t.mono.clone())
+                    .text_size(px(12.))
+                    .text_color(t.text_secondary)
+                    .child(if current.as_os_str().is_empty() {
+                        "–".to_string()
+                    } else {
+                        middle_ellipsis(&current.display().to_string(), 120)
+                    }),
+            );
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .px(t.page_padding)
+            .py(px(18.))
+            .child(header)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_row()
+                    .gap(px(18.))
+                    .child(
+                        div()
+                            .w(px(330.))
+                            .flex_shrink_0()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(16.))
+                            .child(ring)
+                            .child(counters),
+                    )
+                    .child(map_card),
+            )
+            .child(path_line)
+    }
+
     fn waiting(&self, cx: &Context<Self>) -> impl IntoElement {
         let t = theme(cx);
-        let (title, detail): (String, String) = match (&self.scan, &self.error) {
-            (Some(scan), _) => (
-                format!("Scanning {}…", self.root.display()),
-                format!(
-                    "{} items, {} so far. A whole system takes a while; the map appears when the scan ends.",
-                    compact(scan.progress.items.load(Ordering::Relaxed)),
-                    bytes(scan.progress.bytes.load(Ordering::Relaxed) as f64)
-                ),
-            ),
-            (None, Some(error)) => ("The scan failed".into(), error.to_string()),
-            (None, None) => (
+        let (title, detail): (String, String) = match &self.error {
+            Some(error) => ("The scan failed".into(), error.to_string()),
+            None => (
                 format!("Map {}", self.root.display()),
                 "Scan it to see what is using the space.".into(),
             ),
@@ -1905,16 +2466,28 @@ impl DiskMap {
 
 impl Render for DiskMap {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let toolbar = self.toolbar(cx).into_any_element();
+        let first_scan = self.tree.is_none() && self.scan.is_some();
+        let toolbar = (!first_scan).then(|| self.toolbar(cx).into_any_element());
         let body = match self.tree.clone() {
-            None => self.waiting(cx).into_any_element(),
+            None => match self.scan.clone() {
+                Some(scan) => {
+                    if !paused(cx) {
+                        window.request_animation_frame();
+                    }
+                    self.scanning(&scan, cx).into_any_element()
+                }
+                None => self.waiting(cx).into_any_element(),
+            },
             Some(tree) => {
                 let content = match self.mode {
                     Mode::Map => self.map(&tree, cx).into_any_element(),
                     Mode::Largest | Mode::Oldest => self.table(&tree, cx).into_any_element(),
                     Mode::Kinds => self.kinds_view(&tree, cx).into_any_element(),
                 };
-                let rail = sidebar::showing(&self.rail, cx).then(|| self.rail(&tree, cx).into_any_element());
+                let rail = self
+                    .shown
+                    .filter(|id| (*id as usize) < tree.nodes.len() && sidebar::showing(&self.rail, cx))
+                    .map(|id| self.rail(&tree, id, cx).into_any_element());
                 div()
                     .flex_1()
                     .min_h_0()
@@ -1941,11 +2514,15 @@ impl Render for DiskMap {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
                 if e.keystroke.key == "escape" {
-                    this.back(cx);
+                    if this.selected.is_some() {
+                        this.select(None, cx);
+                    } else {
+                        this.back(cx);
+                    }
                 }
             }))
-            .child(toolbar)
-            .child(hline(cx))
+            .children(toolbar)
+            .when(!first_scan, |d| d.child(hline(cx)))
             .child(body)
     }
 }
@@ -1966,6 +2543,113 @@ struct Surface {
 
 fn to_bounds(r: Rect, origin: gpui::Point<Pixels>) -> Bounds<Pixels> {
     Bounds::new(point(origin.x + px(r.x), origin.y + px(r.y)), size(px(r.w), px(r.h)))
+}
+
+/// The top level of a running scan as a treemap: complete entries in colour, the rest pulsing until counted.
+fn paint_partial(
+    bounds: Bounds<Pixels>,
+    tops: &[Top],
+    visual: &RefCell<ScanVisual>,
+    started: Instant,
+    font: &Font,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let t = theme(cx);
+    let now = Instant::now();
+    let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+    let mut order: Vec<usize> = (0..tops.len()).filter(|i| tops[*i].bytes > 0).collect();
+    order.sort_by_key(|i| std::cmp::Reverse(tops[*i].bytes));
+    order.truncate(SCAN_TILES);
+    let values: Vec<f64> = order.iter().map(|i| tops[*i].bytes as f64).collect();
+    let mut target = vec![None; tops.len()];
+    for (rect, i) in squarify(&values, Rect { x: 0., y: 0., w, h }).into_iter().zip(&order) {
+        target[*i] = Some(rect);
+    }
+    let (shown, done_at) = {
+        let mut v = visual.borrow_mut();
+        v.glide.retarget(target, (w, h), now);
+        (v.glide.at(now), v.done_at.clone())
+    };
+    let mut medium = font.clone();
+    medium.weight = FontWeight::MEDIUM;
+    let mut numbers = font.clone();
+    numbers.features = t.numbers.clone();
+    let (text_secondary, text_tertiary, blue) = (t.text_secondary, t.text_tertiary, t.blue);
+    let line = px(TILE_LINE + 1.);
+    let clock = now.saturating_duration_since(started).as_secs_f32();
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        for (i, rect) in shown.iter().enumerate() {
+            let Some(r) = rect.filter(|r| r.w >= 2. && r.h >= 2.) else {
+                continue;
+            };
+            let top = &tops[i];
+            let b = to_bounds(
+                Rect {
+                    x: r.x + 1.5,
+                    y: r.y + 1.5,
+                    w: r.w - 3.,
+                    h: r.h - 3.,
+                },
+                bounds.origin,
+            );
+            let radius = px(if r.w >= 24. && r.h >= 24. { 5. } else { 2. });
+            let pulse = 0.5 + 0.5 * (clock * std::f32::consts::TAU / 1.8 - i as f32 * 0.45).sin();
+            window.paint_quad(
+                fill(b, gpui::white().opacity(0.04 + 0.04 * pulse))
+                    .corner_radii(radius)
+                    .border_widths(px(1.))
+                    .border_color(gpui::white().opacity(0.08 + 0.05 * pulse)),
+            );
+            let colour = if top.dir { blue } else { kind_colour(top.kind) };
+            let shade = done_at
+                .get(i)
+                .copied()
+                .flatten()
+                .map_or(0., |at| eased(at, now, DONE_FADE));
+            if shade > 0. {
+                window.paint_quad(
+                    fill(
+                        b,
+                        linear_gradient(
+                            160.,
+                            linear_color_stop(colour.opacity(0.92 * shade), 0.),
+                            linear_color_stop(colour.opacity(0.68 * shade), 1.),
+                        ),
+                    )
+                    .corner_radii(radius),
+                );
+            }
+            if r.w < LABEL_MIN_W + 8. || r.h < LABEL_MIN_H + 8. {
+                continue;
+            }
+            let ink = if shade > 0.5 { label_ink(colour) } else { text_secondary };
+            let max = r.w - 14.;
+            let x = b.origin.x + px(7.);
+            if let Some(name) = fitted(window, &medium, &top.name, px(TILE_NAME + 1.), max, ink) {
+                name.paint(point(x, b.origin.y + px(6.)), line, TextAlign::Left, None, window, cx)
+                    .ok();
+            }
+            if r.h >= 6. + 2. * (TILE_LINE + 1.) + 6. {
+                let (text, size_ink) = if top.done {
+                    (bytes(top.bytes as f64), ink.opacity(0.8))
+                } else {
+                    (format!("{}…", bytes(top.bytes as f64)), text_tertiary)
+                };
+                if let Some(size) = fitted(window, &numbers, &text, px(TILE_SIZE + 1.), max, size_ink) {
+                    size.paint(
+                        point(x, b.origin.y + px(6. + TILE_LINE + 1.)),
+                        line,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    )
+                    .ok();
+                }
+            }
+        }
+    });
 }
 
 /// `text` cut with an ellipsis to fit `max` pixels, or `None` when not even one letter fits.
@@ -2026,7 +2710,8 @@ impl Surface {
 
     fn paint(self, bounds: Bounds<Pixels>, hitbox: Hitbox, window: &mut Window, cx: &mut App) {
         let t = theme(cx);
-        let (secondary, small, caption, text, page) = (t.text_secondary, t.axis, t.small_caption, t.text, t.window);
+        let (secondary, text, page) = (t.text_secondary, t.text, t.window);
+        let (name_size, size_size) = (px(TILE_NAME), px(TILE_SIZE));
         let features = t.numbers.clone();
         let tiles = self.tiles(bounds);
         let origin = bounds.origin;
@@ -2036,7 +2721,7 @@ impl Surface {
         medium.weight = FontWeight::MEDIUM;
         let mut numbers = self.font.clone();
         numbers.features = features;
-        let text_line = px(13.);
+        let text_line = px(TILE_LINE);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for tile in tiles.iter() {
                 let b = to_bounds(tile.rect, origin);
@@ -2050,10 +2735,10 @@ impl Surface {
                         );
                         if strip && tile.rect.w > 30. {
                             let (name, size_text) = self.label(tile);
-                            let size_line = shape(window, &numbers, size_text.into(), small, secondary);
+                            let size_line = shape(window, &numbers, size_text.into(), size_size, secondary);
                             let room = tile.rect.w - 10. - size_line.width / px(1.) - 6.;
-                            let y = b.origin.y + px((STRIP - 13.) / 2.);
-                            if let Some(name_line) = fitted(window, &bold, &name, caption, room, text.opacity(0.88)) {
+                            let y = b.origin.y + px((STRIP - TILE_LINE) / 2.);
+                            if let Some(name_line) = fitted(window, &bold, &name, name_size, room, text.opacity(0.88)) {
                                 name_line
                                     .paint(
                                         point(b.origin.x + px(5.), y),
@@ -2111,9 +2796,9 @@ impl Surface {
                             let (name, size_text) = self.label(tile);
                             let max = tile.rect.w - 8.;
                             let x = b.origin.x + px(4.);
-                            if let Some(line) = fitted(window, &medium, &name, px(10.5), max, ink) {
+                            if let Some(line) = fitted(window, &medium, &name, name_size, max, ink) {
                                 line.paint(
-                                    point(x, b.origin.y + px(2.)),
+                                    point(x, b.origin.y + px(3.)),
                                     text_line,
                                     TextAlign::Left,
                                     None,
@@ -2122,11 +2807,12 @@ impl Surface {
                                 )
                                 .ok();
                             }
-                            if tile.rect.h >= 2. + 13. + 12.
-                                && let Some(line) = fitted(window, &numbers, &size_text, small, max, ink.opacity(0.8))
+                            if tile.rect.h >= 3. + 2. * TILE_LINE + 2.
+                                && let Some(line) =
+                                    fitted(window, &numbers, &size_text, size_size, max, ink.opacity(0.8))
                             {
                                 line.paint(
-                                    point(x, b.origin.y + px(15.)),
+                                    point(x, b.origin.y + px(3. + TILE_LINE)),
                                     text_line,
                                     TextAlign::Left,
                                     None,
@@ -2432,5 +3118,97 @@ mod tests {
             (600, 0),
             "an overshoot never draws past used space"
         );
+    }
+
+    fn filesystem(device: &str, mounts: &[&str]) -> Filesystem {
+        Filesystem {
+            device: device.into(),
+            fstype: "btrfs".into(),
+            mounts: mounts.iter().map(|m| m.to_string()).collect(),
+            total_bytes: 1000,
+            used_bytes: 600,
+            avail_bytes: 350,
+            used_pct: None,
+            inodes_total: 0,
+            inodes_free: 0,
+        }
+    }
+
+    #[test]
+    fn a_folder_belongs_to_the_deepest_mount_that_contains_it() {
+        // the scanning header names the volume and its size; /home on its own disk must not report the root's
+        let mut fs = Fs::new();
+        fs.insert("root".into(), filesystem("/dev/a", &["/"]));
+        fs.insert("home".into(), filesystem("/dev/b", &["/home"]));
+        let device = |p: &str| filesystem_holding(&fs, Path::new(p)).map(|(f, m)| (f.device.clone(), m.to_string()));
+        assert_eq!(device("/home"), Some(("/dev/b".into(), "/home".into())));
+        assert_eq!(device("/home/me/src"), Some(("/dev/b".into(), "/home".into())));
+        assert_eq!(device("/usr"), Some(("/dev/a".into(), "/".into())));
+        assert_eq!(
+            device("/homework"),
+            Some(("/dev/a".into(), "/".into())),
+            "a shared prefix is not a parent"
+        );
+    }
+
+    #[test]
+    fn a_long_path_keeps_both_ends() {
+        let path = "/home/me/.cache/some/very/deep/folder/file.bin";
+        let cut = middle_ellipsis(path, 21);
+        assert_eq!(cut.chars().count(), 21);
+        assert!(cut.starts_with("/home/me/") && cut.ends_with("file.bin") && cut.contains('…'));
+        assert_eq!(middle_ellipsis("/usr", 21), "/usr");
+    }
+
+    #[test]
+    fn elapsed_time_reads_as_a_clock() {
+        assert_eq!(clock(7), "0:07");
+        assert_eq!(clock(125), "2:05");
+        assert_eq!(clock(3 * 3600 + 61), "3:01:01");
+    }
+
+    fn rect(x: f32, w: f32) -> Option<Rect> {
+        Some(Rect { x, y: 0., w, h: 10. })
+    }
+
+    #[test]
+    fn scanning_tiles_glide_to_a_new_layout_by_elapsed_time() {
+        // motion follows the clock, not the frame count, so a slow frame never slows the animation
+        let start = Instant::now();
+        let mut g = Glide::default();
+        g.retarget(vec![rect(0., 100.)], (100., 10.), start);
+        let grown = g.at(start + GLIDE)[0].unwrap();
+        assert_eq!((grown.x, grown.w), (0., 100.), "a new tile grows into place");
+        g.retarget(vec![rect(0., 50.)], (100., 10.), start + GLIDE);
+        assert_eq!(g.at(start + GLIDE)[0].unwrap().w, 100.);
+        let mid = g.at(start + GLIDE + GLIDE / 2)[0].unwrap().w;
+        assert!(mid < 100. && mid > 50.);
+        assert!(100. - mid > 25., "ease-out covers most of the way in the first half");
+        assert_eq!(g.at(start + GLIDE * 3)[0].unwrap().w, 50.);
+    }
+
+    #[test]
+    fn a_resize_snaps_the_scanning_tiles() {
+        // a tile caught mid-glide from the old size would hang past the new edge
+        let start = Instant::now();
+        let mut g = Glide::default();
+        g.retarget(vec![rect(0., 100.)], (100., 10.), start);
+        g.retarget(vec![rect(0., 80.)], (80., 10.), start + GLIDE * 2);
+        assert_eq!(g.at(start + GLIDE * 2)[0].unwrap().w, 80.);
+    }
+
+    #[test]
+    fn the_ring_eases_from_where_it_is_shown() {
+        let start = Instant::now();
+        let mut e = Eased::default();
+        e.set(0.4, start);
+        let half = e.at(start + RING_EASE / 2);
+        e.set(0.6, start + RING_EASE / 2);
+        assert_eq!(
+            e.at(start + RING_EASE / 2),
+            half,
+            "a new target never makes the ring jump"
+        );
+        assert_eq!(e.at(start + RING_EASE * 2), 0.6);
     }
 }
