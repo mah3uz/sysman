@@ -10,8 +10,7 @@ glibc_max=2.35
 maintainer='Mahfuz Shaikh <mah3uz@gmail.com>'
 
 # libraries GPUI and wgpu open with dlopen at run time, which dpkg-shlibdeps cannot see
-dlopen_depends=(libwayland-client0 libwayland-cursor0 libwayland-egl1 libvulkan1 libegl1 libgl1
-  libxkbcommon0 libxkbcommon-x11-0 libx11-xcb1 libxcb1 libfontconfig1 libfreetype6)
+dlopen_depends=(libwayland-client0 libwayland-egl1 libvulkan1 libegl1)
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -22,11 +21,15 @@ apt-get install -y -qq --no-install-recommends \
   libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libx11-xcb-dev \
   libfontconfig-dev libfreetype-dev librsvg2-bin >/dev/null
 
+# clang -target bpf does not search the multiarch include directory
+ln -sfn x86_64-linux-gnu/asm /usr/include/asm
+
 export CARGO_HOME=${CARGO_HOME:-/root/.cargo} RUSTUP_HOME=${RUSTUP_HOME:-/root/.rustup}
 export PATH=$CARGO_HOME/bin:$PATH
 if ! command -v rustc >/dev/null; then
   curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 fi
+rustup component add rustfmt
 
 cd "$src"
 ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
