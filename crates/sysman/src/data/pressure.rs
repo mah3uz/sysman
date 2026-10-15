@@ -2,6 +2,8 @@
 const KNOTS: [(f64, f64); 4] = [(0., 0.), (5., 34.), (20., 67.), (50., 100.)];
 pub const WARNING: f64 = 34.;
 pub const CRITICAL: f64 = 67.;
+/// Y ticks for a pressure chart, on its Warning and Critical rules.
+pub const TICKS: [f64; 4] = [0., WARNING, CRITICAL, 100.];
 const SWAP_IN_FLOOR_BPS: f64 = 1024. * 1024.;
 /// The kernel reports swap-in in pages; every architecture we run on uses 4 KiB pages.
 pub const PAGE_BYTES: f64 = 4096.;

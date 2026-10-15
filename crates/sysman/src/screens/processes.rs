@@ -1514,6 +1514,7 @@ impl Processes {
                 source: card.source(),
             }],
             rules: vec![],
+            ticks: None,
             meaning,
             method,
             range: self.range,

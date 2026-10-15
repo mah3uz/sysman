@@ -881,6 +881,7 @@ impl Network {
             fill: unit == Unit::BytesPerSec,
             lines,
             rules: vec![],
+            ticks: None,
             meaning,
             method,
             range: self.range,

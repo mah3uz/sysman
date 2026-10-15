@@ -196,6 +196,16 @@ fn domain(y: YScale, unit: Unit, lo: f64, hi: f64) -> (f64, f64, Vec<f64>) {
     (ticks[0], ticks[ticks.len() - 1], ticks)
 }
 
+/// `domain`, with `explicit` ticks inside it, in their given order, in place of the round ones.
+fn axis(y: YScale, unit: Unit, lo: f64, hi: f64, explicit: Option<&[f64]>) -> (f64, f64, Vec<f64>) {
+    let (lo, hi, ticks) = domain(y, unit, lo, hi);
+    let ticks = match explicit {
+        Some(explicit) => explicit.iter().copied().filter(|v| *v >= lo && *v <= hi).collect(),
+        None => ticks,
+    };
+    (lo, hi, ticks)
+}
+
 pub struct Line {
     pub data: Rc<[Bucket]>,
     pub color: Hsla,
@@ -268,6 +278,7 @@ pub struct TrendChart {
     markers: Vec<(f64, f64, Hsla)>,
     unit: Unit,
     y: YScale,
+    ticks: Option<Vec<f64>>,
     fill: bool,
     relative: bool,
     height: Pixels,
@@ -290,6 +301,7 @@ impl TrendChart {
             markers: Vec::new(),
             unit: Unit::Percent,
             y: YScale::Zero,
+            ticks: None,
             fill: false,
             relative: false,
             height: px(150.),
@@ -344,6 +356,12 @@ impl TrendChart {
         self
     }
 
+    /// Y ticks at exactly these values, such as the thresholds the rules mark, instead of round steps.
+    pub fn ticks(mut self, ticks: &[f64]) -> Self {
+        self.ticks = Some(ticks.to_vec());
+        self
+    }
+
     pub fn fill(mut self) -> Self {
         self.fill = true;
         self
@@ -394,7 +412,7 @@ impl TrendChart {
                 hi = hi.max(b.max);
             }
         }
-        let (lo, hi, ticks) = domain(self.y, self.unit, lo, hi);
+        let (lo, hi, ticks) = axis(self.y, self.unit, lo, hi, self.ticks.as_deref());
         let span = (hi - lo).max(f64::EPSILON);
         let y_of = |v: f64| {
             let f = ((v - lo) / span).clamp(-0.02, 1.02) as f32;
@@ -891,5 +909,25 @@ mod tests {
         assert_eq!(hi, 1024., "an empty chart still has an axis");
         let (lo, hi, _) = domain(YScale::Fit(10.), Unit::Celsius, 60., 61.);
         assert!(hi - lo >= 10.);
+    }
+
+    #[test]
+    fn explicit_ticks_sit_on_the_thresholds_instead_of_round_steps() {
+        let fixed = YScale::Fixed(0., 100.);
+        let (_, _, auto) = axis(fixed, Unit::Index, 0., 50., None);
+        assert_eq!(auto, [0., 20., 40., 60., 80., 100.]);
+        let (lo, hi, ticks) = axis(fixed, Unit::Index, 0., 50., Some(&[0., 34., 67., 100.]));
+        assert_eq!((lo, hi), (0., 100.), "the ticks label the axis; they do not rescale it");
+        assert_eq!(ticks, [0., 34., 67., 100.]);
+        let (_, _, ticks) = axis(fixed, Unit::Percent, 0., 50., Some(&[100., 85., 60., 0.]));
+        assert_eq!(ticks, [100., 85., 60., 0.], "given order is kept, not re-sorted");
+        let (_, _, ticks) = axis(
+            YScale::Fixed(0., 80.),
+            Unit::Percent,
+            0.,
+            50.,
+            Some(&[0., 60., 85., 100.]),
+        );
+        assert_eq!(ticks, [0., 60.], "a tick outside the axis would be drawn off the plot");
     }
 }

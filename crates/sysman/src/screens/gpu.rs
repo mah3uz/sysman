@@ -788,6 +788,7 @@ impl Gpu {
                 source: field.source(&pci, &self.known),
             }],
             rules,
+            ticks: None,
             meaning,
             method,
             range: self.range,

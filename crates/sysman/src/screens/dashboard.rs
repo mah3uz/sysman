@@ -36,6 +36,10 @@ use crate::ui::widgets::text::caption;
 const BUCKETS: u32 = 120;
 /// Stored history is re-read this often; the live rings cover the newest 30 minutes in between.
 const RELOAD_S: f64 = 60.;
+const BUSY: f64 = 60.;
+const HEAVY: f64 = 85.;
+/// Y ticks for the processor chart, on its Busy and Heavy rules.
+const CPU_TICKS: [f64; 4] = [0., BUSY, HEAVY, 100.];
 const CHART_HEIGHT: f32 = 150.;
 const RAIL_CHART_HEIGHT: f32 = 120.;
 const TOP_ROWS: usize = 5;
@@ -799,7 +803,7 @@ impl Dashboard {
                 Unit::Percent,
                 YScale::Fixed(0., 100.),
                 vec![line(Metric::Cpu, "CPU", t.green)],
-                vec![(60., "Busy".into(), t.orange), (85., "Heavy".into(), t.red)],
+                vec![(BUSY, "Busy".into(), t.orange), (HEAVY, "Heavy".into(), t.red)],
             ),
             Metric::NetDown | Metric::NetUp => (
                 "Network",
@@ -884,6 +888,11 @@ impl Dashboard {
             ),
         };
         let (meaning, method) = metric.explanation();
+        let ticks = match metric {
+            Metric::Pressure => Some(&pressure::TICKS[..]),
+            Metric::Cpu => Some(&CPU_TICKS[..]),
+            _ => None,
+        };
         Detail {
             title: title.into(),
             icon,
@@ -892,6 +901,7 @@ impl Dashboard {
             fill: !matches!(unit, Unit::Index | Unit::Percent | Unit::Celsius),
             lines,
             rules,
+            ticks,
             meaning,
             method,
             range: self.range,
@@ -907,6 +917,7 @@ impl Dashboard {
                     .line(self.data(Metric::Pressure), t.orange, "Pressure")
                     .rule(WARNING, "Warning", t.orange)
                     .rule(CRITICAL, "Critical", t.red)
+                    .ticks(&pressure::TICKS)
                     .unit(Unit::Index)
                     .y(YScale::Fixed(0., 100.))
                     .height(px(CHART_HEIGHT)),
@@ -955,8 +966,9 @@ impl Dashboard {
             .child(
                 self.chart(&self.charts.cpu, Metric::Cpu, cx)
                     .line(self.data(Metric::Cpu), t.green, "CPU")
-                    .rule(60., "Busy", t.orange)
-                    .rule(85., "Heavy", t.red)
+                    .rule(BUSY, "Busy", t.orange)
+                    .rule(HEAVY, "Heavy", t.red)
+                    .ticks(&CPU_TICKS)
                     .unit(Unit::Percent)
                     .y(YScale::Fixed(0., 100.))
                     .height(px(CHART_HEIGHT)),

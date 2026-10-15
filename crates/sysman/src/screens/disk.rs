@@ -1499,6 +1499,7 @@ impl Disk {
             fill,
             lines,
             rules: vec![],
+            ticks: None,
             meaning,
             method,
             range: self.range,

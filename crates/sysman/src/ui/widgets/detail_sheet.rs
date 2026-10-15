@@ -44,6 +44,8 @@ pub struct Detail {
     pub fill: bool,
     pub lines: Vec<Series>,
     pub rules: Vec<(f64, SharedString, Hsla)>,
+    /// Explicit y ticks, such as the rule values; `None` for round ones.
+    pub ticks: Option<&'static [f64]>,
     pub meaning: &'static str,
     pub method: &'static str,
     pub range: Range,
@@ -343,6 +345,9 @@ impl Render for Sheet {
         }
         for (value, label, color) in &d.rules {
             chart = chart.rule(*value, label.clone(), *color);
+        }
+        if let Some(ticks) = d.ticks {
+            chart = chart.ticks(ticks);
         }
         if d.fill {
             chart = chart.fill();

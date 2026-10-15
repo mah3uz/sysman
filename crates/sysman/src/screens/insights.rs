@@ -25,7 +25,7 @@ use crate::data::insights::{
     ProcHistory, Severity, Target, band_label, short_duration,
 };
 use crate::data::live::Live;
-use crate::data::pressure::{Band, CRITICAL, WARNING};
+use crate::data::pressure::{self, Band, CRITICAL, WARNING};
 use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source};
 use crate::screens::processes::Icons;
@@ -738,6 +738,7 @@ impl Insights {
             .y(YScale::Fixed(0., 100.))
             .rule(WARNING, "Warning", t.orange)
             .rule(CRITICAL, "Critical", t.red)
+            .ticks(&pressure::TICKS)
             .height(px(CHART_HEIGHT));
         for e in &self.events {
             // On the plotted mean, so the dot sits on the curve rather than above it at the bucket's peak.
