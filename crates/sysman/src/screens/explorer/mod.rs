@@ -326,7 +326,14 @@ impl Explorer {
                 last.charts != req.charts
                     || last.procs != req.procs
                     || last.to - last.from != req.to - req.from
-                    || now - at > RELOAD_S
+                    || if req.procs.is_empty() {
+                        self.live
+                            .read(cx)
+                            .reload_due(*at, now, (req.to - req.from) as f64, RELOAD_S)
+                    } else {
+                        // Process series have no live rings to fill a pause.
+                        now - at > RELOAD_S
+                    }
             } else {
                 *last != req
             }

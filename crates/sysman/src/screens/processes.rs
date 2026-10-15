@@ -1318,9 +1318,18 @@ impl Processes {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let now = self.now(cx);
         let selected = self.inspected.as_ref().map(key);
-        let stale = self
-            .attempt
-            .is_none_or(|(range, key, at)| range != self.range || key != selected || now - at > RELOAD_S);
+        let stale = self.attempt.is_none_or(|(range, key, at)| {
+            range != self.range
+                || key != selected
+                || match selected {
+                    // The inspected process's series have no live rings to fill a pause.
+                    Some(_) => now - at > RELOAD_S,
+                    None => self
+                        .live
+                        .read(cx)
+                        .reload_due(at, now, self.range.span_s() as f64, RELOAD_S),
+                }
+        });
         if stale && !self.loading {
             self.load(now, selected, cx);
         }

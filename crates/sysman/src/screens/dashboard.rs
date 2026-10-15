@@ -342,9 +342,13 @@ impl Dashboard {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let now = self.now(cx);
-        let stale = self
-            .attempt
-            .is_none_or(|(range, at)| range != self.range || now - at > RELOAD_S);
+        let stale = self.attempt.is_none_or(|(range, at)| {
+            range != self.range
+                || self
+                    .live
+                    .read(cx)
+                    .reload_due(at, now, self.range.span_s() as f64, RELOAD_S)
+        });
         if stale && !self.loading {
             self.load(now, cx);
         }

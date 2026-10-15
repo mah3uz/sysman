@@ -404,10 +404,14 @@ impl Gpu {
             return;
         };
         let now = self.now(cx);
-        let stale = self
-            .attempt
-            .as_ref()
-            .is_none_or(|(range, p, at)| *range != self.range || *p != pci || now - at > RELOAD_S);
+        let stale = self.attempt.as_ref().is_none_or(|(range, p, at)| {
+            *range != self.range
+                || *p != pci
+                || self
+                    .live
+                    .read(cx)
+                    .reload_due(*at, now, self.range.span_s() as f64, RELOAD_S)
+        });
         if stale && !self.loading {
             self.load(now, pci.clone(), cx);
         }

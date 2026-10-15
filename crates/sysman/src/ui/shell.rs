@@ -377,6 +377,7 @@ impl Shell {
         cx.set_global(Paused(paused));
         self.sync_feed();
         if !paused {
+            self.live.update(cx, |live, _| live.resumed());
             // One catch-up render of the open tab; the rings kept ingesting, so it draws from memory.
             self.redraw(true, cx);
             self.feed_eager = true;

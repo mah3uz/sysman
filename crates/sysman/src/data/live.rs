@@ -12,7 +12,7 @@ use schema::{Meta, Record, Sample};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::data::net;
+use crate::data::{net, source};
 
 /// How long a series ring reaches back.
 pub const WINDOW_S: f64 = 30. * 60.;
@@ -113,6 +113,10 @@ pub struct Live {
     /// Kept here, not on the Network screen, so it counts while that tab is unmounted.
     pub net_session: net::Session,
     series: HashMap<String, VecDeque<(f64, f64)>>,
+    /// Sample times, trimmed as the rings are, so the front is how far back every ring reaches.
+    times: VecDeque<f64>,
+    /// Sample time at which live work last resumed after a pause.
+    resumed_at: Option<f64>,
 }
 
 impl Default for Live {
@@ -124,6 +128,8 @@ impl Default for Live {
             skipped: 0,
             net_session: net::Session::default(),
             series: HashMap::new(),
+            times: VecDeque::new(),
+            resumed_at: None,
         }
     }
 }
@@ -142,11 +148,11 @@ impl Live {
                 points,
             } => {
                 let t = sample.t;
+                trim(&mut self.times, |&t0| t0, t);
+                self.times.push_back(t);
                 for (path, v) in points {
                     let ring = self.series.entry(path).or_default();
-                    while ring.front().is_some_and(|&(t0, _)| t0 < t - WINDOW_S) || ring.len() >= RING_CAPACITY {
-                        ring.pop_front();
-                    }
+                    trim(ring, |&(t0, _)| t0, t);
                     ring.push_back((t, v));
                 }
                 if let Some(n) = &sample.net {
@@ -155,6 +161,16 @@ impl Live {
                 self.merge(*sample);
             }
         }
+    }
+
+    pub fn resumed(&mut self) {
+        self.resumed_at = self.latest.as_ref().map(|s| s.t);
+    }
+
+    /// Whether history a screen read at `read_at` for `span_s` is due again; see [`source::reload_due`].
+    pub fn reload_due(&self, read_at: f64, now: f64, span_s: f64, every_s: f64) -> bool {
+        let rings_from = self.times.front().copied().unwrap_or(f64::INFINITY);
+        source::reload_due(read_at, now, span_s, every_s, self.resumed_at, rings_from)
     }
 
     /// `(t, value)` oldest first.
@@ -191,6 +207,13 @@ impl Live {
         latest.t = sample.t;
         latest.time = sample.time;
         latest.errors = sample.errors;
+    }
+}
+
+/// Drops what falls out of the window before a point at `t` is added, or what would exceed the capacity.
+fn trim<T>(ring: &mut VecDeque<T>, time: impl Fn(&T) -> f64, t: f64) {
+    while ring.front().is_some_and(|p| time(p) < t - WINDOW_S) || ring.len() >= RING_CAPACITY {
+        ring.pop_front();
     }
 }
 

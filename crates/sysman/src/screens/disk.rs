@@ -425,10 +425,13 @@ impl Disk {
         }
         let now = self.now(cx);
         if let Some(key) = self.key(cx) {
-            let stale = self
-                .attempt
-                .as_ref()
-                .is_none_or(|(k, at)| *k != key || now - at > RELOAD_S);
+            let stale = self.attempt.as_ref().is_none_or(|(k, at)| {
+                *k != key
+                    || self
+                        .live
+                        .read(cx)
+                        .reload_due(*at, now, self.range.span_s() as f64, RELOAD_S)
+            });
             if stale && !self.loading {
                 self.load(key, now, cx);
             }

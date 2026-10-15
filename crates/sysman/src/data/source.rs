@@ -88,6 +88,18 @@ impl Source {
     }
 }
 
+/// Whether history read at `read_at` for a window `span_s` long is due again: every `every_s` from that read, or
+/// from the last resume if the live rings, which keep ingesting while paused, still fill the paused stretch.
+pub fn reload_due(read_at: f64, now: f64, span_s: f64, every_s: f64, resumed_at: Option<f64>, rings_from: f64) -> bool {
+    // A read's newest `every_s` may still be missing, since the daemon writes history in batches.
+    let filled = rings_from <= (read_at - every_s).max(now - span_s);
+    let since = match resumed_at {
+        Some(resumed) if resumed > read_at && filled => resumed,
+        _ => read_at,
+    };
+    now - since > every_s
+}
+
 /// `stored` up to the first bucket that `points` (ms, value; oldest first, starting at `start` s) cover whole,
 /// then the points bucketed on the same grid.
 pub fn top_up(
@@ -225,6 +237,58 @@ mod tests {
         let source = Source::new(vec!["/a".into()], Combine::Sum);
         let stored = [bucket(0, 1.), bucket(15, 2.)];
         assert_eq!(source.top_up(&stored, &Live::default(), 0, 15), stored);
+    }
+
+    #[test]
+    fn a_resume_rereads_history_only_when_the_rings_left_a_gap() {
+        const MIN: f64 = 60.;
+        let rings_kept = |now: f64| now - 30. * MIN;
+        let (read, every) = (10_000., MIN);
+        assert!(!reload_due(
+            read,
+            read + 59.,
+            3600.,
+            every,
+            None,
+            rings_kept(read + 59.)
+        ));
+        assert!(
+            reload_due(read, read + 61., 3600., every, None, rings_kept(read + 61.)),
+            "while live, the minute schedule stands"
+        );
+
+        let resumed = read + 10. * MIN;
+        assert!(
+            !reload_due(read, resumed, 3600., every, Some(resumed), rings_kept(resumed)),
+            "a 10 min pause on a 1 h window: the 30 min rings hold the whole pause"
+        );
+        assert!(
+            reload_due(
+                read,
+                resumed + 61.,
+                3600.,
+                every,
+                Some(resumed),
+                rings_kept(resumed + 61.)
+            ),
+            "the minute schedule restarts from the resume"
+        );
+
+        let resumed = read + 45. * MIN;
+        assert!(
+            reload_due(read, resumed, 3600., every, Some(resumed), rings_kept(resumed)),
+            "a 45 min pause on a 1 h window leaves 15 min the rings no longer hold"
+        );
+        assert!(
+            !reload_due(read, resumed, 5. * MIN, every, Some(resumed), rings_kept(resumed)),
+            "a 5 min window lies inside the rings, however long the pause"
+        );
+
+        let resumed = read + 5. * MIN;
+        assert!(
+            reload_due(read, resumed, 3600., every, Some(resumed), read - 10.),
+            "rings that start just before the read cannot vouch for its unwritten last minute"
+        );
     }
 
     #[test]

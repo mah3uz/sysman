@@ -705,10 +705,14 @@ impl Energy {
         let snap = self.snapshot(cx);
         let layout = layout(&snap.power);
         let now = self.now(cx);
-        let stale = self
-            .attempt
-            .as_ref()
-            .is_none_or(|(r, l, at)| *r != self.range || *l != layout || now - at > RELOAD_S);
+        let stale = self.attempt.as_ref().is_none_or(|(r, l, at)| {
+            *r != self.range
+                || *l != layout
+                || self
+                    .live
+                    .read(cx)
+                    .reload_due(*at, now, self.range.span_s() as f64, RELOAD_S)
+        });
         if stale && !self.loading {
             self.attempt = Some((self.range, layout.clone(), now));
             let qs = queries(&layout, &snap, self.range);
