@@ -145,7 +145,7 @@ const paths = [
         <details name="faq" class="group py-1">
           <summary>Is it free?</summary>
           <div class="answer">
-            <p>Yes. sysman is open source under the MIT license.</p>
+            <p>Yes. sysman is free and open source.</p>
           </div>
         </details>
       </div>

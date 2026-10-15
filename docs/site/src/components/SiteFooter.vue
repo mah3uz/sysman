@@ -40,15 +40,13 @@ import logo from '@repo/assets/logo.svg'
       <div class="flex items-center gap-3">
         <img :src="logo" alt="" width="28" height="28" class="h-7 w-7" />
         <p>
-          <span class="font-semibold text-ink">sysman</span> by Mahfuz Shaikh ·
-          <a href="https://github.com/mah3uz/sysman/blob/main/LICENSE" class="underline-offset-4 hover:text-ink hover:underline">MIT license</a>
+          <span class="font-semibold text-ink">sysman</span> by Mahfuz Shaikh
         </p>
       </div>
       <ul class="flex flex-wrap gap-x-5 gap-y-2">
         <li><a href="https://github.com/mah3uz/sysman" class="inline-flex items-center gap-1.5 hover:text-ink"><Icon name="github" :size="16" /> GitHub</a></li>
         <li><a href="https://github.com/mah3uz/sysman/releases/latest" class="hover:text-ink">Releases</a></li>
         <li><a href="https://github.com/mah3uz/sysman/issues" class="hover:text-ink">Issues</a></li>
-        <li><a href="https://github.com/mah3uz/sysman/blob/main/DESIGN.md" class="hover:text-ink">Design notes</a></li>
       </ul>
     </div>
   </footer>
