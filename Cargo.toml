@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/schema", "crates/sysman", "crates/sysmand"]
+members = ["crates/schema", "crates/sysman", "crates/sysman-helper", "crates/sysmand"]
 
 [workspace.package]
 edition = "2024"

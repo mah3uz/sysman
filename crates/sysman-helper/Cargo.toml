@@ -1,0 +1,21 @@
+[package]
+name = "sysman-helper"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+schema.workspace = true
+anyhow.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# default-features off links the system libbpf instead of building a vendored copy
+libbpf-rs = { version = "0.27", default-features = false }
+
+[build-dependencies]
+libbpf-cargo = { version = "0.27", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
