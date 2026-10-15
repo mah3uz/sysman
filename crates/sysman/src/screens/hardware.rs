@@ -191,6 +191,7 @@ impl Hardware {
         #[cfg(debug_assertions)]
         {
             this.dev_scroll = std::env::var("SYSMAN_DEV_HW_SCROLL").ok().and_then(|y| y.parse().ok());
+            this.query = std::env::var("SYSMAN_DEV_HW_QUERY").unwrap_or_default();
         }
         this.refresh(cx);
         this.request_seed(cx);
@@ -731,7 +732,11 @@ impl Hardware {
             );
         let nodes: Vec<(usize, &Node)> = match only {
             Some(i) => section.nodes.get(i).map(|n| (i, n)).into_iter().collect(),
-            None => section.nodes.iter().enumerate().collect(),
+            None => {
+                let shown = filter(std::slice::from_ref(section), &self.query);
+                let keep = shown.first().map_or(&[][..], |(_, nodes)| nodes.as_slice());
+                keep.iter().map(|&i| (i, &section.nodes[i])).collect()
+            }
         };
         div()
             .flex()
@@ -758,7 +763,11 @@ impl Hardware {
                     div()
                         .text_size(px(12.))
                         .text_color(t.text_secondary)
-                        .child("Nothing reported for this section."),
+                        .child(if needle.is_empty() {
+                            "Nothing reported for this section."
+                        } else {
+                            "No matches in this section."
+                        }),
                 )
             })
             .children(nodes.into_iter().map(|(i, node)| {
