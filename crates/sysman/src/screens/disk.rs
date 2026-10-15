@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
@@ -18,7 +18,7 @@ use schema::processes::Process;
 use schema::series::escape;
 use schema::storage::{Drive, Smart, StorageMeta};
 
-use crate::charts::format::{Unit, bytes};
+use crate::charts::format::{self, Unit, bytes};
 use crate::charts::sparkline::Sparkline;
 use crate::charts::trend::{ChartState, TrendChart, YScale};
 use crate::data::helper::{self, DiskHealth, Wear};
@@ -29,7 +29,7 @@ use crate::data::source::{Combine, Source};
 use crate::screens::dashboard::{readout, top_list, whole_disk};
 use crate::screens::disk_map::DiskMap;
 use crate::ui::shell::{Focus, Tab, take_focus};
-use crate::ui::theme::{Theme, theme};
+use crate::ui::theme::{Theme, rem_px, theme};
 use crate::ui::widgets::card::card;
 use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
 use crate::ui::widgets::hairline;
@@ -534,20 +534,20 @@ impl Disk {
 fn capsule(text: impl Into<SharedString>, color: Hsla, cx: &App) -> impl IntoElement {
     let t = theme(cx);
     div()
-        .px(px(6.))
+        .px(rem_px(6.))
         .py(px(1.))
         .rounded_full()
         .bg(color.opacity(0.16))
         .text_color(color)
         .text_size(t.small_caption)
-        .font_weight(FontWeight::SEMIBOLD)
+        .font_weight(t.weight_semibold)
         .child(text.into())
 }
 
 /// A 7 px capsule track filled to `fraction`.
 fn bar(fraction: f64, color: Hsla, cx: &App) -> gpui::Div {
     let t = theme(cx);
-    div().h(px(7.)).rounded_full().bg(t.text.opacity(0.10)).child(
+    div().h(rem_px(7.)).rounded_full().bg(t.text.opacity(0.10)).child(
         div()
             .h_full()
             .rounded_full()
@@ -576,8 +576,8 @@ fn smart_block(s: &Smart, cx: &App) -> AnyElement {
     div()
         .flex()
         .flex_col()
-        .gap(px(6.))
-        .child(key_value("Verdict", verdict, verdict_tint, cx).font_weight(FontWeight::SEMIBOLD))
+        .gap(rem_px(6.))
+        .child(key_value("Verdict", verdict, verdict_tint, cx).font_weight(t.weight_semibold))
         .when_some(s.percent_used, |d, used| {
             let tint = match helper::wear(used) {
                 Wear::Fine => t.green,
@@ -647,7 +647,7 @@ impl Disk {
             .flex()
             .flex_row()
             .items_end()
-            .gap(px(20.))
+            .gap(rem_px(20.))
             .child(
                 div()
                     .flex_1()
@@ -656,7 +656,7 @@ impl Disk {
                     .flex_col()
                     .gap(px(2.))
                     .child(
-                        div().text_size(t.panel_title).font_weight(FontWeight::SEMIBOLD).child(
+                        div().text_size(t.panel_title).font_weight(t.weight_semibold).child(
                             drive
                                 .and_then(|d| d.model.clone())
                                 .or_else(|| disk.map(str::to_owned))
@@ -680,7 +680,7 @@ impl Disk {
                     .flex()
                     .flex_col()
                     .items_end()
-                    .gap(px(5.))
+                    .gap(rem_px(5.))
                     .child(caption_label("Device", cx))
                     .child(picker),
             )
@@ -690,7 +690,7 @@ impl Disk {
                     .flex()
                     .flex_col()
                     .items_end()
-                    .gap(px(5.))
+                    .gap(rem_px(5.))
                     .child(caption_label("History", cx))
                     .child(range_picker_of(
                         &RANGES,
@@ -725,7 +725,7 @@ impl Disk {
         div()
             .flex()
             .flex_row()
-            .gap(px(10.))
+            .gap(rem_px(10.))
             .child(self.detail_card(
                 Metric::Read,
                 "card-read",
@@ -800,22 +800,22 @@ impl Disk {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(rem_px(8.))
                     .child(
                         div()
                             .text_size(t.card_value)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .font_features(t.numbers.clone())
                             .text_color(tint)
                             .child(busy.map_or("–".into(), |b| format!("{b:.0}%"))),
                     )
-                    .child(bar(busy.unwrap_or(0.) / 100., tint, cx).w(px(80.))),
+                    .child(bar(busy.unwrap_or(0.) / 100., tint, cx).w(rem_px(80.))),
             );
         let sub = |label: &str, chart: TrendChart| {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(6.))
+                .gap(rem_px(6.))
                 .child(caption_label(label, cx))
                 .child(chart)
         };
@@ -829,7 +829,7 @@ impl Disk {
             div()
                 .flex()
                 .flex_row()
-                .gap(px(28.))
+                .gap(rem_px(28.))
                 .child(readout(
                     "Read latency",
                     ms(device.map(|d| d.read_await_ms)),
@@ -936,7 +936,7 @@ impl Disk {
             div()
                 .flex()
                 .flex_row()
-                .gap(px(5.))
+                .gap(rem_px(5.))
                 .child(div().text_color(t.text_secondary).child(label))
                 .child(
                     div()
@@ -961,9 +961,9 @@ impl Disk {
                 .id(("device", i))
                 .flex()
                 .flex_col()
-                .gap(px(7.))
-                .px(px(13.))
-                .py(px(11.))
+                .gap(rem_px(7.))
+                .px(rem_px(13.))
+                .py(rem_px(11.))
                 .rounded(t.sub_radius)
                 .bg(if selected { t.card_hover } else { t.card })
                 .border_color(if selected { t.blue.opacity(0.6) } else { t.hairline }),
@@ -976,12 +976,12 @@ impl Disk {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(8.))
+                .gap(rem_px(8.))
                 .child(Icon::new(IconName::HardDrive).small().text_color(t.text_secondary))
                 .child(
                     div()
                         .text_size(t.panel_title)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(t.weight_semibold)
                         .child(drive.and_then(|d| d.model.clone()).unwrap_or_else(|| name.clone())),
                 )
                 .child(
@@ -1005,7 +1005,7 @@ impl Disk {
                 .flex()
                 .flex_row()
                 .flex_wrap()
-                .gap_x(px(20.))
+                .gap_x(rem_px(20.))
                 .gap_y(px(4.))
                 .text_size(t.caption)
                 .child(fact("Protocol", protocol(&name).map(str::to_owned)))
@@ -1018,7 +1018,7 @@ impl Disk {
                 .flex()
                 .flex_row()
                 .flex_wrap()
-                .gap_x(px(16.))
+                .gap_x(rem_px(16.))
                 .gap_y(px(4.))
                 .text_size(t.caption)
                 .child(live("R", Unit::BytesPerSec.format(device.read_bps as f64), t.blue))
@@ -1047,10 +1047,10 @@ impl Disk {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.))
+            .gap(rem_px(6.))
             .text_size(t.caption)
             .child(Icon::new(IconName::CircleCheck).small().text_color(tint))
-            .child(div().font_weight(FontWeight::SEMIBOLD).child(match &state {
+            .child(div().font_weight(t.weight_semibold).child(match &state {
                 Some(s) => format!("Controller {s}"),
                 None => "Controller state –".into(),
             }))
@@ -1088,7 +1088,7 @@ impl Disk {
                     label.clone()
                 };
                 match value {
-                    Some(c) => key_value(name, format!("{c:.0} °C"), temp_colour(*c, crit_of(label), t), cx),
+                    Some(c) => key_value(name, format::temperature(*c, 0), temp_colour(*c, crit_of(label), t), cx),
                     None => key_value(name, "–", t.text_tertiary, cx),
                 }
                 .into_any_element()
@@ -1141,7 +1141,7 @@ impl Disk {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
+                    .gap(rem_px(6.))
                     .map(|d| {
                         if temps.is_empty() {
                             d.child(key_value("Temperature", "–", t.text_tertiary, cx))
@@ -1152,12 +1152,19 @@ impl Disk {
                     .when_some(
                         chip.as_ref()
                             .and_then(|_| limits.get("Composite")?.get("crit").copied()),
-                        |d, crit| d.child(key_value("Critical at", format!("{crit:.0} °C"), t.text_secondary, cx)),
+                        |d, crit| {
+                            d.child(key_value(
+                                "Critical at",
+                                format::temperature(crit, 0),
+                                t.text_secondary,
+                                cx,
+                            ))
+                        },
                     ),
             )
             .child(div().h(t.hairline_width).bg(t.hairline))
             .child(caption_label("Btrfs error counters", cx))
-            .child(div().flex().flex_col().gap(px(6.)).map(|d| {
+            .child(div().flex().flex_col().gap(rem_px(6.)).map(|d| {
                 if btrfs.is_empty() {
                     d.child(caption("No btrfs filesystems", cx))
                 } else {
@@ -1207,7 +1214,7 @@ impl Disk {
                         div()
                             .flex()
                             .flex_row()
-                            .gap(px(8.))
+                            .gap(rem_px(8.))
                             .text_size(t.caption)
                             .child(
                                 div()
@@ -1215,7 +1222,7 @@ impl Disk {
                                     .min_w_0()
                                     .overflow_hidden()
                                     .whitespace_nowrap()
-                                    .when(on_this, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                    .when(on_this, |d| d.font_weight(t.weight_semibold))
                                     .child(mount.clone()),
                             )
                             .child(
@@ -1237,7 +1244,7 @@ impl Disk {
             Some((mount, f)) => div()
                 .flex()
                 .flex_col()
-                .gap(px(6.))
+                .gap(rem_px(6.))
                 .child(caption_label(&format!("Used on {mount}"), cx))
                 .child(
                     self.chart(&self.charts.used, Metric::Used, cx)
@@ -1258,7 +1265,7 @@ impl Disk {
             None => caption(format!("No mounted filesystem on {}", disk.unwrap_or("this disk")), cx).into_any_element(),
         };
         panel(IconName::ChartArea, "Free space", self.expand(Metric::Used), cx)
-            .child(div().flex().flex_col().gap(px(10.)).map(|d| {
+            .child(div().flex().flex_col().gap(rem_px(10.)).map(|d| {
                 if rows.is_empty() {
                     d.child(caption("No filesystems reported", cx))
                 } else {
@@ -1318,7 +1325,7 @@ impl Disk {
                             .flex_col()
                             .gap(t.gap)
                             .pl(t.page_padding)
-                            .pt(px(12.))
+                            .pt(rem_px(12.))
                             .pb(t.page_padding)
                             .child(header)
                             .child(self.cards(sample, cx))
@@ -1341,7 +1348,7 @@ impl Disk {
                             .gap(t.gap)
                             .pl(t.gap)
                             .pr(t.page_padding)
-                            .pt(px(12.))
+                            .pt(rem_px(12.))
                             .pb(t.page_padding)
                             .child(self.health_panel(sample, cx))
                             .child(self.free_space_panel(sample, cx))
@@ -1372,18 +1379,18 @@ impl Disk {
                     .flex()
                     .flex_row()
                     .items_end()
-                    .gap(px(5.))
+                    .gap(rem_px(5.))
                     .child(
                         div()
                             .text_size(t.card_value)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .font_features(t.numbers.clone())
                             .child(value),
                     )
                     .when_some(detail, |d, detail| {
                         d.child(
                             div()
-                                .pb(px(2.))
+                                .pb(rem_px(2.))
                                 .text_size(t.small_caption)
                                 .text_color(t.text_secondary)
                                 .font_features(t.numbers.clone())
@@ -1529,7 +1536,7 @@ impl Disk {
             .flex()
             .flex_col()
             .items_end()
-            .gap(px(5.))
+            .gap(rem_px(5.))
             .child(caption_label("View", cx))
             .child(switch)
     }

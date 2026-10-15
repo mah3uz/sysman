@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, Context, Div, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, Context, Div, Entity, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{Icon, Sizable};
@@ -17,7 +17,7 @@ use schema::power::{Power, Supply};
 use schema::series::escape;
 
 use crate::charts::flow::{End, EnergyFlow, Hub, Link, Sink, Source as FlowSource};
-use crate::charts::format::Unit;
+use crate::charts::format::{self, Unit};
 use crate::charts::sparkline::Sparkline;
 use crate::charts::trend::{ChartState, TrendChart, YScale, clock};
 use crate::data::hardware::{Domain, domain_of};
@@ -25,7 +25,7 @@ use crate::data::history::{Bucket, History, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::source::{Combine, Source};
 use crate::ui::shell::Tab;
-use crate::ui::theme::{Theme, theme};
+use crate::ui::theme::{Theme, rem_px, theme};
 use crate::ui::widgets::card::card;
 use crate::ui::widgets::hairline;
 use crate::ui::widgets::hint::helper_hint;
@@ -984,8 +984,8 @@ fn reading_row(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(8.))
-        .h(px(18.))
+        .gap(rem_px(8.))
+        .h(rem_px(18.))
         .text_size(t.caption)
         .child(
             div()
@@ -995,10 +995,10 @@ fn reading_row(
                 .text_color(t.text_secondary)
                 .child(label.into()),
         )
-        .child(div().w(px(56.)).flex_shrink_0().children(spark))
+        .child(div().w(rem_px(56.)).flex_shrink_0().children(spark))
         .child(
             div()
-                .w(px(66.))
+                .w(rem_px(66.))
                 .flex_shrink_0()
                 .flex()
                 .justify_end()
@@ -1012,7 +1012,7 @@ fn big_value(value: impl Into<SharedString>, cx: &App) -> Div {
     let t = theme(cx);
     div()
         .text_size(t.card_value)
-        .font_weight(FontWeight::SEMIBOLD)
+        .font_weight(t.weight_semibold)
         .font_features(t.numbers.clone())
         .child(value.into())
 }
@@ -1040,7 +1040,7 @@ impl Energy {
             .child(
                 div()
                     .text_size(theme(cx).small_caption)
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(theme(cx).weight_semibold)
                     .text_color(theme(cx).text_secondary)
                     .child(range.to_owned()),
             )
@@ -1065,7 +1065,7 @@ impl Energy {
                     .child(
                         div()
                             .text_size(t.panel_title)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .child("Energy"),
                     )
                     .child(caption(subtitle, cx))
@@ -1078,7 +1078,7 @@ impl Energy {
                     .flex()
                     .flex_col()
                     .items_end()
-                    .gap(px(5.))
+                    .gap(rem_px(5.))
                     .child(caption_label("History", cx))
                     .child(range_picker(
                         self.range,
@@ -1154,7 +1154,7 @@ impl Energy {
                 CardKind::Temp,
                 "Battery temperature",
                 teal,
-                format!("{c:.1}°C"),
+                format::temperature(*c, 1),
                 None,
                 self.spark("temp", teal).into_any_element(),
                 range,
@@ -1184,7 +1184,7 @@ impl Energy {
             "1 year",
             cx,
         ));
-        div().flex().flex_row().gap(px(10.)).children(cards)
+        div().flex().flex_row().gap(rem_px(10.)).children(cards)
     }
 
     fn desktop_cards(&self, snap: &Snapshot, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1197,7 +1197,7 @@ impl Energy {
         let cpu_body = match cpu {
             CpuPower::Measured => self.spark("cpu", green).into_any_element(),
             CpuPower::NeedsHelper => div()
-                .h(px(57.))
+                .h(rem_px(57.))
                 .child(helper_hint(
                     "energy-enable",
                     "CPU package power needs the privileged helper",
@@ -1205,7 +1205,7 @@ impl Energy {
                 ))
                 .into_any_element(),
             CpuPower::Unsupported => div()
-                .h(px(57.))
+                .h(rem_px(57.))
                 .child(caption("This CPU has no readable power counter.", cx))
                 .into_any_element(),
         };
@@ -1247,7 +1247,7 @@ impl Energy {
             range,
             cx,
         ));
-        div().flex().flex_row().gap(px(10.)).children(cards)
+        div().flex().flex_row().gap(rem_px(10.)).children(cards)
     }
 
     fn battery_flow(&self, s: &Supply, snap: &Snapshot, cx: &App) -> impl IntoElement {
@@ -1429,7 +1429,7 @@ impl Energy {
                         div()
                             .flex_1()
                             .text_size(t.caption)
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(t.weight_medium)
                             .child(status),
                     )
                     .child(caption(
@@ -1491,7 +1491,7 @@ impl Energy {
         let key_row = div()
             .flex()
             .flex_row()
-            .gap(px(16.))
+            .gap(rem_px(16.))
             .text_size(t.small_caption)
             .text_color(t.text_secondary)
             .children(keys.into_iter().map(|(colour, name)| {
@@ -1499,8 +1499,8 @@ impl Energy {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(6.))
-                    .child(div().w(px(10.)).h(px(3.)).rounded(px(1.)).bg(colour))
+                    .gap(rem_px(6.))
+                    .child(div().w(rem_px(10.)).h(px(3.)).rounded(px(1.)).bg(colour))
                     .child(name)
             }));
         let total = self
@@ -1550,18 +1550,18 @@ impl Energy {
                     .id(SharedString::from(format!("accessory-{}", a.key)))
                     .flex()
                     .flex_col()
-                    .gap(px(8.))
+                    .gap(rem_px(8.))
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(8.))
+                            .gap(rem_px(8.))
                             .child(Icon::new(a.glyph.icon()).small().text_color(t.text_secondary))
                             .child(
                                 div()
                                     .text_size(t.caption)
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(t.weight_semibold)
                                     .truncate()
                                     .child(a.name.clone()),
                             ),
@@ -1571,8 +1571,8 @@ impl Energy {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.))
-                            .pl(px(26.))
+                            .gap(rem_px(6.))
+                            .pl(rem_px(26.))
                             .text_size(t.small_caption)
                             .child(div().text_color(t.text_secondary).child("Charge"))
                             .child(div().flex_1())
@@ -1590,8 +1590,8 @@ impl Energy {
                             )
                             .child(
                                 div()
-                                    .text_size(if a.percent.is_some() { px(15.) } else { t.caption })
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(if a.percent.is_some() { t.card_value } else { t.caption })
+                                    .font_weight(t.weight_semibold)
                                     .font_features(t.numbers.clone())
                                     .child(value),
                             ),
@@ -1602,7 +1602,7 @@ impl Energy {
             }
         }
         p.when_some(snap.checked, |p, at| {
-            p.child(caption(format!("Checked {}", clock(at, "%H:%M")), cx).font_weight(FontWeight::SEMIBOLD))
+            p.child(caption(format!("Checked {}", clock(at, "%H:%M")), cx).font_weight(t.weight_semibold))
         })
     }
 
@@ -1633,11 +1633,11 @@ impl Energy {
                     .flex()
                     .flex_row()
                     .items_baseline()
-                    .gap(px(6.))
+                    .gap(rem_px(6.))
                     .child(
                         div()
-                            .text_size(px(22.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(rem_px(22.))
+                            .font_weight(t.weight_semibold)
                             .font_features(t.numbers.clone())
                             .text_color(colour)
                             .child(health.map_or("–".into(), |h| format!("{h:.0}%"))),
@@ -1686,7 +1686,7 @@ impl Energy {
             ("Current", current, t.text, None),
             (
                 "Temperature",
-                snap.temp.as_ref().map(|(_, c)| format!("{c:.1}°C")),
+                snap.temp.as_ref().map(|(_, c)| format::temperature(*c, 1)),
                 t.teal,
                 self.row_spark("temp", t.teal),
             ),
@@ -1695,7 +1695,7 @@ impl Energy {
             ("Adapter", adapter, t.text, None),
         ];
         section(IconName::Activity, "Electrical", cx).child(
-            div().flex().flex_col().gap(px(5.)).children(
+            div().flex().flex_col().gap(rem_px(5.)).children(
                 rows.into_iter()
                     .filter_map(|(label, value, colour, spark)| Some(reading_row(label, value?, colour, spark, cx))),
             ),
@@ -1712,11 +1712,11 @@ impl Energy {
         let group = |label: String, cx: &App| {
             div()
                 .text_size(theme(cx).caption)
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(t.weight_semibold)
                 .truncate()
                 .child(label)
         };
-        let rows = |gap: f32| div().flex().flex_col().gap(px(gap));
+        let rows = |gap: f32| div().flex().flex_col().gap(rem_px(gap));
         let (ac, ac_colour) = match on_mains(&snap.power) {
             Some(false) => ("Offline", orange),
             _ => ("Online", green),
@@ -1743,7 +1743,7 @@ impl Energy {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(8.))
+                            .gap(rem_px(8.))
                             .child(div().flex_1().child(proportion(w / limit, colour, cx)))
                             .child(
                                 caption(format!("{:.0}% of limit", w / limit * 100.), cx)
@@ -1957,11 +1957,11 @@ impl Energy {
                 hairline(
                     div()
                         .id("sheet")
-                        .w(px(640.))
+                        .w(rem_px(640.))
                         .flex()
                         .flex_col()
-                        .gap(px(14.))
-                        .p(px(20.))
+                        .gap(rem_px(14.))
+                        .p(rem_px(20.))
                         .rounded(t.panel_radius)
                         .bg(t.tooltip)
                         .border_color(t.hairline)
@@ -1973,12 +1973,12 @@ impl Energy {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(8.))
-                        .child(div().size(px(8.)).rounded_full().bg(colour))
+                        .gap(rem_px(8.))
+                        .child(div().size(rem_px(8.)).rounded_full().bg(colour))
                         .child(
                             div()
                                 .text_size(t.panel_title)
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_weight(t.weight_semibold)
                                 .child(title),
                         )
                         .child(div().flex_1())
@@ -1987,7 +1987,7 @@ impl Energy {
                 .child(big_value(latest, cx))
                 .child(if empty {
                     div()
-                        .h(px(200.))
+                        .h(rem_px(200.))
                         .flex()
                         .items_center()
                         .justify_center()

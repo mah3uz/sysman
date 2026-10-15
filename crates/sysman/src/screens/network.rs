@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, Render,
-    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, Rems, Render, SharedString,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
@@ -27,7 +27,7 @@ use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source, matching};
 use crate::screens::processes::Icons;
 use crate::ui::shell::Tab;
-use crate::ui::theme::theme;
+use crate::ui::theme::{rem_px, theme};
 use crate::ui::widgets::app_icon::app_icon;
 use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
 use crate::ui::widgets::hairline;
@@ -43,7 +43,7 @@ const RELOAD_S: f64 = 60.;
 const CHART_HEIGHT: f32 = 170.;
 const RAIL_CHART_HEIGHT: f32 = 100.;
 const ADAPTER_CHART_HEIGHT: f32 = 120.;
-const HEADER_VALUE: Pixels = px(17.);
+const HEADER_VALUE: Rems = rem_px(17.);
 const NET_INTERVAL_S: u64 = 2;
 const PREFIX: &str = "/net/interfaces/";
 const TOP_APPS: usize = 8;
@@ -329,12 +329,12 @@ fn per_sec(v: Option<f64>) -> String {
 fn badge(text: &'static str, color: Hsla, cx: &App) -> impl IntoElement {
     let t = theme(cx);
     div()
-        .px(px(6.))
+        .px(rem_px(6.))
         .rounded_full()
         .bg(color.opacity(0.16))
         .text_color(color)
         .text_size(t.small_caption)
-        .font_weight(FontWeight::MEDIUM)
+        .font_weight(t.weight_medium)
         .child(text)
 }
 
@@ -351,12 +351,12 @@ fn big_rate(label: &str, arrow: IconName, color: Hsla, value: String, cx: &App) 
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(5.))
+                .gap(rem_px(5.))
                 .child(Icon::new(arrow).small().text_color(color))
                 .child(
                     div()
                         .text_size(HEADER_VALUE)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(t.weight_semibold)
                         .font_features(t.numbers.clone())
                         .child(value),
                 ),
@@ -375,7 +375,7 @@ fn stat(label: &str, value: String, color: Hsla, cx: &App) -> impl IntoElement +
         .child(
             div()
                 .text_size(t.panel_title)
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(t.weight_semibold)
                 .font_features(t.numbers.clone())
                 .text_color(color)
                 .child(value),
@@ -453,7 +453,7 @@ impl Network {
             .flex()
             .flex_row()
             .items_end()
-            .gap(px(28.))
+            .gap(rem_px(28.))
             .child(
                 div()
                     .flex_1()
@@ -485,7 +485,7 @@ impl Network {
                     .flex()
                     .flex_col()
                     .items_end()
-                    .gap(px(5.))
+                    .gap(rem_px(5.))
                     .child(caption_label("History", cx))
                     .child(range_picker(
                         self.range,
@@ -551,7 +551,7 @@ impl Network {
             let icons = cx.try_global::<Icons>().map(|i| i.0.clone()).unwrap_or_default();
             let rate_cell = |arrow: IconName, color: Hsla, bps: Option<u64>| {
                 div()
-                    .w(px(96.))
+                    .w(rem_px(96.))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -571,14 +571,14 @@ impl Network {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
+                    .gap(rem_px(6.))
                     .text_size(t.caption)
                     .children(top.into_iter().map(|p| {
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(8.))
+                            .gap(rem_px(8.))
                             .child(app_icon(&p.comm, &p.cmdline, &icons, 16., cx))
                             .child(
                                 div()
@@ -646,11 +646,11 @@ impl Network {
             div()
                 .flex()
                 .flex_row()
-                .gap(px(10.))
+                .gap(rem_px(10.))
                 .text_size(t.caption)
                 .child(
                     div()
-                        .w(px(34.))
+                        .w(rem_px(34.))
                         .flex_shrink_0()
                         .text_color(t.text_tertiary)
                         .child(label),
@@ -693,7 +693,7 @@ impl Network {
             .items_end()
             .gap(px(2.))
             .text_size(t.panel_title)
-            .font_weight(FontWeight::MEDIUM)
+            .font_weight(t.weight_medium)
             .font_features(t.numbers.clone())
             .child(arrow_value(IconName::ArrowDown, t.green, rate(live.map(|l| l.rx_bps))))
             .child(arrow_value(IconName::ArrowUp, t.red, rate(live.map(|l| l.tx_bps))))
@@ -701,7 +701,7 @@ impl Network {
                 d.child(
                     div()
                         .text_size(t.small_caption)
-                        .font_weight(FontWeight::NORMAL)
+                        .font_weight(t.weight_body)
                         .text_color(t.text_tertiary)
                         .child(format!(
                             "{} / {}",
@@ -714,7 +714,7 @@ impl Network {
                 d.child(
                     div()
                         .text_size(t.small_caption)
-                        .font_weight(FontWeight::NORMAL)
+                        .font_weight(t.weight_body)
                         .text_color(t.text_secondary)
                         .child(format!("{dbm:.0} dBm · {}", signal_quality(dbm))),
                 )
@@ -739,14 +739,14 @@ impl Network {
             .flex()
             .flex_row()
             .items_start()
-            .gap(px(12.))
-            .py(px(9.))
+            .gap(rem_px(12.))
+            .py(rem_px(9.))
             .cursor_pointer()
             .when(!a.connected, |d| d.opacity(0.55))
             .child(
                 div()
-                    .w(px(22.))
-                    .pt(px(2.))
+                    .w(rem_px(22.))
+                    .pt(rem_px(2.))
                     .flex()
                     .justify_center()
                     .child(Icon::new(glyph).small().text_color(glyph_colour)),
@@ -763,11 +763,11 @@ impl Network {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(7.))
+                            .gap(rem_px(7.))
                             .child(
                                 div()
                                     .text_size(t.panel_title)
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(t.weight_semibold)
                                     .child(a.name.to_owned()),
                             )
                             .child(
@@ -923,10 +923,10 @@ impl Network {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(10.))
-                .ml(px(34.))
-                .mb(px(10.))
-                .p(px(12.))
+                .gap(rem_px(10.))
+                .ml(rem_px(34.))
+                .mb(rem_px(10.))
+                .p(rem_px(12.))
                 .rounded(t.sub_radius)
                 .bg(t.card)
                 .border_color(t.hairline),
@@ -937,8 +937,8 @@ impl Network {
                 .flex()
                 .flex_row()
                 .flex_wrap()
-                .gap_x(px(28.))
-                .gap_y(px(8.))
+                .gap_x(rem_px(28.))
+                .gap_y(rem_px(8.))
                 .children(facts.into_iter().map(|(label, value)| {
                     div()
                         .flex()
@@ -958,7 +958,7 @@ impl Network {
                 .child(
                     div()
                         .id("adapter-expand")
-                        .p(px(3.))
+                        .p(rem_px(3.))
                         .rounded(px(4.))
                         .text_color(t.text_tertiary)
                         .hover(|d| d.bg(t.card_hover).text_color(t.text))
@@ -1021,7 +1021,7 @@ impl Network {
             rows.into_iter().enumerate().map(|(i, row)| {
                 div()
                     .when(i + 1 < count, |d| d.border_b_1().border_color(t.hairline))
-                    .child(row.py(px(6.)).text_size(t.panel_title))
+                    .child(row.py(rem_px(6.)).text_size(t.panel_title))
             }),
         ))
     }
@@ -1041,7 +1041,14 @@ impl Network {
         };
         let sockets = net.map(|n| &n.sockets);
         let count = |v: Option<u64>| v.map_or("–".into(), |v| v.to_string());
-        let row = || div().flex().flex_row().flex_wrap().gap_x(px(20.)).gap_y(px(10.));
+        let row = || {
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap_x(rem_px(20.))
+                .gap_y(rem_px(10.))
+        };
         div()
             .flex()
             .flex_col()
