@@ -63,7 +63,7 @@ Dark first; light is derived from the same tokens.
 
 | Token | Dark | Light |
 | --- | --- | --- |
-| window | `#1E1E20` | `#F5F5F7` |
+| window | `#21232F` | `#F5F5F7` |
 | panel fill | white 5% over window | black 4% |
 | card fill / hover | white 5% / 8% | black 4% / 6% |
 | hairline | white 8%, 0.5 px | black 8% |
