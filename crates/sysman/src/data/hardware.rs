@@ -12,6 +12,10 @@ use schema::system::SystemMeta;
 use schema::{Meta, Sample};
 use serde::Serialize;
 
+pub mod item;
+
+pub use item::Item;
+
 const HWDATA: &str = "/usr/share/hwdata";
 const SECURE_BOOT: &str = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const SETUP_MODE: &str = "/sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c";
@@ -104,6 +108,8 @@ pub struct Node {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
     pub props: Vec<(String, String)>,
+    #[serde(skip)]
+    pub item: Option<Item>,
 }
 
 impl Node {
@@ -116,6 +122,11 @@ impl Node {
 
     fn sub(mut self, subtitle: Option<impl Into<String>>) -> Self {
         self.subtitle = subtitle.map(Into::into).filter(|s: &String| !s.is_empty());
+        self
+    }
+
+    fn item(mut self, item: Item) -> Self {
+        self.item = Some(item);
         self
     }
 
@@ -525,6 +536,11 @@ pub struct PciDevice {
     pub driver: Option<String>,
     pub revision: Option<String>,
     pub link: Option<String>,
+    pub max_link: Option<String>,
+    /// `D0` … `D3cold`.
+    pub power_state: Option<String>,
+    /// The bridge or root port above, by slot.
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -540,6 +556,10 @@ pub struct UsbDevice {
     pub class: u8,
     pub version: Option<String>,
     pub root: bool,
+    /// Drivers bound to the device's interfaces, deduplicated.
+    pub drivers: Vec<String>,
+    /// Runtime power management: `active`, `suspended`.
+    pub power: Option<String>,
 }
 
 impl UsbDevice {
@@ -562,6 +582,8 @@ pub struct Display {
     pub size_mm: Option<(u32, u32)>,
     pub year: Option<u16>,
     pub modes: usize,
+    /// Distinct resolutions offered, best first.
+    pub resolutions: Vec<String>,
     pub builtin: bool,
 }
 
@@ -585,6 +607,8 @@ pub struct NetDevice {
     pub wireless: bool,
     pub signal_dbm: Option<f64>,
     pub bus: Option<String>,
+    /// The wireless phy (`phy0`), which names the card's hwmon chip.
+    pub phy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -637,6 +661,12 @@ pub struct Inventory {
     pub kernel: Option<String>,
     pub boot_time: Option<u64>,
     pub desktop: Option<String>,
+    /// Block device path (`/dev/mapper/root`, `/dev/nvme0n1p2`) → the disk under it.
+    pub holders: BTreeMap<String, String>,
+    /// Disk → the PCI slot of its controller.
+    pub block_pci: BTreeMap<String, String>,
+    /// How many of the inventory's sources returned anything.
+    pub sources: usize,
 }
 
 fn read(path: impl AsRef<Path>) -> Option<String> {
@@ -713,7 +743,28 @@ pub fn read_inventory() -> Inventory {
         desktop: std::env::var("XDG_CURRENT_DESKTOP").ok().filter(|d| !d.is_empty()),
         usb,
         took_s: 0.,
+        holders: BTreeMap::new(),
+        block_pci: BTreeMap::new(),
+        sources: 0,
     };
+    (inv.holders, inv.block_pci) = read_blocks();
+    inv.sources = [
+        !inv.dmi.is_empty(),
+        !inv.pci.is_empty(),
+        !inv.usb.is_empty(),
+        !inv.displays.is_empty(),
+        !inv.sound.is_empty(),
+        !inv.bluetooth.is_empty(),
+        !inv.inputs.is_empty(),
+        !inv.nets.is_empty(),
+        !inv.supplies.is_empty(),
+        !inv.holders.is_empty(),
+        inv.os.is_some(),
+        inv.kernel.is_some(),
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
     inv.took_s = started.elapsed().as_secs_f64();
     inv
 }
@@ -742,7 +793,18 @@ fn read_pci(ids: &Ids) -> Vec<PciDevice> {
                     None => vendor,
                 }
             });
-            let link = read(p.join("current_link_speed")).zip(read(p.join("current_link_width")));
+            let link = |speed: &str, width: &str| {
+                read(p.join(speed))
+                    .zip(read(p.join(width)))
+                    .filter(|(s, _)| !s.starts_with("Unknown"))
+                    .map(|(s, w)| format!("{s} x{w}"))
+            };
+            let canonical = fs::canonicalize(&p).ok();
+            let slots = canonical
+                .as_ref()
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let chain = item::pci_slots(&slots);
             Some(PciDevice {
                 slot: file_name(&p),
                 vendor_id,
@@ -754,9 +816,10 @@ fn read_pci(ids: &Ids) -> Vec<PciDevice> {
                 subsystem,
                 driver: link_name(p.join("driver")),
                 revision: read(p.join("revision")),
-                link: link
-                    .filter(|(s, _)| !s.starts_with("Unknown"))
-                    .map(|(s, w)| format!("{s} x{w}")),
+                link: link("current_link_speed", "current_link_width"),
+                max_link: link("max_link_speed", "max_link_width"),
+                power_state: read(p.join("power_state")),
+                parent: chain.len().checked_sub(2).map(|i| chain[i].to_owned()),
             })
         })
         .collect()
@@ -766,7 +829,16 @@ fn usb_device(p: &Path, ids: &Ids) -> Option<UsbDevice> {
     let vendor_id: u16 = hex(p.join("idVendor"))?;
     let product_id: u16 = hex(p.join("idProduct"))?;
     let port = file_name(p);
+    let mut drivers: Vec<String> = entries(&p.to_string_lossy())
+        .iter()
+        .filter(|e| file_name(e).starts_with(&format!("{port}:")))
+        .filter_map(|e| link_name(e.join("driver")))
+        .collect();
+    drivers.sort();
+    drivers.dedup();
     Some(UsbDevice {
+        drivers,
+        power: read(p.join("power/runtime_status")),
         root: port.starts_with("usb"),
         bus: read(p.join("busnum"))?.parse().ok()?,
         dev: read(p.join("devnum"))?.parse().ok()?,
@@ -818,6 +890,15 @@ fn read_displays(pnp: &str) -> Vec<Display> {
                 size_mm: edid.as_ref().and_then(|e| e.size_mm),
                 year: edid.as_ref().and_then(|e| e.year),
                 modes: modes.lines().count(),
+                resolutions: {
+                    let mut seen: Vec<String> = Vec::new();
+                    for m in modes.lines().map(|m| m.trim().to_owned()) {
+                        if !seen.contains(&m) {
+                            seen.push(m);
+                        }
+                    }
+                    seen
+                },
                 builtin: ["eDP", "LVDS", "DSI"].iter().any(|k| connector.starts_with(k)),
                 connector: connector.to_owned(),
                 card: card.to_owned(),
@@ -892,6 +973,7 @@ fn read_nets() -> Vec<NetDevice> {
                 mtu: read(p.join("mtu")),
                 wireless: p.join("wireless").exists() || p.join("phy80211").exists(),
                 signal_dbm: signal.get(&name).copied(),
+                phy: link_name(p.join("phy80211")),
                 bus: device.map(|d| {
                     if d.to_string_lossy().contains("/usb") {
                         "USB".to_owned()
@@ -903,6 +985,40 @@ fn read_nets() -> Vec<NetDevice> {
             }
         })
         .collect()
+}
+
+/// Which disk each block device sits on, following partitions and device-mapper slaves; and each disk's PCI slot.
+fn read_blocks() -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    fn disk(name: &str, depth: u8) -> Option<String> {
+        let dir = Path::new("/sys/class/block").join(name);
+        if dir.join("partition").exists() {
+            return fs::canonicalize(&dir).ok()?.parent().map(file_name);
+        }
+        let slaves = entries(&dir.join("slaves").to_string_lossy());
+        match slaves.first() {
+            Some(s) if depth < 8 => disk(&file_name(s), depth + 1),
+            _ => Some(name.to_owned()),
+        }
+    }
+    let mut holders = BTreeMap::new();
+    let mut block_pci = BTreeMap::new();
+    for p in entries("/sys/class/block") {
+        let name = file_name(&p);
+        let Some(d) = disk(&name, 0) else {
+            continue;
+        };
+        if let Some(dm) = read(p.join("dm/name")) {
+            holders.insert(format!("/dev/mapper/{dm}"), d.clone());
+        }
+        holders.insert(format!("/dev/{name}"), d);
+        if !p.join("partition").exists()
+            && let Ok(dev) = fs::canonicalize(p.join("device"))
+            && let Some(slot) = item::pci_slots(&dev.to_string_lossy()).last()
+        {
+            block_pci.insert(name, (*slot).to_owned());
+        }
+    }
+    (holders, block_pci)
 }
 
 fn read_supplies() -> Vec<Supply> {
@@ -1191,6 +1307,7 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
         let t = &c.topology;
         processor.push(
             Node::new(c.model.clone().unwrap_or_else(|| "Processor".into()))
+                .item(Item::Cpu)
                 .sub(t.cores.map(|n| format!("{n} cores, {} threads", t.threads)))
                 .prop("Vendor", c.vendor.clone())
                 .prop("Packages", t.packages.map(|p| p.to_string()))
@@ -1219,6 +1336,7 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
         for (i, g) in t.l3_groups.iter().enumerate() {
             processor.push(
                 Node::new(format!("CCD {i}"))
+                    .item(Item::Ccd(i))
                     .sub(Some(format!(
                         "{} cores, {} MB L3",
                         g.cpus.len() as u32 / tpc,
@@ -1240,6 +1358,7 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
             let live = sample.and_then(|s| s.gpu.as_ref()?.devices.get(slot));
             Node::new(gpu_name(d.name.as_deref(), pci).unwrap_or_else(|| slot.clone()))
                 .sub(pci.and_then(|p| p.vendor.clone()))
+                .item(Item::Gpu(slot.clone()))
                 .prop("PCI slot", Some(slot.clone()))
                 .prop("PCI ID", Some(format!("{}:{}", d.vendor_id, d.device_id)))
                 .prop("Driver", live.map(|l| l.driver.clone()))
@@ -1265,6 +1384,7 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
     let mem = sample.and_then(|s| s.memory.as_ref());
     let mut memory = vec![
         Node::new("System memory")
+            .item(Item::Memory)
             .sub(mem.map(|m| format!("{} GB installed", installed_gib(m.total_bytes))))
             .prop("Usable", mem.map(|m| gib(m.total_bytes)))
             .prop("Available", mem.map(|m| gib(m.available_bytes)))
@@ -1285,6 +1405,7 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
         let address = s.chip.split('/').nth(1).unwrap_or(&s.chip);
         memory.push(
             Node::new(format!("Module at {address}"))
+                .item(Item::Dimm(s.chip.clone()))
                 .sub(Some(format!("{:.1} °C", s.value)))
                 .prop("Temperature", Some(format!("{:.1} °C", s.value)))
                 .prop("Sensor", Some(s.chip.clone())),
@@ -1301,6 +1422,7 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
         .iter()
         .map(|d| {
             Node::new(d.name.clone())
+                .item(Item::Display(format!("{}-{}", d.card, d.connector)))
                 .sub(Some(format!(
                     "{}, {}",
                     d.connector,
@@ -1325,6 +1447,7 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
         .flat_map(|s| &s.devices)
         .map(|(name, d)| {
             Node::new(d.model.clone().unwrap_or_else(|| name.clone()))
+                .item(Item::Drive(name.clone()))
                 .sub(Some(format!(
                     "{name}{}",
                     d.size_bytes.map(|b| format!(", {}", size_label(b))).unwrap_or_default()
@@ -1343,6 +1466,7 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
     for (mount, f) in sample.and_then(|s| s.fs.as_ref()).into_iter().flatten() {
         drives.push(
             Node::new(mount.clone())
+                .item(Item::Volume(mount.clone()))
                 .sub(Some(format!("{}, {} free", f.fstype, gib(f.avail_bytes))))
                 .prop("Device", Some(f.device.clone()))
                 .prop("File system", Some(f.fstype.clone()))
@@ -1369,6 +1493,7 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
                 _ => "Supply".to_owned(),
             };
             Node::new(title)
+                .item(Item::Supply(s.name.clone()))
                 .sub(Some(kind))
                 .prop("Name", Some(s.name.clone()))
                 .prop("Status", s.get("STATUS"))
@@ -1390,7 +1515,15 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
     let sensor_nodes = chips
         .into_iter()
         .map(|(chip, list)| {
-            let mut node = Node::new(chip.to_owned()).sub(Some(list[0].domain.title()));
+            // A GPU read through its own library has no hwmon chip; its readings live on the GPU's page.
+            let in_hwmon = sample
+                .and_then(|s| s.hwmon.as_ref())
+                .is_some_and(|h| h.contains_key(chip));
+            let item = match chip.split_once('/') {
+                Some((_, slot)) if !in_hwmon && list[0].domain == Domain::Graphics => Item::Gpu(slot.to_owned()),
+                _ => Item::Chip(chip.to_owned()),
+            };
+            let mut node = Node::new(chip.to_owned()).item(item).sub(Some(list[0].domain.title()));
             for s in list {
                 let value = if s.domain == Domain::Fans {
                     format!("{:.0} rpm", s.value)
@@ -1411,6 +1544,7 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
             .and_then(|ni| ni.interfaces.get(&n.name))
             .map(|i| i.addresses.join(", "));
         Node::new(n.name.clone())
+            .item(Item::Net(n.name.clone()))
             .sub(Some(
                 [n.driver.clone(), n.state.clone()]
                     .into_iter()
@@ -1460,6 +1594,9 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
                 .prop("Speed", u.speed_mbps.as_ref().map(|s| format!("{s} Mb/s")))
                 .prop("USB version", u.version.clone())
                 .prop("Class", usb_class(u.class))
+                .prop("Drivers", (!u.drivers.is_empty()).then(|| u.drivers.join(", ")))
+                .prop("Power", u.power.clone())
+                .item(Item::Usb(u.port.clone()))
         })
         .collect();
     push(Category::Usb, None, usb);
@@ -1495,6 +1632,10 @@ pub fn sections(inv: &Inventory, meta: Option<&Meta>, sample: Option<&Sample>) -
             .prop("Driver", p.driver.clone())
             .prop("Revision", p.revision.clone())
             .prop("Link", p.link.clone())
+            .prop("Maximum link", p.max_link.clone())
+            .prop("Power state", p.power_state.clone())
+            .prop("Upstream", p.parent.clone())
+            .item(Item::Pci(p.slot.clone()))
         })
         .collect();
     push(Category::Pci, None, pci);
@@ -1595,7 +1736,7 @@ pub fn display_mode(d: &Display) -> Option<String> {
     })
 }
 
-fn usb_class(class: u8) -> Option<String> {
+pub fn usb_class(class: u8) -> Option<String> {
     let name = match class {
         0x00 => "Per interface",
         0x01 => "Audio",
@@ -1970,6 +2111,50 @@ H: Handlers=event6 js0
     }
 
     #[test]
+    fn every_node_with_a_page_names_the_item_behind_it() {
+        let sample: Sample = serde_json::from_value(serde_json::json!({
+            "schema": 3, "t": 0.0, "time": "x",
+            "hwmon": {"nvme/nvme0": {"temp": {"Composite": 40.0}}},
+            "gpu": {"devices": {"0000:01:00.0": {"vendor": "nvidia", "driver": "nvidia", "backend": "nvml", "temp_c": 50.0}}},
+            "fs": {"/": {"device": "/dev/nvme0n1p2", "fstype": "btrfs", "mounts": ["/"], "total_bytes": 10,
+                          "used_bytes": 5, "avail_bytes": 5, "used_pct": 50.0, "inodes_total": 0, "inodes_free": 0}}
+        }))
+        .unwrap();
+        let meta: Meta = serde_json::from_value(serde_json::json!({
+            "schema": 3, "t": 0.0, "time": "x", "config": {}, "failed_modules": {},
+            "modules": {"storage": {"interval_s": 60, "info": {"note": "", "devices": {
+                "nvme0n1": {"model": "Disk", "serial": null, "firmware": null, "size_bytes": null, "rotational": false}
+            }}}}
+        }))
+        .unwrap();
+        let sections = sections(&Inventory::default(), Some(&meta), Some(&sample));
+        let items = |c: Category| -> Vec<Option<Item>> {
+            sections
+                .iter()
+                .find(|s| s.category == c)
+                .map(|s| s.nodes.iter().map(|n| n.item.clone()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            items(Category::Storage),
+            [Some(Item::Drive("nvme0n1".into())), Some(Item::Volume("/".into()))]
+        );
+        assert_eq!(
+            items(Category::Sensors),
+            [
+                Some(Item::Gpu("0000:01:00.0".into())),
+                Some(Item::Chip("nvme/nvme0".into()))
+            ],
+            "a GPU read through its own library has no chip page; its sensor opens the GPU"
+        );
+        assert_eq!(
+            items(Category::System),
+            [None],
+            "pages without live data keep the plain view"
+        );
+    }
+
+    #[test]
     fn gpu_names_prefer_pci_ids_over_hex_fallbacks() {
         let pci = PciDevice {
             slot: "0000:7a:00.0".into(),
@@ -1983,6 +2168,9 @@ H: Handlers=event6 js0
             driver: None,
             revision: None,
             link: None,
+            max_link: None,
+            power_state: None,
+            parent: None,
         };
         assert_eq!(
             gpu_name(Some("AMD GPU (0x164e)"), Some(&pci)).as_deref(),
