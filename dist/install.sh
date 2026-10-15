@@ -177,6 +177,8 @@ if command -v ldd >/dev/null 2>&1; then
         fi
     done
 fi
+command -v fc-match >/dev/null 2>&1 ||
+    echo 'warning: fc-match is missing; install fontconfig so the app can use the system font'
 
 if have_systemd; then
     $sudo systemctl daemon-reload || true

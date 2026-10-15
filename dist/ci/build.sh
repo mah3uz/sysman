@@ -70,7 +70,7 @@ shlibs=$(cd "$work" && dpkg-shlibdeps -O -e"$work/bin/sysmand" -e"$work/bin/sysm
   sed 's/^shlibs:Depends=//')
 depends=$shlibs
 for p in "${dlopen_depends[@]}"; do depends+=", $p"; done
-depends+=", iproute2"
+depends+=", iproute2, fontconfig"
 size=$(du -sk "$deb/usr" | cut -f1)
 cat >"$deb/DEBIAN/control" <<EOF
 Package: sysman
