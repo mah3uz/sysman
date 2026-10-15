@@ -75,77 +75,117 @@ uninstall:
     systemctl --user disable --now sysmand || true
     sudo pacman -Rns sysman
 
-# Set the version to VER (x.y.z), check, tag and push v<VER>, then follow the CI run that drafts the GitHub release
+# The whole release, e.g. `just release 0.2.0`: checks, version bump, tag, CI build, GitHub release, AUR and the website
 release ver:
     #!/usr/bin/env bash
     set -euo pipefail
-    ver={{ ver }} tag=v{{ ver }} current={{ version }}
-    [[ $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: give the version as x.y.z, e.g. just release 0.2.0" >&2; exit 1; }
-    [ "$(git branch --show-current)" = main ] || { echo "error: release from main" >&2; exit 1; }
-    [ -z "$(git status --porcelain)" ] || { echo "error: uncommitted changes; a release is cut from a clean tree" >&2; exit 1; }
-    ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null || { echo "error: tag $tag already exists" >&2; exit 1; }
-    git fetch -q origin main
-    git merge-base --is-ancestor origin/main HEAD || { echo "error: origin/main has commits this checkout lacks; pull first" >&2; exit 1; }
-    if [ "$ver" != "$current" ]; then
-        echo "Version $current -> $ver"
-        sed -i "0,/^version = \".*\"/s//version = \"$ver\"/" Cargo.toml
+    v={{ ver }} tag=v{{ ver }} current={{ version }}
+    fail() { echo "release: $*" >&2; exit 1; }
+    last=$(git describe --tags --abbrev=0 --match 'v*' --exclude 'v*-*' 2>/dev/null || true)
+    last=${last#v}
+    last=${last:-0.0.0}
+
+    [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "give the version as x.y.z, e.g. just release 0.2.0"
+    [[ $v != "$last" && $(printf '%s\n%s\n' "$last" "$v" | sort -V | tail -1) == "$v" ]] || fail "$v is not newer than the last release ($last)"
+    [[ $(git branch --show-current) == main ]] || fail "switch to main first"
+    [[ -z $(git status --porcelain) ]] || fail "commit or stash your changes first"
+    git fetch -q origin
+    [[ $(git rev-list --count HEAD..origin/main) == 0 ]] || fail "main is behind origin/main; pull first"
+    ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null || fail "tag $tag already exists"
+    ! git ls-remote --exit-code --tags origin "$tag" >/dev/null || fail "tag $tag already exists on origin"
+    gh auth status >/dev/null 2>&1 || fail "gh is not logged in; run gh auth login"
+    ssh -o BatchMode=yes aur@aur.archlinux.org help >/dev/null 2>&1 || fail "can't reach the AUR over SSH; add your key at https://aur.archlinux.org/account"
+    (cd docs/site && { [ -d node_modules ] || npm ci --silent; } && npx wrangler whoami 2>&1 | grep -q "You are logged in") ||
+        fail "wrangler is not logged in, and the website is deployed at the end; run: cd docs/site && npx wrangler login"
+
+    echo "==> lint and tests"
+    just check
+
+    echo "==> version $v (last release: $last)"
+    if [[ $v != "$current" ]]; then
+        sed -i "0,/^version = \".*\"/s//version = \"$v\"/" Cargo.toml
         cargo update -w --offline -q
     fi
-    just check
-    if [ -n "$(git status --porcelain)" ]; then git commit -qam "sysman $ver"; fi
-    git tag -a "$tag" -m "sysman $ver"
+    sed -i -e "s/^pkgver=.*/pkgver=$v/" -e "s/^pkgrel=.*/pkgrel=1/" -e "s/^sha256sums=.*/sha256sums=('SKIP')/" dist/arch/sysman/PKGBUILD
+    sed -i -e "s/^pkgver=.*/pkgver=$v/" -e "s/^pkgrel=.*/pkgrel=1/" -e "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('SKIP')/" dist/arch/sysman-bin/PKGBUILD
+    git commit -qam "sysman $v"
+
+    # Everything after this is public and can't be taken back.
+    read -rp "Push $tag, publish the GitHub release and AUR packages, and deploy the website? [y/N] " answer
+    if [[ $answer != [yY] ]]; then
+        echo "Stopped before pushing. To undo the version commit: git reset --hard HEAD~1"
+        exit 1
+    fi
+    trap 'echo "release: stopped; finish the remaining steps by hand" >&2' ERR
+
+    echo "==> tag and push"
+    git tag -a "$tag" -m "sysman $v"
     git push -q origin main "$tag"
-    echo "Pushed $tag; waiting for the release workflow to start..."
+
+    echo "==> CI build"
     run=
     for _ in $(seq 30); do
         run=$(gh run list --workflow release.yml --event push --limit 10 --json databaseId,headBranch \
             --jq ".[] | select(.headBranch == \"$tag\") | .databaseId" | head -1)
-        [ -n "$run" ] && break
+        [[ -n $run ]] && break
         sleep 5
     done
-    [ -n "$run" ] || { echo "error: no release run for $tag after 150 s; see the Actions tab on GitHub" >&2; exit 1; }
-    if ! gh run watch "$run" --exit-status --interval 15; then
-        echo "error: the release workflow failed: $(gh run view "$run" --json url --jq .url)" >&2
-        exit 1
-    fi
-    echo
-    echo "Draft release ready: $(gh release view "$tag" --json url --jq .url)"
-    echo "Review and publish it on GitHub, then run: just aur"
+    [[ -n $run ]] || fail "no release run for $tag after 150 s; see the Actions tab on GitHub"
+    gh run watch "$run" --exit-status --interval 15 || fail "the release workflow failed: $(gh run view "$run" --json url --jq .url)"
 
-# After the GitHub release is published: fill both PKGBUILDs from its SHA256SUMS and commit them in clones of the AUR repos (does not push)
-aur pkgrel="1":
+    echo "==> publish the GitHub release"
+    gh release edit "$tag" --draft=false --latest >/dev/null
+
+    echo "==> AUR checksums"
+    # GitHub can take a few seconds to serve the assets of a release it has just published
+    sums=$(curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors "https://github.com/mah3uz/sysman/releases/download/$tag/SHA256SUMS")
+    src_sum=$(awk -v f="sysman-$v.tar.gz" '$2 == f {print $1}' <<<"$sums")
+    bin_sum=$(awk -v f="sysman-$v-x86_64.tar.gz" '$2 == f {print $1}' <<<"$sums")
+    [[ -n $src_sum && -n $bin_sum ]] || fail "SHA256SUMS lacks a tarball checksum"
+    sed -i "s/^sha256sums=.*/sha256sums=('$src_sum')/" dist/arch/sysman/PKGBUILD
+    sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$bin_sum')/" dist/arch/sysman-bin/PKGBUILD
+    git commit -qam "Release $v: AUR checksums"
+    git push -q origin main
+
+    echo "==> AUR: sysman and sysman-bin"
+    just aur
+
+    echo "==> the website"
+    just site-deploy
+    echo "Released $v: $(gh release view "$tag" --json url --jq .url)"
+
+# Publish dist/arch (sysman, sysman-bin) to the AUR through throwaway clones in target/aur; bump pkgrel and commit first for a packaging-only fix
+aur:
     #!/usr/bin/env bash
     set -euo pipefail
-    ver={{ version }} rel={{ pkgrel }}
-    sums=$(curl -fsSL "https://github.com/mah3uz/sysman/releases/download/v$ver/SHA256SUMS")
-    src_sum=$(awk -v f="sysman-$ver.tar.gz" '$2 == f {print $1}' <<<"$sums")
-    bin_sum=$(awk -v f="sysman-$ver-x86_64.tar.gz" '$2 == f {print $1}' <<<"$sums")
-    [ -n "$src_sum" ] && [ -n "$bin_sum" ] || { echo "error: SHA256SUMS lacks a tarball checksum" >&2; exit 1; }
-    sed -i -e "s/^pkgver=.*/pkgver=$ver/" -e "s/^pkgrel=.*/pkgrel=$rel/" \
-        -e "s/^sha256sums=.*/sha256sums=('$src_sum')/" dist/arch/sysman/PKGBUILD
-    sed -i -e "s/^pkgver=.*/pkgver=$ver/" -e "s/^pkgrel=.*/pkgrel=$rel/" \
-        -e "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$bin_sum')/" dist/arch/sysman-bin/PKGBUILD
-    mkdir -p target/aur
+    ver={{ version }}
+    fail() { echo "aur: $*" >&2; exit 1; }
+    [[ -z $(git status --porcelain dist/arch) ]] || fail "commit dist/arch first"
+    curl -fsIL --retry 6 --retry-delay 5 --retry-all-errors -o /dev/null \
+        "https://github.com/mah3uz/sysman/releases/download/v$ver/SHA256SUMS" || fail "no published v$ver GitHub release"
     for p in sysman sysman-bin; do
-        (cd "dist/arch/$p" && makepkg --printsrcinfo > .SRCINFO)
+        src=dist/arch/$p
+        grep -q "^pkgver=$ver$" "$src/PKGBUILD" || fail "$p: pkgver is not $ver"
+        ! grep -q "^sha256sums.*SKIP" "$src/PKGBUILD" || fail "$p: no checksum yet"
         dir=target/aur/$p
-        if [ -d "$dir/.git" ]; then
-            if [ -n "$(git -C "$dir" ls-remote --heads origin)" ]; then git -C "$dir" pull --ff-only; fi
-        else
-            # a new package's AUR repo is empty, so there is no master branch to clone yet
-            git clone -q "ssh://aur@aur.archlinux.org/$p.git" "$dir"
-            git -C "$dir" checkout -q -B master
-        fi
-        cp "dist/arch/$p/PKGBUILD" "dist/arch/$p/.SRCINFO" "dist/arch/$p/sysman.install" "$dir/"
+        rm -rf "$dir"
+        mkdir -p target/aur
+        # a new package's AUR repo is empty, which git warns about
+        git clone -q "ssh://aur@aur.archlinux.org/$p.git" "$dir" 2>/dev/null
+        cp "$src/PKGBUILD" "$src/sysman.install" "$dir/"
+        (cd "$dir" && makepkg --printsrcinfo > .SRCINFO)
         git -C "$dir" add PKGBUILD .SRCINFO sysman.install
         if git -C "$dir" diff --cached --quiet; then
-            echo "$p: nothing to commit"
+            echo "$p: already up to date"
         else
+            rel=$(sed -n 's/^pkgrel=//p' "$src/PKGBUILD")
             git -C "$dir" commit -qm "Update to $ver-$rel"
-            echo "$p: committed; push with: git -C $dir push -u origin master"
+            # the AUR only accepts master, whatever init.defaultBranch named the clone's branch
+            git -C "$dir" push -q origin HEAD:master
+            echo "$p: pushed $ver-$rel"
         fi
+        rm -rf "$dir"
     done
-    echo "Commit the updated dist/arch/ files in this repository too."
 
 # Collector service status
 status:
