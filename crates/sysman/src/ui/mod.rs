@@ -47,7 +47,26 @@ gpui_kit_assets::icon_assets!(
         ChartLine,
         HeartPulse,
         ChartArea,
-        CircleCheck
+        CircleCheck,
+        ChevronLeft,
+        Calendar,
+        ZoomIn,
+        ZoomOut,
+        Pause,
+        Play,
+        LayoutGrid,
+        LayoutList,
+        RefreshCw,
+        PanelRight,
+        Ellipsis,
+        StepBack,
+        StepForward,
+        Pin,
+        PinOff,
+        Crosshair,
+        X,
+        Plus,
+        ListFilter
     ]
 );
 
@@ -68,3 +87,6 @@ impl AssetSource for Assets {
         Ok(paths)
     }
 }
+
+/// Opens the settings window; wired up where that window is built.
+pub fn open_settings(_cx: &mut gpui::App) {}

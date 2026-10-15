@@ -213,6 +213,7 @@ struct Rule {
 pub struct ChartState {
     built: Option<Built>,
     cursor: Rc<Cell<Option<f64>>>,
+    pin: Option<Rc<Cell<Option<f64>>>>,
     hovering: bool,
 }
 
@@ -225,6 +226,15 @@ impl ChartState {
     pub fn with_cursor(cursor: Rc<Cell<Option<f64>>>) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
             cursor,
+            ..Self::default()
+        }))
+    }
+
+    /// As `with_cursor`, but while `pin` holds a time the rule stays there; hovering still updates `cursor`.
+    pub fn with_pin(cursor: Rc<Cell<Option<f64>>>, pin: Rc<Cell<Option<f64>>>) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self {
+            cursor,
+            pin: Some(pin),
             ..Self::default()
         }))
     }
@@ -568,8 +578,14 @@ impl TrendChart {
             paint_text(window, cx, &line, point(plot.left() + px(4.), *y - LABEL_LINE / 2.));
         }
 
-        if let Some(at) = state.cursor.get().filter(|t| *t >= self.from && *t <= self.to) {
-            self.paint_cursor(at, built, &ink, window, cx);
+        let pinned = state.pin.as_ref().and_then(|p| p.get());
+        // A pin marks every chart in the group; only the chart under the pointer adds a tooltip to it.
+        let tooltip = pinned.is_none() || state.hovering;
+        if let Some(at) = pinned
+            .or(state.cursor.get())
+            .filter(|t| *t >= self.from && *t <= self.to)
+        {
+            self.paint_cursor(at, built, &ink, tooltip, window, cx);
         }
         drop(state);
 
@@ -593,7 +609,7 @@ impl TrendChart {
         });
     }
 
-    fn paint_cursor(&self, at: f64, built: &Built, ink: &Ink, window: &mut Window, cx: &mut App) {
+    fn paint_cursor(&self, at: f64, built: &Built, ink: &Ink, tooltip: bool, window: &mut Window, cx: &mut App) {
         let plot = built.plot;
         let x = self.x_of(&plot, at);
         window.paint_quad(fill(
@@ -627,6 +643,9 @@ impl TrendChart {
                 format!("{}  {value}", line.label)
             };
             rows.push((Some(line.color), label.into()));
+        }
+        if !tooltip {
+            return;
         }
 
         let shaped: Vec<_> = rows
