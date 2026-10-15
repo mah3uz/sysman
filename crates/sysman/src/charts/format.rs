@@ -8,6 +8,7 @@ pub enum Unit {
     Bytes,
     BytesPerSec,
     Celsius,
+    Watts,
 }
 
 impl Unit {
@@ -18,6 +19,8 @@ impl Unit {
             Self::Bytes => bytes(v),
             Self::BytesPerSec => format!("{}/s", bytes(v)),
             Self::Celsius => format!("{v:.1}°C"),
+            Self::Watts if v.abs() >= 10. => format!("{v:.0} W"),
+            Self::Watts => format!("{v:.1} W"),
         }
     }
 
@@ -85,6 +88,8 @@ mod tests {
         assert_eq!(Unit::BytesPerSec.format(164. * 1024.), "164.0 KB/s");
         assert_eq!(Unit::BytesPerSec.format(0.), "0 bytes/s");
         assert_eq!(Unit::Celsius.format(63.84), "63.8°C");
+        assert_eq!(Unit::Watts.format(33.66), "34 W");
+        assert_eq!(Unit::Watts.format(3.66), "3.7 W", "small iGPU draws keep a decimal");
     }
 
     #[test]
