@@ -78,6 +78,27 @@ pub struct Proc {
     pub last_t: i64,
 }
 
+/// One stored process reading.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProcPoint {
+    pub t: i64,
+    pub cpu_pct: Option<f64>,
+    pub rss_bytes: Option<i64>,
+}
+
+fn proc_row(r: &rusqlite::Row) -> rusqlite::Result<Proc> {
+    Ok(Proc {
+        id: r.get(0)?,
+        pid: r.get(1)?,
+        start_time: r.get(2)?,
+        comm: r.get(3)?,
+        cmdline: r.get(4)?,
+        user: r.get(5)?,
+        first_t: r.get(6)?,
+        last_t: r.get(7)?,
+    })
+}
+
 /// Read-only view of the daemon's `history.db`; WAL lets it read while the daemon writes.
 pub struct History {
     conn: Connection,
@@ -224,6 +245,40 @@ impl History {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Recorded processes whose name contains `query`, or whose pid is `query`, most recently seen first.
+    pub fn search_procs(&self, query: &str, limit: u32) -> Result<Vec<Proc>> {
+        let pid = query.trim().parse::<i64>().unwrap_or(-1);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, pid, start_time, comm, cmdline, user, first_t, last_t FROM procs
+             WHERE pid = ?2 OR (?2 < 0 AND instr(lower(comm), lower(?1)) > 0) ORDER BY last_t DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![query.trim(), pid, limit], proc_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Each process's newest `proc_points` row in `(t - within, t]`, busiest first.
+    pub fn procs_at(&self, t: i64, within: i64, limit: u32) -> Result<Vec<(Proc, ProcPoint)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT p.id, p.pid, p.start_time, p.comm, p.cmdline, p.user, p.first_t, p.last_t,
+                    x.t, x.cpu_pct, x.rss_bytes
+             FROM (SELECT proc_id, max(t) AS t FROM proc_points WHERE t <= ?1 AND t > ?1 - ?2 GROUP BY proc_id) AS m
+             JOIN proc_points AS x ON x.proc_id = m.proc_id AND x.t = m.t
+             JOIN procs AS p ON p.id = m.proc_id
+             ORDER BY x.cpu_pct IS NULL, x.cpu_pct DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![t, within, limit], |r| {
+            Ok((
+                proc_row(r)?,
+                ProcPoint {
+                    t: r.get(8)?,
+                    cpu_pct: r.get(9)?,
+                    rss_bytes: r.get(10)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The total of `field` over the instances `ids`, summed at each instant before bucketing, so
     /// a restart counts once and the band shows the swing of the total, not of one member.
     pub fn procs_sum(&self, ids: &[i64], field: ProcField, from: i64, to: i64, buckets: u32) -> Result<Vec<Bucket>> {
@@ -260,6 +315,33 @@ impl History {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Stored readings of a series in `[from, to)`, from the tier `series` reads.
+    pub fn sample_count(&self, path: &str, from: i64, to: i64) -> Result<i64> {
+        let table = match Tier::for_span(to - from) {
+            Tier::Raw => "SELECT count(*) FROM points",
+            Tier::Minute => "SELECT coalesce(sum(count), 0) FROM rollup_1m",
+            Tier::Quarter => "SELECT coalesce(sum(count), 0) FROM rollup_15m",
+        };
+        Ok(self.conn.query_row(
+            &format!("{table} WHERE series_id = (SELECT id FROM series WHERE path = ?1) AND t >= ?2 AND t < ?3"),
+            params![path, from, to],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Stored readings of one process in `[from, to)`, from the tier `proc_series` reads.
+    pub fn proc_sample_count(&self, proc_id: i64, from: i64, to: i64) -> Result<i64> {
+        let table = match Tier::for_span(to - from) {
+            Tier::Raw => "SELECT count(*) FROM proc_points",
+            _ => "SELECT coalesce(sum(count), 0) FROM proc_rollup_1m",
+        };
+        Ok(self.conn.query_row(
+            &format!("{table} WHERE proc_id = ?1 AND t >= ?2 AND t < ?3"),
+            params![proc_id, from, to],
+            |r| r.get(0),
+        )?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -492,5 +574,41 @@ mod tests {
             cpu[0].avg, 10.,
             "a minute with no CPU reading does not shrink the divisor"
         );
+    }
+
+    #[test]
+    fn explorer_queries_find_by_pid_rank_by_cpu_and_count_readings() {
+        let (dir, conn) = db();
+        conn.execute_batch(
+            "INSERT INTO procs VALUES (1, 42, 100, 'firefox', NULL, NULL, 0, 500);
+             INSERT INTO procs VALUES (2, 4242, 100, 'bash', NULL, NULL, 0, 900);
+             INSERT INTO proc_points (proc_id, t, cpu_pct, rss_bytes) VALUES
+               (1, 0, 90, 1), (1, 10, 5, 2), (2, 10, 40, 3), (2, 20, 70, 4);
+             INSERT INTO points (series_id, t, value) VALUES (1, 0, 1), (1, 2, 1), (1, 4, 1);",
+        )
+        .unwrap();
+        let h = history(&dir);
+        let by_pid: Vec<i64> = h.search_procs("42", 10).unwrap().iter().map(|p| p.id).collect();
+        assert_eq!(
+            by_pid,
+            [1],
+            "a number matches that pid exactly, not every pid containing it"
+        );
+        assert_eq!(h.search_procs("BASH", 10).unwrap()[0].id, 2);
+
+        let at = h.procs_at(15, 30, 10).unwrap();
+        assert_eq!(
+            at.iter().map(|(p, x)| (p.id, x.t, x.cpu_pct)).collect::<Vec<_>>(),
+            [(2, 10, Some(40.)), (1, 10, Some(5.))],
+            "each process's newest reading at or before the time, never a later one"
+        );
+        assert!(
+            h.procs_at(100, 30, 10).unwrap().is_empty(),
+            "stale readings are not current"
+        );
+
+        assert_eq!(h.sample_count("/cpu/total_pct", 0, 4).unwrap(), 2);
+        assert_eq!(h.sample_count("/nope", 0, 4).unwrap(), 0);
+        assert_eq!(h.proc_sample_count(2, 0, 60).unwrap(), 2);
     }
 }

@@ -64,7 +64,25 @@ gpui_kit_assets::icon_assets!(
         BatteryMedium,
         BatteryLow,
         BatteryCharging,
-        Laptop
+        Laptop,
+        ChevronLeft,
+        Calendar,
+        ZoomIn,
+        ZoomOut,
+        Pause,
+        Play,
+        LayoutGrid,
+        LayoutList,
+        RefreshCw,
+        PanelRight,
+        Ellipsis,
+        StepBack,
+        StepForward,
+        Pin,
+        PinOff,
+        Crosshair,
+        Plus,
+        ListFilter
     ]
 );
 
