@@ -3,9 +3,10 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    App, Background, BorderStyle, Bounds, ContentMask, DispatchPhase, Font, Hitbox, HitboxBehavior, Hsla, IntoElement,
-    MouseMoveEvent, ParentElement, Path, PathBuilder, Pixels, Point, RenderOnce, SharedString, Styled, TextAlign,
-    TextRun, Window, canvas, div, fill, linear_color_stop, linear_gradient, outline, point, px, size,
+    AnyElement, AnyView, App, Background, BorderStyle, Bounds, ContentMask, Context, DispatchPhase, ElementId, Font,
+    Hitbox, HitboxBehavior, Hsla, IntoElement, MouseMoveEvent, ParentElement, Path, PathBuilder, Pixels, Point, Render,
+    RenderOnce, SharedString, StyleRefinement, Styled, TextAlign, TextRun, Window, canvas, div, fill,
+    linear_color_stop, linear_gradient, outline, point, px, size,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -206,6 +207,7 @@ fn axis(y: YScale, unit: Unit, lo: f64, hi: f64, explicit: Option<&[f64]>) -> (f
     (lo, hi, ticks)
 }
 
+#[derive(Clone)]
 pub struct Line {
     pub data: Rc<[Bucket]>,
     pub color: Hsla,
@@ -213,6 +215,7 @@ pub struct Line {
     pub dashed: bool,
 }
 
+#[derive(Clone)]
 struct Rule {
     value: f64,
     label: SharedString,
@@ -226,6 +229,8 @@ pub struct ChartState {
     cursor: Rc<Cell<Option<f64>>>,
     pin: Option<Rc<Cell<Option<f64>>>>,
     hovering: bool,
+    /// The version last painted, so an unchanged chart is replayed rather than painted again.
+    shown: Option<u64>,
 }
 
 impl ChartState {
@@ -265,7 +270,7 @@ struct Built {
     hi: f64,
 }
 
-#[derive(IntoElement)]
+#[derive(IntoElement, Clone)]
 pub struct TrendChart {
     state: Rc<RefCell<ChartState>>,
     version: u64,
@@ -602,12 +607,18 @@ fn paint_text(window: &mut Window, cx: &mut App, line: &gpui::ShapedLine, origin
 }
 
 impl TrendChart {
-    fn paint(self, bounds: Bounds<Pixels>, hitbox: Hitbox, window: &mut Window, cx: &mut App) {
-        let ink = Ink::new(theme(cx));
+    fn ensure_built(&self, bounds: Bounds<Pixels>) {
         let mut state = self.state.borrow_mut();
         if state.built.as_ref().is_none_or(|b| b.key != (self.version, bounds)) {
             state.built = Some(self.build(bounds));
         }
+    }
+
+    /// Grid, lines and labels: everything but the hover cursor, which `paint_cursor_layer` draws over it.
+    fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        let ink = Ink::new(theme(cx));
+        self.ensure_built(bounds);
+        let state = self.state.borrow();
         let built = state.built.as_ref().expect("built above");
         let plot = built.plot;
 
@@ -650,7 +661,14 @@ impl TrendChart {
             let line = shape(window, &ink.font, label.clone(), ink.axis, *color);
             paint_text(window, cx, &line, point(plot.left() + px(4.), *y - LABEL_LINE / 2.));
         }
+    }
 
+    fn paint_cursor_layer(self, bounds: Bounds<Pixels>, hitbox: Hitbox, window: &mut Window, cx: &mut App) {
+        let ink = Ink::new(theme(cx));
+        self.ensure_built(bounds);
+        let state = self.state.borrow();
+        let built = state.built.as_ref().expect("built above");
+        let plot = built.plot;
         let pinned = state.pin.as_ref().and_then(|p| p.get());
         // A pin marks every chart in the group; only the chart under the pointer adds a tooltip to it.
         let tooltip = pinned.is_none() || state.hovering;
@@ -664,7 +682,9 @@ impl TrendChart {
 
         let state = self.state.clone();
         let (from, to) = (self.from, self.to);
-        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, _| {
+        // Only the view drawing this chart, and the views around it, redraw; cached charts elsewhere are replayed.
+        let owner = window.current_view();
+        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
             if phase != DispatchPhase::Bubble {
                 return;
             }
@@ -673,11 +693,11 @@ impl TrendChart {
                 let f = f64::from((e.position.x - plot.left()) / plot.size.width);
                 state.cursor.set(Some(from + f * (to - from)));
                 state.hovering = true;
-                window.refresh();
+                cx.notify(owner);
             } else if state.hovering {
                 state.hovering = false;
                 state.cursor.set(None);
-                window.refresh();
+                cx.notify(owner);
             }
         });
     }
@@ -761,14 +781,53 @@ pub(crate) fn dot(center: Point<Pixels>, r: Pixels, color: Hsla) -> gpui::PaintQ
     fill(Bounds::centered_at(center, size(r * 2., r * 2.)), color).corner_radii(r)
 }
 
+impl TrendChart {
+    fn canvas(self) -> AnyElement {
+        canvas(
+            |_, _, _| (),
+            move |bounds, (), window, cx| self.paint(bounds, window, cx),
+        )
+        .size_full()
+        .into_any_element()
+    }
+}
+
+/// Holds a chart for the frame its view renders in, so a chart whose data has not changed is replayed.
+struct ChartView(Option<TrendChart>);
+
+impl Render for ChartView {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.0
+            .take()
+            .map_or_else(|| div().into_any_element(), TrendChart::canvas)
+    }
+}
+
 impl RenderOnce for TrendChart {
-    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let id = ElementId::Integer(Rc::as_ptr(&self.state) as usize as u64);
+        let view = window.use_keyed_state(id, cx, |_, _| ChartView(None));
+        let changed = self.state.borrow_mut().shown.replace(self.version) != Some(self.version);
         let height = self.height;
-        div().w_full().h(height).child(
+        let cursor = self.clone();
+        // A changed chart is painted in its parent's view: its cached view would replay the old picture.
+        let base = if changed {
+            view.update(cx, |v, _| v.0 = None);
+            self.canvas()
+        } else {
+            view.update(cx, |v, _| v.0 = Some(self));
+            AnyView::from(view)
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element()
+        };
+        div().relative().w_full().h(height).child(base).child(
             canvas(
                 |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
-                move |bounds, hitbox, window, cx| self.paint(bounds, hitbox, window, cx),
+                move |bounds, hitbox, window, cx| cursor.paint_cursor_layer(bounds, hitbox, window, cx),
             )
+            .absolute()
+            .top_0()
+            .left_0()
             .size_full(),
         )
     }
