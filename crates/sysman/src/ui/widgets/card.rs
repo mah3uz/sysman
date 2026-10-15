@@ -1,9 +1,9 @@
-use gpui::{App, Div, FontWeight, Hsla, InteractiveElement, ParentElement, SharedString, Stateful, Styled, div, px};
+use gpui::{App, Div, Hsla, InteractiveElement, ParentElement, SharedString, Stateful, Styled, div};
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 
 use crate::charts::sparkline::Sparkline;
-use crate::ui::theme::theme;
+use crate::ui::theme::{rem_px, theme};
 use crate::ui::widgets::hairline;
 use crate::ui::widgets::panel::caption_label;
 
@@ -20,7 +20,7 @@ pub fn metric_card(
         .child(
             div()
                 .text_size(t.card_value)
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(t.weight_semibold)
                 .font_features(t.numbers.clone())
                 .child(value.into()),
         )
@@ -38,7 +38,7 @@ pub fn card(id: &'static str, label: &str, color: Hsla, cx: &App) -> Stateful<Di
             .min_w_0()
             .flex()
             .flex_col()
-            .gap(px(5.))
+            .gap(rem_px(5.))
             .py(t.card_padding_y)
             .px(t.card_padding_x)
             .rounded(t.card_radius)
@@ -52,8 +52,8 @@ pub fn card(id: &'static str, label: &str, color: Hsla, cx: &App) -> Stateful<Di
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(5.))
-            .child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(color))
+            .gap(rem_px(5.))
+            .child(div().flex_shrink_0().size(rem_px(6.)).rounded_full().bg(color))
             .child(div().min_w_0().truncate().child(caption_label(label, cx)))
             .child(div().flex_1())
             .child(Icon::new(IconName::Info).xsmall().text_color(t.text_tertiary)),

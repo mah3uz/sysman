@@ -3,8 +3,8 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use gpui::{
-    App, AppContext, ClickEvent, Context, Entity, FontWeight, Hsla, IntoElement, ParentElement, Render, SharedString,
-    Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
+    App, AppContext, ClickEvent, Context, Entity, Hsla, IntoElement, ParentElement, Render, SharedString, Styled,
+    WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{Icon, Sizable, WindowExt};
@@ -15,7 +15,7 @@ use crate::charts::trend::{ChartState, TrendChart, YScale};
 use crate::data::history::{Bucket, History, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::source::Source;
-use crate::ui::theme::theme;
+use crate::ui::theme::{rem_px, theme};
 use crate::ui::widgets::legend::legend;
 use crate::ui::widgets::panel::caption_label;
 use crate::ui::widgets::range::{Range, range_picker};
@@ -82,7 +82,7 @@ pub fn open(detail: Detail, window: &mut Window, cx: &mut App) {
             .gap_0()
             .bg(t.window)
             .border_color(t.control_border)
-            .rounded(px(12.))
+            .rounded(rem_px(12.))
             .content(move |content, _, _| content.child(view.clone()))
     });
 }
@@ -269,7 +269,7 @@ impl Sheet {
         let stored = self.stored.as_ref().filter(|s| s.range == self.range);
         let cell = |text: SharedString, color: Hsla| {
             div()
-                .w(px(96.))
+                .w(rem_px(96.))
                 .flex_shrink_0()
                 .flex()
                 .justify_end()
@@ -277,7 +277,7 @@ impl Sheet {
                 .font_features(t.numbers.clone())
                 .child(text)
         };
-        let header = div().flex().flex_row().pb(px(4.)).child(div().flex_1()).children(
+        let header = div().flex().flex_row().pb(rem_px(4.)).child(div().flex_1()).children(
             ["Average", "Minimum", "Maximum", "Latest", "Samples"]
                 .map(|h| cell(h.into(), t.text_tertiary).text_size(t.small_caption)),
         );
@@ -292,7 +292,7 @@ impl Sheet {
                 .flex()
                 .flex_row()
                 .items_center()
-                .py(px(5.))
+                .py(rem_px(5.))
                 .child(
                     div()
                         .flex_1()
@@ -300,8 +300,8 @@ impl Sheet {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(6.))
-                        .child(div().flex_shrink_0().size(px(7.)).rounded_full().bg(line.color))
+                        .gap(rem_px(6.))
+                        .child(div().flex_shrink_0().size(rem_px(7.)).rounded_full().bg(line.color))
                         .child(div().truncate().child(line.label.clone())),
                 )
                 .child(cell(show(s.map(|s| s.average)), t.text))
@@ -361,26 +361,26 @@ impl Render for Sheet {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(4.))
+                .gap(rem_px(4.))
                 .child(caption_label(heading, cx))
                 .child(footnote(body, cx))
         };
         div()
             .flex()
             .flex_col()
-            .gap(px(14.))
-            .p(px(20.))
+            .gap(rem_px(14.))
+            .p(rem_px(20.))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(rem_px(8.))
                     .child(Icon::new(d.icon).small().text_color(t.text_secondary))
                     .child(
                         div()
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(rem_px(15.))
+                            .font_weight(t.weight_semibold)
                             .child(d.title.clone()),
                     )
                     .child(div().flex_1())
@@ -409,7 +409,7 @@ impl Render for Sheet {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
+                    .gap(rem_px(6.))
                     .child(caption_label("Window statistics", cx))
                     .child(self.statistics(cx)),
             )

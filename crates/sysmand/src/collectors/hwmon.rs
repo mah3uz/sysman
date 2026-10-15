@@ -3,28 +3,13 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use schema::hwmon::HwmonMeta;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::collector::Collector;
 use crate::daemon::unix_now;
 use crate::sys::Sys;
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Options {
-    /// Seconds between reads by chip-name prefix (longest match wins); unmatched chips are read every sample.
-    pub chip_intervals: BTreeMap<String, u64>,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        // the nct67xx driver re-reads every register over port I/O when its cache is older than ~1.5 s
-        Self {
-            chip_intervals: BTreeMap::from([("nct67".to_string(), 10)]),
-        }
-    }
-}
+pub use sysman_config::modules::hwmon::Options;
 
 const KINDS: &[(&str, f64, &str)] = &[
     ("temp", 1000.0, "C"),

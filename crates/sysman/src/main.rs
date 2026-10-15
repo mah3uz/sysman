@@ -5,7 +5,7 @@ use gpui_component::{Root, ThemeMode};
 
 use sysman::ui;
 use sysman::ui::shell::Shell;
-use sysman::ui::theme::Theme;
+use sysman::ui::theme::{TextSize, Theme};
 
 fn main() {
     gpui_platform::application()
@@ -34,7 +34,7 @@ fn main() {
             );
             // the default dialog backdrop is too faint to read as dimmed over a dark window
             table_colour!(overlay = gpui::black().opacity(0.5));
-            cx.set_global(theme);
+            ui::theme::install(TextSize::load(), cx);
 
             let shell = cx.new(Shell::new);
             #[cfg(debug_assertions)]

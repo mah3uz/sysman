@@ -1,10 +1,10 @@
 use gpui::{
     App, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString, StatefulInteractiveElement,
-    Styled, div, px, relative,
+    Styled, div, relative,
 };
 use gpui_component::tooltip::Tooltip;
 
-use crate::ui::theme::theme;
+use crate::ui::theme::{rem_px, theme};
 
 pub struct CoreBar {
     pub pct: f64,
@@ -18,7 +18,7 @@ pub fn core_bars(bars: Vec<CoreBar>, height: Pixels, cx: &App) -> impl IntoEleme
     div()
         .flex()
         .flex_row()
-        .gap(px(2.))
+        .gap(rem_px(2.))
         .h(height)
         .children(bars.into_iter().enumerate().map(move |(i, bar)| {
             let tip: SharedString = format!("CPU {i} · {:.0}% · {}", bar.pct, bar.group).into();
@@ -27,7 +27,7 @@ pub fn core_bars(bars: Vec<CoreBar>, height: Pixels, cx: &App) -> impl IntoEleme
                 .relative()
                 .flex_1()
                 .h_full()
-                .rounded(px(2.))
+                .rounded(rem_px(2.))
                 .overflow_hidden()
                 .bg(track)
                 .child(

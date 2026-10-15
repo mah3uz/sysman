@@ -1,4 +1,82 @@
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use serde::{Deserialize, Serialize};
+
+use crate::data::prefs::prefs;
+
 const BYTE_UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
+
+/// The unit every temperature is shown in; readings stay in °C everywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TempUnit {
+    #[default]
+    Celsius,
+    Fahrenheit,
+}
+
+/// 0 until read from the preferences, then 1 + the unit's index.
+static TEMP_UNIT: AtomicU8 = AtomicU8::new(0);
+
+impl TempUnit {
+    pub const ALL: [TempUnit; 2] = [Self::Celsius, Self::Fahrenheit];
+    const KEY: &str = "display.temperature";
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Celsius => "°C",
+            Self::Fahrenheit => "°F",
+        }
+    }
+
+    /// The chosen unit, read from the preferences once.
+    pub fn current() -> Self {
+        match TEMP_UNIT.load(Ordering::Relaxed) {
+            1 => Self::Celsius,
+            2 => Self::Fahrenheit,
+            // tests format in °C and never read the user's preferences
+            _ if cfg!(test) => Self::Celsius,
+            _ => {
+                let unit: Self = prefs().lock().ok().and_then(|p| p.get(Self::KEY)).unwrap_or_default();
+                unit.remember();
+                unit
+            }
+        }
+    }
+
+    /// Makes `self` the unit shown from the next redraw on, and stores it.
+    pub fn choose(self) {
+        self.remember();
+        if let Ok(mut p) = prefs().lock() {
+            p.set(Self::KEY, &self);
+        }
+    }
+
+    /// Forgets the cached unit, after the preferences file was changed by hand.
+    pub fn reload() {
+        TEMP_UNIT.store(0, Ordering::Relaxed);
+    }
+
+    fn remember(self) {
+        TEMP_UNIT.store(self as u8 + 1, Ordering::Relaxed);
+    }
+
+    pub fn convert(self, celsius: f64) -> f64 {
+        match self {
+            Self::Celsius => celsius,
+            Self::Fahrenheit => celsius * 9. / 5. + 32.,
+        }
+    }
+
+    pub fn format(self, celsius: f64, decimals: usize) -> String {
+        format!("{:.decimals$}{}", self.convert(celsius), self.label())
+    }
+}
+
+/// A °C reading in the chosen unit: `63.8°C` or `146.8°F`.
+pub fn temperature(celsius: f64, decimals: usize) -> String {
+    TempUnit::current().format(celsius, decimals)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
@@ -21,7 +99,7 @@ impl Unit {
             Self::Index => format!("{v:.0}"),
             Self::Bytes => bytes(v),
             Self::BytesPerSec => format!("{}/s", bytes(v)),
-            Self::Celsius => format!("{v:.1}°C"),
+            Self::Celsius => temperature(v, 1),
             Self::Millis => format!("{v:.1} ms"),
             Self::Count if v.abs() < 10. && v.fract() != 0. => format!("{v:.1}"),
             Self::Count => format!("{v:.0}"),
@@ -106,6 +184,25 @@ mod tests {
         assert_eq!(Unit::Bytes.tick_scale(500.), 1.);
         assert_eq!(Unit::Bytes.tick_scale(18. * 1024f64.powi(3)), 1024f64.powi(3));
         assert_eq!(Unit::Percent.tick_scale(1e9), 1.);
+    }
+
+    #[test]
+    fn fahrenheit_converts_the_reading_not_just_the_label() {
+        let f = TempUnit::Fahrenheit;
+        assert_eq!(f.format(100., 0), "212°F");
+        assert_eq!(f.format(0., 1), "32.0°F");
+        assert_eq!(f.format(-40., 0), "-40°F", "the scales cross at -40");
+        assert_eq!(f.format(63.84, 1), "146.9°F");
+        assert_eq!(TempUnit::Celsius.format(63.84, 1), "63.8°C");
+    }
+
+    #[test]
+    fn the_temperature_unit_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui.toml");
+        crate::data::prefs::Prefs::load(path.clone()).set(TempUnit::KEY, &TempUnit::Fahrenheit);
+        let p = crate::data::prefs::Prefs::load(path);
+        assert_eq!(p.get::<TempUnit>(TempUnit::KEY), Some(TempUnit::Fahrenheit));
     }
 
     #[test]

@@ -114,7 +114,15 @@ pub fn query(runner: &dyn Runner, service: Service) -> Result<Unit, String> {
 
 /// For a system unit systemd asks polkit, which shows the system's authentication dialog.
 pub fn set(runner: &dyn Runner, service: Service, on: bool) -> Result<(), String> {
-    let args = service.toggle_args(on);
+    run(runner, service.toggle_args(on))
+}
+
+/// Restarts a running unit so it reads its configuration again.
+pub fn restart(runner: &dyn Runner, service: Service) -> Result<(), String> {
+    run(runner, service.args("restart"))
+}
+
+fn run(runner: &dyn Runner, args: Vec<&str>) -> Result<(), String> {
     let ran = runner
         .run("systemctl", &args)
         .map_err(|e| format!("Could not run systemctl: {e}"))?;
@@ -225,6 +233,13 @@ mod tests {
             "running now is not starting at login"
         );
         assert!(HELPER.switched_on(&running_not_enabled));
+    }
+
+    #[test]
+    fn restarting_the_collector_is_a_user_command_without_authentication() {
+        let f = fake(vec![("restart", ran(true, "", ""))]);
+        assert_eq!(restart(&f, COLLECTOR), Ok(()));
+        assert_eq!(*f.calls.lock().unwrap(), ["systemctl --user restart sysmand.service"]);
     }
 
     #[test]

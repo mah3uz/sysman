@@ -4,7 +4,6 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use schema::cpu::{Breakdown, CoreTypes, L3Group, Topology};
-use serde::Deserialize;
 use serde_json::Value;
 
 use crate::collector::Collector;
@@ -22,21 +21,7 @@ const TEMP_CHIPS: [(&str, &[&str]); 3] = [
     ("coretemp", &["Package id 0"]),
 ];
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Options {
-    pub per_core: bool,
-    pub frequency: bool,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            per_core: true,
-            frequency: true,
-        }
-    }
-}
+pub use sysman_config::modules::cpu::Options;
 
 struct TempSource {
     key: String,

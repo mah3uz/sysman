@@ -3,11 +3,11 @@ use std::rc::Rc;
 
 use gpui::{
     App, Global, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    prelude::FluentBuilder,
 };
 
 use crate::ui::shell::Tab;
-use crate::ui::theme::theme;
+use crate::ui::theme::{rem_px, theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Range {
@@ -81,8 +81,8 @@ pub fn range_picker_of(
     div()
         .flex()
         .flex_row()
-        .p(px(2.))
-        .rounded(px(6.))
+        .p(rem_px(2.))
+        .rounded(rem_px(6.))
         .bg(t.card)
         .text_size(t.caption)
         .children(choices.iter().map(|&range| {
@@ -90,11 +90,11 @@ pub fn range_picker_of(
             let selected = range == current;
             div()
                 .id(range.label())
-                .h(px(20.))
-                .px(px(8.))
+                .h(rem_px(20.))
+                .px(rem_px(8.))
                 .flex()
                 .items_center()
-                .rounded(px(4.))
+                .rounded(rem_px(4.))
                 .when(selected, |d| d.bg(t.blue).text_color(gpui::white()))
                 .when(!selected, |d| {
                     d.text_color(t.text_secondary).hover(|d| d.text_color(t.text))

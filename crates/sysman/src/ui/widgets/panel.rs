@@ -1,12 +1,12 @@
 use gpui::{
-    App, ClickEvent, Div, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, px,
+    App, ClickEvent, Div, ElementId, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, Window, div,
 };
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 
-use crate::ui::theme::theme;
+use crate::ui::theme::{rem_px, theme};
 use crate::ui::widgets::hairline;
 
 /// A titled panel whose expand arrow opens a larger view of its chart; callers add the body as children.
@@ -23,8 +23,8 @@ pub fn panel(
         heading(icon, title, cx).child(div().flex_1()).child(
             div()
                 .id(id)
-                .p(px(3.))
-                .rounded(px(4.))
+                .p(rem_px(3.))
+                .rounded(rem_px(4.))
                 .text_color(t.text_tertiary)
                 .hover(|d| d.bg(t.card_hover).text_color(t.text))
                 .child(Icon::new(IconName::Maximize2).xsmall())
@@ -53,7 +53,7 @@ pub fn section_with(
         div()
             .flex()
             .flex_col()
-            .gap(px(2.))
+            .gap(rem_px(2.))
             .child(heading(icon, title.into(), cx))
             .child(
                 div()
@@ -70,7 +70,7 @@ pub fn frame(cx: &App) -> Div {
         div()
             .flex()
             .flex_col()
-            .gap(px(14.))
+            .gap(rem_px(14.))
             .p(t.panel_padding)
             .rounded(t.panel_radius)
             .bg(t.panel)
@@ -85,12 +85,12 @@ pub fn heading(icon: IconName, title: impl Into<SharedString>, cx: &App) -> Div 
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(7.))
+        .gap(rem_px(7.))
         .child(Icon::new(icon).small().text_color(t.text_secondary))
         .child(
             div()
                 .text_size(t.panel_title)
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(t.weight_semibold)
                 .child(title.into()),
         )
 }
@@ -100,7 +100,7 @@ pub fn caption_label(text: &str, cx: &App) -> impl IntoElement + use<> {
     let t = theme(cx);
     div()
         .text_size(t.card_label)
-        .font_weight(FontWeight::SEMIBOLD)
+        .font_weight(t.weight_semibold)
         .text_color(t.text_secondary)
         .child(text.to_uppercase())
 }

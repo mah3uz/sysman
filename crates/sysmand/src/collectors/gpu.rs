@@ -7,24 +7,12 @@ use std::time::Instant;
 
 use anyhow::Result;
 use schema::gpu::{Device, DeviceInfo, Process};
-use serde::Deserialize;
 use serde_json::Value;
 
 use crate::collector::Collector;
 use crate::sys::Sys;
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Options {
-    /// Per-process usage (NVML or nvidia-smi, and DRM fdinfo).
-    pub processes: bool,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self { processes: true }
-    }
-}
+pub use sysman_config::modules::gpu::Options;
 
 pub struct Gpu {
     sys: Sys,
