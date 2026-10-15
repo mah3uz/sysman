@@ -17,6 +17,7 @@
         var light = mode === 'light' || (mode !== 'dark' && matchMedia('(prefers-color-scheme: light)').matches)
         var theme = light ? 'light' : 'dark'
         var root = document.documentElement
+        root.classList.add('js')
         root.dataset.theme = theme
         root.style.colorScheme = theme
         document.querySelector('meta[name="color-scheme"]').content = theme
@@ -42,13 +43,7 @@
     <meta name="twitter:image" content="https://sysman.asmechanics.com/og.jpg" />
   </head>
   <body>
-    <div id="app"></div>
-    <noscript>
-      <p style="padding: 2rem; font-family: system-ui, sans-serif">
-        sysman is a system monitor for Linux. Source and downloads:
-        <a href="https://github.com/mah3uz/sysman">github.com/mah3uz/sysman</a>.
-      </p>
-    </noscript>
+    <div id="app"><!--app-html--></div>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
