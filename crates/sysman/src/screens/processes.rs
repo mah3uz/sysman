@@ -1466,6 +1466,8 @@ mod tests {
             write_bps: None,
             user: Some("me".into()),
             fds: None,
+            net_rx_bps: None,
+            net_tx_bps: None,
             cmdline: format!("/usr/bin/{comm} --flag"),
             start_time: 1000 + u64::from(pid),
         }

@@ -8,6 +8,38 @@ pub struct Storage {
     pub devices: BTreeMap<String, Device>,
     /// Keyed by filesystem uuid.
     pub btrfs: BTreeMap<String, Btrfs>,
+    /// Keyed by block device name; present only while the privileged helper runs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub smart: BTreeMap<String, Smart>,
+}
+
+/// Drive health. NVMe fields map to the SMART / Health Information log; SATA to the ATA attributes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Smart {
+    /// The drive's own overall verdict.
+    pub passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_c: Option<f64>,
+    /// Vendor estimate of life used; may exceed 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent_used: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_spare_pct: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_on_hours: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_cycles: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsafe_shutdowns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_errors: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_read_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_written_bytes: Option<u64>,
+    /// Raw critical-warning bits (NVMe) or failing-attribute names (SATA); empty when healthy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

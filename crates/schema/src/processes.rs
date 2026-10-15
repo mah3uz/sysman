@@ -20,6 +20,11 @@ pub struct Process {
     pub user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fds: Option<u64>,
+    /// Bytes per second over TCP and UDP, from the privileged helper's eBPF counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_rx_bps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_tx_bps: Option<u64>,
     pub cmdline: String,
     /// Absolute Unix seconds; with `pid` it identifies the process instance.
     #[serde(default)]

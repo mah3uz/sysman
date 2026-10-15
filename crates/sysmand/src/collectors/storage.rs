@@ -97,7 +97,11 @@ impl Collector for Storage {
             let label = self.sys.read_opt(format!("{fs}/label")).filter(|l| !l.is_empty());
             btrfs.insert(uuid, Btrfs { label, device_errors });
         }
-        Ok(Some(serde_json::to_value(schema::storage::Storage { devices, btrfs })?))
+        Ok(Some(serde_json::to_value(schema::storage::Storage {
+            devices,
+            btrfs,
+            smart: Default::default(),
+        })?))
     }
 }
 

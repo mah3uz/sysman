@@ -164,6 +164,50 @@ A second daemon is refused when the socket answers; any other socket failure
 leaves the daemon logging without it. History is not served over the socket:
 the app opens `history.db` read-only (WAL allows concurrent readers).
 
+## Privileged helper
+
+Some data needs root or a capability: SMART (raw drive commands), CPU package
+power (RAPL `energy_uj` is root-only since the PLATYPUS side channel,
+CVE-2020-8694), other users' `/proc/<pid>/io` and `/proc/<pid>/fd`, and
+per-process network traffic (Linux keeps no such counter; eBPF does).
+`sysmand` stays unprivileged; a separate, optional `sysman-helper` reads only
+these and nothing else.
+
+- **Off by default.** Installed as `/usr/lib/systemd/system/sysman-helper.service`
+  and not enabled. The app's Settings window turns it on and off with
+  `systemctl enable --now` / `disable --now`, which asks for authentication
+  through polkit. Without it everything works and the affected values stay
+  "not permitted".
+- **Confinement.** Runs as root, limited by systemd to
+  `CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_BPF
+  CAP_PERFMON`, with `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
+  `PrivateNetwork`, no writable paths except its runtime directory. It runs a
+  fixed set of read-only queries; it never executes anything a client sends.
+- **Access.** Unix socket `/run/sysman-helper/helper.sock`, mode 0660, group
+  `wheel` (configurable): only administrators, who could read this data as root
+  anyway. Each client gets at most one answer per second.
+- **Protocol.** Line-delimited JSON, one request per line:
+  `{"cmd":"status"}` → version and which features work; `{"cmd":"read"}` →
+  RAPL energy counters (µJ, per zone, with wrap range), per-process cumulative
+  counters for every pid (`read_bytes`, `write_bytes`, `fds`, eBPF `net_rx_bytes`,
+  `net_tx_bytes`, keyed by pid and start time), and the latest SMART readings.
+  Rates are computed in `sysmand` with its usual `Deltas`.
+- **Sources.** RAPL from `/sys/class/powercap`; `/proc/<pid>/{io,fd}` for every
+  pid; SMART every 10 minutes, NVMe through the admin `Get Log Page` ioctl and
+  SATA through `smartctl -j` when installed, never waking a drive in standby;
+  network from a CO-RE eBPF program (`fexit` on `tcp_sendmsg`,
+  `tcp_cleanup_rbuf`, `udp_sendmsg`, `udp_recvmsg` and their IPv6 variants,
+  loopback excluded) that sums bytes per process in a BPF hash map.
+- **In sysmand.** A `HelperClient` asks once per tick when the socket exists and
+  feeds `cpu.power_w`, the process rows (`read_bps`, `write_bps`, `fds`,
+  `net_rx_bps`, `net_tx_bps`) and `storage.smart`. A `helper` module (10 s)
+  reports `state` (`running`, `stopped`, `error`), `version` and `features`, so
+  the app knows what to offer.
+- **In the app.** Settings → Privileged data: what the helper reads and why it
+  needs privileges, its state, and the toggle. Every card or column that lacks
+  this data shows one line saying so and an "Enable…" button that opens
+  Settings.
+
 ## Record format (schema 3)
 
 Every record has `type` (`meta` or `sample`), `schema`, `t` (Unix seconds) and
@@ -215,6 +259,5 @@ daemon at startup with a message naming them.
 
 ## Not in scope yet
 
-Privileged helper (SMART, RAPL where root-only, other users' process I/O),
-clean-shutdown marker, Docker container names, ARM CPUs, systemd service and
+Clean-shutdown marker, Docker container names, ARM CPUs, systemd service and
 mdraid collectors.

@@ -129,6 +129,8 @@ impl ProcessScanner {
                 write_bps: io.map(|i| i.1),
                 user: None,
                 fds: None,
+                net_rx_bps: None,
+                net_tx_bps: None,
                 cmdline: String::new(),
                 start_time: p.start_time,
             });
