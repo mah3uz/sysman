@@ -702,6 +702,7 @@ impl Disk {
                     .child(caption_label("Device", cx))
                     .child(picker),
             )
+            .child(self.view_switch(cx))
             .child(
                 div()
                     .flex()
@@ -1394,9 +1395,8 @@ fn detail_card(
         .child(spark)
 }
 
-impl Render for Disk {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sample = self.live.read(cx).latest.clone();
+impl Disk {
+    fn view_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
         let switch = segmented(
             "disk-view",
@@ -1413,8 +1413,20 @@ impl Render for Disk {
                 .ok();
             },
             cx,
-        )
-        .into_any_element();
+        );
+        div()
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap(px(5.))
+            .child(caption_label("View", cx))
+            .child(switch)
+    }
+}
+
+impl Render for Disk {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let sample = self.live.read(cx).latest.clone();
         let body = match self.view {
             View::Overview => self.overview(sample.as_ref(), cx).into_any_element(),
             View::Map => {
@@ -1434,7 +1446,18 @@ impl Render for Disk {
             .size_full()
             .flex()
             .flex_col()
-            .child(div().flex().flex_row().justify_center().pt(px(12.)).child(switch))
+            .when(self.view == View::Map, |d| {
+                let t = theme(cx);
+                d.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .px(t.page_padding)
+                        .pt(t.page_padding)
+                        .child(self.view_switch(cx)),
+                )
+            })
             .child(body)
     }
 }

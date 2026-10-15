@@ -49,7 +49,7 @@ gpui_kit_assets::icon_assets!(
         HeartPulse,
         ChartArea,
         CircleCheck,
-        ShieldCheck,
+        SlidersHorizontal,
         X,
         Lock
     ]

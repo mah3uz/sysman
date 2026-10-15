@@ -1,107 +1,18 @@
-use std::io;
-use std::process::{Command, Stdio};
-
 use schema::Sample;
 use schema::helper::Helper;
 use schema::processes::Process;
 use schema::storage::Smart;
 
 use crate::charts::format::bytes;
-
-pub const UNIT: &str = "sysman-helper.service";
+use crate::data::systemd::{HELPER, Unit};
 
 /// What the helper adds, in the order Settings lists it: feature key and label.
 pub const FEATURES: [(&str, &str); 4] = [
-    ("smart", "Drive health (SMART)"),
+    ("smart", "Drive health"),
     ("rapl", "CPU package power"),
-    ("proc_io", "Disk I/O and open files of other users' processes"),
+    ("proc_io", "Other users' disk I/O and open files"),
     ("net", "Per-app network traffic"),
 ];
-
-/// A finished command's outcome.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Ran {
-    pub ok: bool,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-/// Runs a program to completion; tests put a fake in place of `systemctl`.
-pub trait Runner: Send + Sync {
-    fn run(&self, program: &str, args: &[&str]) -> io::Result<Ran>;
-}
-
-pub struct System;
-
-impl Runner for System {
-    fn run(&self, program: &str, args: &[&str]) -> io::Result<Ran> {
-        // No stdin, so systemctl asks the desktop's polkit agent rather than a terminal.
-        let out = Command::new(program).args(args).stdin(Stdio::null()).output()?;
-        Ok(Ran {
-            ok: out.status.success(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
-    }
-}
-
-pub fn toggle_args(on: bool) -> [&'static str; 3] {
-    [if on { "enable" } else { "disable" }, "--now", UNIT]
-}
-
-/// The service as systemd sees it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Unit {
-    pub installed: bool,
-    pub enabled: bool,
-    /// `is-active` output: `active`, `inactive`, `failed`, `activating`, …
-    pub active: String,
-}
-
-impl Unit {
-    /// Where the toggle sits: on once enabled or started, whichever systemd reports first.
-    pub fn on(&self) -> bool {
-        self.enabled || matches!(self.active.as_str(), "active" | "activating")
-    }
-}
-
-/// Older systemd prints nothing on stdout for a missing unit and says so on stderr.
-pub fn parse_unit(is_enabled: &Ran, is_active: &Ran) -> Unit {
-    let enabled = is_enabled.stdout.trim();
-    let missing = enabled == "not-found"
-        || (enabled.is_empty()
-            && (is_enabled.stderr.contains("No such file") || is_enabled.stderr.contains("not found")));
-    Unit {
-        installed: !missing,
-        enabled: matches!(enabled, "enabled" | "enabled-runtime"),
-        active: is_active.stdout.trim().to_owned(),
-    }
-}
-
-pub fn query(runner: &dyn Runner) -> Result<Unit, String> {
-    let run = |verb: &str| {
-        runner
-            .run("systemctl", &[verb, UNIT])
-            .map_err(|e| format!("Could not run systemctl: {e}"))
-    };
-    Ok(parse_unit(&run("is-enabled")?, &run("is-active")?))
-}
-
-/// `enable --now` or `disable --now`; systemd asks polkit, which shows the system's authentication dialog.
-pub fn set(runner: &dyn Runner, on: bool) -> Result<(), String> {
-    let ran = runner
-        .run("systemctl", &toggle_args(on))
-        .map_err(|e| format!("Could not run systemctl: {e}"))?;
-    if ran.ok {
-        return Ok(());
-    }
-    let message = ran.stderr.trim();
-    Err(if message.is_empty() {
-        format!("systemctl {} failed", toggle_args(on).join(" "))
-    } else {
-        message.to_owned()
-    })
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum State {
@@ -137,7 +48,9 @@ pub fn state(module: Option<&Helper>, unit: Option<&Unit>) -> State {
     }
     match unit {
         Some(u) if !u.installed => State::NotInstalled,
-        Some(u) if u.active == "failed" => State::Error(format!("{UNIT} failed; journalctl -u {UNIT} has the details")),
+        Some(u) if u.active == "failed" => {
+            State::Error(format!("{0} failed; journalctl -u {0} has the details", HELPER.name))
+        }
         Some(u) if matches!(u.active.as_str(), "active" | "activating") => State::Starting,
         _ => State::Off,
     }
@@ -239,41 +152,8 @@ pub fn wear(percent_used: u8) -> Wear {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
 
     use super::*;
-
-    fn ran(ok: bool, stdout: &str, stderr: &str) -> Ran {
-        Ran {
-            ok,
-            stdout: stdout.into(),
-            stderr: stderr.into(),
-        }
-    }
-
-    /// Answers by verb and records every call, standing in for systemctl.
-    struct Fake {
-        answers: Vec<(&'static str, Ran)>,
-        calls: Mutex<Vec<String>>,
-    }
-
-    impl Runner for Fake {
-        fn run(&self, program: &str, args: &[&str]) -> io::Result<Ran> {
-            self.calls.lock().unwrap().push(format!("{program} {}", args.join(" ")));
-            self.answers
-                .iter()
-                .find(|(verb, _)| *verb == args[0])
-                .map(|(_, r)| r.clone())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such program"))
-        }
-    }
-
-    fn fake(answers: Vec<(&'static str, Ran)>) -> Fake {
-        Fake {
-            answers,
-            calls: Mutex::new(Vec::new()),
-        }
-    }
 
     fn module(state: &str) -> Helper {
         Helper {
@@ -290,29 +170,6 @@ mod tests {
             enabled,
             active: active.into(),
         }
-    }
-
-    #[test]
-    fn systemd_tells_not_installed_from_installed_but_off() {
-        let missing = parse_unit(&ran(false, "not-found\n", ""), &ran(false, "inactive\n", ""));
-        assert!(!missing.installed);
-        let old_systemd = parse_unit(
-            &ran(
-                false,
-                "",
-                "Failed to get unit file state for sysman-helper.service: No such file or directory",
-            ),
-            &ran(false, "inactive", ""),
-        );
-        assert!(
-            !old_systemd.installed,
-            "older systemd reports a missing unit on stderr only"
-        );
-        let off = parse_unit(&ran(false, "disabled\n", ""), &ran(false, "inactive\n", ""));
-        assert_eq!(off, unit(true, false, "inactive"));
-        assert!(!off.on());
-        let on = parse_unit(&ran(true, "enabled\n", ""), &ran(true, "active\n", ""));
-        assert!(on.installed && on.enabled && on.on());
     }
 
     #[test]
@@ -343,58 +200,11 @@ mod tests {
     }
 
     #[test]
-    fn the_toggle_runs_enable_or_disable_now_on_the_helper_unit_only() {
-        assert_eq!(toggle_args(true), ["enable", "--now", "sysman-helper.service"]);
-        assert_eq!(toggle_args(false), ["disable", "--now", "sysman-helper.service"]);
-        let runner = fake(vec![("enable", ran(true, "", ""))]);
-        assert_eq!(set(&runner, true), Ok(()));
-        assert_eq!(
-            *runner.calls.lock().unwrap(),
-            ["systemctl enable --now sysman-helper.service"]
-        );
-    }
-
-    #[test]
-    fn a_failed_toggle_reports_what_systemctl_said() {
-        let cancelled = fake(vec![(
-            "enable",
-            ran(false, "", "Failed to enable unit: Access denied\n"),
-        )]);
-        assert_eq!(
-            set(&cancelled, true),
-            Err("Failed to enable unit: Access denied".into())
-        );
-        let silent = fake(vec![("disable", ran(false, "", ""))]);
-        assert_eq!(
-            set(&silent, false),
-            Err("systemctl disable --now sysman-helper.service failed".into())
-        );
-        let absent = fake(vec![]);
-        assert!(set(&absent, true).unwrap_err().starts_with("Could not run systemctl"));
-    }
-
-    #[test]
-    fn query_asks_is_enabled_and_is_active() {
-        let runner = fake(vec![
-            ("is-enabled", ran(false, "disabled\n", "")),
-            ("is-active", ran(false, "inactive\n", "")),
-        ]);
-        assert_eq!(query(&runner), Ok(unit(true, false, "inactive")));
-        assert_eq!(
-            *runner.calls.lock().unwrap(),
-            [
-                "systemctl is-enabled sysman-helper.service",
-                "systemctl is-active sysman-helper.service"
-            ]
-        );
-    }
-
-    #[test]
     fn features_are_ticked_only_while_the_helper_runs() {
         let mut m = module("running");
         m.features = BTreeMap::from([("smart".into(), true), ("net".into(), false)]);
         let f = features(Some(&m));
-        assert_eq!(f[0], ("Drive health (SMART)", true));
+        assert_eq!(f[0], ("Drive health", true));
         assert!(!f[1].1, "a feature the helper does not report is not offered");
         assert!(!f[3].1);
         m.state = "error".into();

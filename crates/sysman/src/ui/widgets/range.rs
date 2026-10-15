@@ -95,7 +95,7 @@ pub fn range_picker_of(
                 .flex()
                 .items_center()
                 .rounded(px(4.))
-                .when(selected, |d| d.bg(t.card_hover).text_color(t.text))
+                .when(selected, |d| d.bg(t.blue).text_color(gpui::white()))
                 .when(!selected, |d| {
                     d.text_color(t.text_secondary).hover(|d| d.text_color(t.text))
                 })

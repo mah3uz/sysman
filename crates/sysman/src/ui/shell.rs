@@ -17,6 +17,7 @@ use gpui_kit_assets::IconName;
 use crate::data::helper;
 use crate::data::live::{self, Conn, Event, Live};
 use crate::data::process::{self, Interval, ProcessFeed};
+use crate::data::systemd;
 use crate::screens::dashboard::Dashboard;
 use crate::screens::disk::Disk;
 use crate::screens::gpu::Gpu;
@@ -24,14 +25,17 @@ use crate::screens::network::Network;
 use crate::screens::processes::Processes;
 use crate::ui::settings;
 use crate::ui::theme::{Theme, theme};
+use crate::ui::widgets::hairline;
 
-const TITLE_BAR_HEIGHT: Pixels = px(38.);
-const TAB_HEIGHT: Pixels = px(26.);
-const TAB_PADDING_X: Pixels = px(12.);
+const TITLE_BAR_HEIGHT: Pixels = px(52.);
+const STRIP_HEIGHT: Pixels = px(36.);
+const STRIP_INSET: Pixels = px(3.);
+const TAB_PADDING_X: Pixels = px(20.);
 const TAB_MIN_WIDTH: Pixels = px(64.);
+const CONTROL_HEIGHT: Pixels = px(32.);
 const TAB_FONT: Pixels = px(13.);
 /// Room each side of the centred strip: the refresh and settings controls and their margin.
-const SIDE_WIDTH: Pixels = px(140.);
+const SIDE_WIDTH: Pixels = px(150.);
 const DRAIN_EVERY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -111,7 +115,7 @@ impl Tab {
 pub struct Refresh(Duration);
 
 impl Refresh {
-    const CHOICES: [Refresh; 5] = [
+    pub const CHOICES: [Refresh; 5] = [
         Refresh(Duration::from_secs(2)),
         Refresh(Duration::from_secs(5)),
         Refresh(Duration::from_secs(10)),
@@ -119,7 +123,7 @@ impl Refresh {
         Refresh(Duration::from_secs(60)),
     ];
 
-    fn label(self) -> SharedString {
+    pub fn label(self) -> SharedString {
         match self.0.as_secs() {
             60 => "1 min".into(),
             s => format!("{s} s").into(),
@@ -144,7 +148,7 @@ pub struct Shell {
 impl Shell {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let live = cx.new(|_| Live::default());
-        settings::install(live.clone(), Arc::new(helper::System), cx);
+        settings::install(live.clone(), cx.entity().downgrade(), Arc::new(systemd::System), cx);
         cx.observe(&live, |_, _, cx| cx.notify()).detach();
         cx.spawn(async move |this, cx| {
             loop {
@@ -250,6 +254,16 @@ impl Shell {
         }
     }
 
+    pub fn refresh(&self) -> Refresh {
+        self.refresh
+    }
+
+    pub fn set_refresh(&mut self, refresh: Refresh, cx: &mut Context<Self>) {
+        self.refresh = refresh;
+        self.sync_feed();
+        cx.notify();
+    }
+
     fn select(&mut self, tab: Tab, cx: &mut Context<Self>) {
         if tab != self.tab {
             self.tab = tab;
@@ -262,6 +276,10 @@ impl Shell {
     fn title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let compact = strip_width(window, t) > window.viewport_size().width - SIDE_WIDTH * 2.;
+        let gear = pill(Button::new("settings").ghost().icon(Icon::new(IconName::Settings)), t)
+            .w(CONTROL_HEIGHT)
+            .tooltip("Settings")
+            .on_click(|_, _, cx| settings::open(cx));
         let drag = |id: &'static str| {
             div()
                 .id(id)
@@ -276,8 +294,6 @@ impl Shell {
             .items_center()
             .flex_shrink_0()
             .h(TITLE_BAR_HEIGHT)
-            .border_b_1()
-            .border_color(t.hairline)
             .child(drag("drag-left"))
             .child(self.tab_strip(compact, cx))
             .child(
@@ -286,95 +302,94 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .justify_end()
-                    .pr_3()
-                    .gap_1()
+                    .pr(px(14.))
+                    .gap(px(6.))
                     .child(self.refresh_control(cx))
-                    .child(
-                        Button::new("settings")
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::Settings))
-                            .tooltip("Settings")
-                            .on_click(|_, _, cx| settings::open(cx)),
-                    ),
+                    .child(gear),
             )
     }
 
     fn tab_strip(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let active = Tab::ALL.iter().position(|&tab| tab == self.tab).unwrap_or(0);
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .flex_shrink_0()
-            .p(px(2.))
-            .rounded(px(7.))
-            .bg(t.card)
-            .children(Tab::ALL.iter().enumerate().map(|(i, &tab)| {
-                let selected = i == active;
-                // A divider only between two unselected segments, as in a native segmented control.
-                let divider = i > 0 && !selected && i != active + 1;
-                div()
-                    .id(tab.label())
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .child(div().w(px(1.)).h(px(14.)).when(divider, |d| d.bg(t.hairline)))
-                    .child(
-                        div()
-                            .id(("tab", i))
-                            .h(TAB_HEIGHT)
-                            .min_w(if compact { px(34.) } else { TAB_MIN_WIDTH })
-                            .px(if compact { px(9.) } else { TAB_PADDING_X })
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(5.))
-                            .text_size(TAB_FONT)
-                            .when(selected, |d| d.bg(t.card_hover).text_color(t.text))
-                            .when(!selected, |d| {
-                                d.text_color(t.text_secondary).hover(|d| d.text_color(t.text))
-                            })
-                            .map(|d| {
-                                if compact {
-                                    d.child(Icon::new(tab.icon()).size_4())
-                                        .tooltip(move |window, cx| Tooltip::new(tab.label()).build(window, cx))
-                                } else {
-                                    d.child(tab.label())
-                                }
-                            })
-                            .on_click(cx.listener(move |shell, _, _, cx| shell.select(tab, cx))),
-                    )
-            }))
+        hairline(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .flex_shrink_0()
+                .h(STRIP_HEIGHT)
+                .p(STRIP_INSET)
+                .rounded_full()
+                .bg(t.strip)
+                .border_color(t.strip_border),
+            t.hairline_width,
+        )
+        .children(Tab::ALL.iter().enumerate().map(|(i, &tab)| {
+            let selected = i == active;
+            // A divider only between two unselected segments, as in a native segmented control.
+            let divider = i > 0 && !selected && i != active + 1;
+            div()
+                .id(tab.label())
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(div().w(px(1.)).h(px(14.)).when(divider, |d| d.bg(t.hairline)))
+                .child(
+                    div()
+                        .id(("tab", i))
+                        .h(STRIP_HEIGHT - STRIP_INSET * 2.)
+                        .min_w(if compact { px(38.) } else { TAB_MIN_WIDTH })
+                        .px(if compact { px(11.) } else { TAB_PADDING_X })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .text_size(TAB_FONT)
+                        .font_weight(FontWeight::MEDIUM)
+                        .when(selected, |d| d.bg(t.strip_active).text_color(t.text))
+                        .when(!selected, |d| {
+                            d.text_color(t.text_secondary).hover(|d| d.text_color(t.text))
+                        })
+                        .map(|d| {
+                            if compact {
+                                d.child(Icon::new(tab.icon()).size_4())
+                                    .tooltip(move |window, cx| Tooltip::new(tab.label()).build(window, cx))
+                            } else {
+                                d.child(tab.label())
+                            }
+                        })
+                        .on_click(cx.listener(move |shell, _, _, cx| shell.select(tab, cx))),
+                )
+        }))
     }
 
     fn refresh_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let shell = cx.entity().downgrade();
         let current = self.refresh;
-        Button::new("refresh")
-            .ghost()
-            .small()
-            .icon(Icon::new(IconName::Timer))
-            .label(current.label())
-            .tooltip("Redraw interval")
-            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |mut menu, _, _| {
-                for choice in Refresh::CHOICES {
-                    let shell = shell.clone();
-                    menu = menu.item(PopupMenuItem::new(choice.label()).checked(choice == current).on_click(
-                        move |_, _, cx| {
-                            shell
-                                .update(cx, |shell, cx| {
-                                    shell.refresh = choice;
-                                    shell.sync_feed();
-                                    cx.notify();
-                                })
-                                .ok();
-                        },
-                    ));
-                }
-                menu
-            })
+        let t = theme(cx);
+        pill(
+            Button::new("refresh")
+                .ghost()
+                .small()
+                .icon(Icon::new(IconName::Timer))
+                .label(current.label())
+                .child(Icon::new(IconName::ChevronDown).xsmall().text_color(t.text_secondary)),
+            t,
+        )
+        .px(px(12.))
+        .tooltip("Redraw interval")
+        .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |mut menu, _, _| {
+            for choice in Refresh::CHOICES {
+                let shell = shell.clone();
+                menu = menu.item(PopupMenuItem::new(choice.label()).checked(choice == current).on_click(
+                    move |_, _, cx| {
+                        shell.update(cx, |shell, cx| shell.set_refresh(choice, cx)).ok();
+                    },
+                ));
+            }
+            menu
+        })
     }
 }
 
@@ -395,6 +410,18 @@ impl Render for Shell {
     }
 }
 
+/// The bordered round control of the title bar's right side.
+fn pill(button: Button, t: &Theme) -> Button {
+    hairline(
+        button
+            .h(CONTROL_HEIGHT)
+            .rounded_full()
+            .bg(t.control)
+            .border_color(t.control_border),
+        t.hairline_width,
+    )
+}
+
 fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App) -> AnyView {
     let (live, feed) = (live.clone(), feed.clone());
     match tab {
@@ -411,7 +438,7 @@ fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App
 fn strip_width(window: &mut Window, t: &Theme) -> Pixels {
     let mut style = window.text_style();
     style.font_family = t.font.clone();
-    Tab::ALL.iter().fold(px(5.), |total, tab| {
+    Tab::ALL.iter().fold(STRIP_INSET * 2. + px(1.), |total, tab| {
         let run = style.to_run(tab.label().len());
         let text = window
             .text_system()
