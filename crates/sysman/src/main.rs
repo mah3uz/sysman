@@ -1,4 +1,6 @@
-use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions, px, size};
+use gpui::{
+    App, AppContext, Bounds, Entity, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions, px, size,
+};
 use gpui_component::{Root, ThemeMode};
 
 use sysman::ui;
@@ -17,27 +19,51 @@ fn main() {
             component.mono_font_family = theme.mono.clone();
             cx.set_global(theme);
 
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1280.), px(720.)),
-                    cx,
-                ))),
-                window_min_size: Some(size(px(860.), px(520.))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("sysman".into()),
-                    appears_transparent: true,
-                    traffic_light_position: None,
-                }),
-                app_id: Some("sysman".into()),
-                window_decorations: Some(WindowDecorations::Client),
-                ..Default::default()
-            };
-            cx.open_window(options, |window, cx| {
-                let shell = cx.new(|cx| Shell::new(window, cx));
-                cx.new(|cx| Root::new(shell, window, cx))
-            })
-            .expect("open window");
-            cx.activate(true);
+            let shell = cx.new(Shell::new);
+            #[cfg(debug_assertions)]
+            if std::env::var_os("SYSMAN_DEV_OPEN_AFTER_DATA").is_some() {
+                open_when_ready(shell, cx);
+                return;
+            }
+            open(shell, cx);
         });
+}
+
+/// Development aid: a locked Hyprland session draws only a window's first frame, so open once that frame has data.
+#[cfg(debug_assertions)]
+fn open_when_ready(shell: Entity<Shell>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        while !cx.update(|cx| shell.read(cx).ready(cx)) {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+        }
+        cx.update(|cx| open(shell, cx));
+    })
+    .detach();
+}
+
+fn open(shell: Entity<Shell>, cx: &mut App) {
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            size(px(1280.), px(720.)),
+            cx,
+        ))),
+        window_min_size: Some(size(px(860.), px(520.))),
+        titlebar: Some(TitlebarOptions {
+            title: Some("sysman".into()),
+            appears_transparent: true,
+            traffic_light_position: None,
+        }),
+        app_id: Some("sysman".into()),
+        window_decorations: Some(WindowDecorations::Client),
+        ..Default::default()
+    };
+    cx.open_window(options, |window, cx| {
+        window.set_window_title("sysman");
+        cx.new(|cx| Root::new(shell, window, cx))
+    })
+    .expect("open window");
+    cx.activate(true);
 }

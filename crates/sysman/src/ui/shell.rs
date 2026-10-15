@@ -13,6 +13,7 @@ use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 
 use crate::data::live::{self, Conn, Event, Live};
+use crate::screens::dashboard::Dashboard;
 use crate::ui::theme::{Theme, theme};
 
 const TITLE_BAR_HEIGHT: Pixels = px(38.);
@@ -24,7 +25,7 @@ const TAB_FONT: Pixels = px(13.);
 const SIDE_WIDTH: Pixels = px(110.);
 const DRAIN_EVERY: Duration = Duration::from_millis(250);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
     Dashboard,
     Processes,
@@ -128,8 +129,7 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        window.set_window_title("sysman");
+    pub fn new(cx: &mut Context<Self>) -> Self {
         let live = cx.new(|_| Live::default());
         cx.observe(&live, |_, _, cx| cx.notify()).detach();
         cx.spawn(async move |this, cx| {
@@ -151,6 +151,15 @@ impl Shell {
             drawn: Instant::now(),
             pending: false,
         }
+    }
+
+    /// For the first-frame aid: the mounted Dashboard has a sample and its history.
+    #[cfg(debug_assertions)]
+    pub fn ready(&self, cx: &App) -> bool {
+        self.active
+            .clone()
+            .downcast::<Dashboard>()
+            .is_ok_and(|dashboard| dashboard.read(cx).ready(cx))
     }
 
     fn drain(&mut self, cx: &mut Context<Self>) {
@@ -312,7 +321,10 @@ impl Render for Shell {
 
 fn mount(tab: Tab, live: &Entity<Live>, cx: &mut App) -> AnyView {
     let live = live.clone();
-    cx.new(|_| Placeholder { tab, live }).into()
+    match tab {
+        Tab::Dashboard => cx.new(|cx| Dashboard::new(live, cx)).into(),
+        _ => cx.new(|_| Placeholder { tab, live }).into(),
+    }
 }
 
 /// Width the strip needs with labels, so it can fall back to icons before it would overflow.

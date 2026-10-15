@@ -99,6 +99,11 @@ fn width(tier: Tier, from: i64, to: i64, buckets: u32) -> i64 {
     (raw + res - 1) / res * res
 }
 
+/// The step `series` will use for this span, so callers can bucket live points on the same grid.
+pub fn bucket_width(from: i64, to: i64, buckets: u32) -> i64 {
+    width(Tier::for_span(to - from), from, to, buckets)
+}
+
 impl History {
     pub fn open(path: &Path) -> Result<Self> {
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -124,6 +129,15 @@ impl History {
             Tier::Quarter => ("rollup_15m", "min(min), sum(avg * count) / sum(count), max(max)"),
         };
         self.bucketed(table, "series_id", id, aggregates, from, to, w)
+    }
+
+    /// Every series path that starts with `prefix`.
+    pub fn paths(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT path FROM series WHERE substr(path, 1, length(?1)) = ?1")?;
+        let rows = stmt.query_map([prefix], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Per-process history: `proc_points` up to 6 h, `proc_rollup_1m` beyond.

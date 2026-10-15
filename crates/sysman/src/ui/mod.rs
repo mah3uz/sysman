@@ -4,11 +4,32 @@ use gpui::{AssetSource, Result, SharedString};
 
 pub mod shell;
 pub mod theme;
+pub mod widgets;
 
 gpui_kit_assets::icon_assets!(
     AppIcons,
     [
-        Gauge, List, Monitor, Zap, Network, HardDrive, Cpu, Activity, Lightbulb, Layers, Timer
+        Gauge,
+        List,
+        Monitor,
+        Zap,
+        Network,
+        HardDrive,
+        Cpu,
+        Activity,
+        Lightbulb,
+        Layers,
+        Timer,
+        Info,
+        Maximize2,
+        Clock,
+        Globe,
+        Thermometer,
+        ChartColumnStacked,
+        ArrowDown,
+        ArrowUp,
+        Database,
+        Flame
     ]
 );
 

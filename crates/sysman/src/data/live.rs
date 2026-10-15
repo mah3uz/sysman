@@ -152,6 +152,10 @@ impl Live {
         self.series.get(path)
     }
 
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.series.keys().map(String::as_str)
+    }
+
     pub fn value(&self, path: &str) -> Option<f64> {
         self.series(path)?.back().map(|&(_, v)| v)
     }
