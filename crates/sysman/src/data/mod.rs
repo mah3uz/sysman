@@ -1,6 +1,7 @@
 pub mod desktop;
 pub mod diskmap;
 pub mod groups;
+pub mod hardware;
 pub mod helper;
 pub mod history;
 pub mod live;

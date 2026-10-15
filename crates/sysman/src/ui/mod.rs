@@ -82,7 +82,19 @@ gpui_kit_assets::icon_assets!(
         PinOff,
         Crosshair,
         Plus,
-        ListFilter
+        ListFilter,
+        PcCase,
+        Gpu,
+        Bluetooth,
+        Usb,
+        Volume2,
+        CircuitBoard,
+        ShieldCheck,
+        LayoutDashboard,
+        Share,
+        Fan,
+        Copy,
+        Radio
     ]
 );
 

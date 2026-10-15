@@ -24,6 +24,7 @@ use crate::screens::energy::Energy;
 use crate::screens::explorer::Explorer;
 use crate::screens::gpu::Gpu;
 use crate::screens::groups::Groups;
+use crate::screens::hardware::Hardware;
 use crate::screens::network::Network;
 use crate::screens::processes::Processes;
 use crate::ui::settings;
@@ -442,6 +443,7 @@ fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App
         Tab::Energy => cx.new(|cx| Energy::new(live, cx)).into(),
         Tab::Groups => cx.new(|cx| Groups::new(live, feed, cx)).into(),
         Tab::Explorer => cx.new(|cx| Explorer::new(live, cx)).into(),
+        Tab::Hardware => cx.new(|cx| Hardware::new(live, cx)).into(),
         _ => cx.new(|_| Placeholder { tab, live }).into(),
     }
 }

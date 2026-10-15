@@ -269,6 +269,8 @@ pub struct TrendChart {
     fill: bool,
     relative: bool,
     height: Pixels,
+    gutter: Pixels,
+    y_label: Option<fn(f64) -> String>,
 }
 
 impl TrendChart {
@@ -288,6 +290,8 @@ impl TrendChart {
             fill: false,
             relative: false,
             height: px(150.),
+            gutter: GUTTER,
+            y_label: None,
         }
     }
 
@@ -347,6 +351,13 @@ impl TrendChart {
         self
     }
 
+    /// A narrower y-axis gutter with its own tick labels, for small multiples.
+    pub fn compact_axis(mut self, gutter: Pixels, label: fn(f64) -> String) -> Self {
+        self.gutter = gutter;
+        self.y_label = Some(label);
+        self
+    }
+
     fn visible<'a>(&'a self, line: &'a Line) -> impl Iterator<Item = &'a Bucket> + 'a {
         line.data
             .iter()
@@ -364,7 +375,7 @@ impl TrendChart {
 
     fn build(&self, bounds: Bounds<Pixels>) -> Built {
         let plot = Bounds::from_corners(
-            point(bounds.left() + GUTTER, bounds.top() + TOP_PAD),
+            point(bounds.left() + self.gutter, bounds.top() + TOP_PAD),
             point(bounds.right() - px(1.), bounds.bottom() - AXIS_HEIGHT),
         );
         let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -389,7 +400,12 @@ impl TrendChart {
             rule_labels: Vec::new(),
             y_ticks: ticks
                 .iter()
-                .map(|&v| (px(y_of(v)), self.unit.format(v).into()))
+                .map(|&v| {
+                    (
+                        px(y_of(v)),
+                        self.y_label.map_or_else(|| self.unit.format(v), |f| f(v)).into(),
+                    )
+                })
                 .collect(),
             x_ticks: Vec::new(),
             lo,
