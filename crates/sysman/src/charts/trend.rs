@@ -236,6 +236,7 @@ struct Built {
     under: Vec<(Path<Pixels>, Background)>,
     over: Vec<(Path<Pixels>, Background)>,
     dots: Vec<(Point<Pixels>, Hsla)>,
+    markers: Vec<(Point<Pixels>, Hsla)>,
     rule_labels: Vec<(Pixels, SharedString, Hsla)>,
     y_ticks: Vec<(Pixels, SharedString)>,
     x_ticks: Vec<(Pixels, SharedString)>,
@@ -253,6 +254,7 @@ pub struct TrendChart {
     gap_s: f64,
     lines: Vec<Line>,
     rules: Vec<Rule>,
+    markers: Vec<(f64, f64, Hsla)>,
     unit: Unit,
     y: YScale,
     fill: bool,
@@ -272,6 +274,7 @@ impl TrendChart {
             gap_s,
             lines: Vec::new(),
             rules: Vec::new(),
+            markers: Vec::new(),
             unit: Unit::Percent,
             y: YScale::Zero,
             fill: false,
@@ -295,6 +298,12 @@ impl TrendChart {
             label: label.into(),
             color,
         });
+        self
+    }
+
+    /// A dot at `(t, value)`, such as a spike worth pointing at.
+    pub fn marker(mut self, t: f64, value: f64, color: Hsla) -> Self {
+        self.markers.push((t, value, color));
         self
     }
 
@@ -363,6 +372,12 @@ impl TrendChart {
             under: Vec::new(),
             over: Vec::new(),
             dots: Vec::new(),
+            markers: self
+                .markers
+                .iter()
+                .filter(|m| m.0 >= self.from && m.0 <= self.to)
+                .map(|&(t, v, color)| (point(self.x_of(&plot, t), px(y_of(v))), color))
+                .collect(),
             rule_labels: Vec::new(),
             y_ticks: ticks
                 .iter()
@@ -549,6 +564,9 @@ impl TrendChart {
             }
             for (at, color) in &built.dots {
                 window.paint_quad(dot(*at, px(1.5), *color));
+            }
+            for (at, color) in &built.markers {
+                window.paint_quad(dot(*at, px(4.), *color));
             }
         });
         window.paint_quad(outline(plot, ink.border, BorderStyle::Solid).border_widths(px(0.5)));

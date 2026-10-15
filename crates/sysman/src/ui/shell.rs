@@ -3,9 +3,9 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyView, App, AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Window, WindowControlArea, div,
-    prelude::FluentBuilder, px,
+    AnyView, App, AppContext, Context, Entity, FontWeight, Global, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
+    WindowControlArea, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
@@ -18,6 +18,7 @@ use crate::data::process::{self, Interval, ProcessFeed};
 use crate::screens::dashboard::Dashboard;
 use crate::screens::disk::Disk;
 use crate::screens::gpu::Gpu;
+use crate::screens::insights::Insights;
 use crate::screens::network::Network;
 use crate::screens::processes::Processes;
 use crate::ui::theme::{Theme, theme};
@@ -103,6 +104,37 @@ impl Tab {
     }
 }
 
+/// What the screen opened by [`navigate`] should select once its data is in.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Focus {
+    /// This instance if it still runs, else the newest process with this command.
+    Process { comm: String, instance: Option<(u32, u64)> },
+    /// The disk that holds this mount point.
+    Mount(String),
+}
+
+struct Navigator(WeakEntity<Shell>);
+
+impl Global for Navigator {}
+
+struct PendingFocus(Option<Focus>);
+
+impl Global for PendingFocus {}
+
+/// Switches tabs from inside a screen; the screen mounted there takes `focus` with [`take_focus`].
+pub fn navigate(tab: Tab, focus: Option<Focus>, cx: &mut App) {
+    cx.set_global(PendingFocus(focus));
+    if let Some(shell) = cx.try_global::<Navigator>().map(|n| n.0.clone()) {
+        shell.update(cx, |shell, cx| shell.select(tab, cx)).ok();
+    }
+}
+
+pub fn take_focus(cx: &mut App) -> Option<Focus> {
+    cx.has_global::<PendingFocus>()
+        .then(|| cx.global_mut::<PendingFocus>().0.take())
+        .flatten()
+}
+
 /// Redraw throttle; collection always runs at the daemon's own interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Refresh(Duration);
@@ -139,6 +171,8 @@ pub struct Shell {
 
 impl Shell {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let navigator = Navigator(cx.weak_entity());
+        cx.set_global(navigator);
         let live = cx.new(|_| Live::default());
         cx.observe(&live, |_, _, cx| cx.notify()).detach();
         cx.spawn(async move |this, cx| {
@@ -178,7 +212,7 @@ impl Shell {
     /// Only the tabs that show the process table pay for the daemon's scan.
     fn sync_feed(&self) {
         let ms = match self.tab {
-            Tab::Dashboard | Tab::Processes | Tab::Disk => self.refresh.0.as_millis() as u64,
+            Tab::Dashboard | Tab::Processes | Tab::Disk | Tab::Insights => self.refresh.0.as_millis() as u64,
             _ => 0,
         };
         self.feed_interval.store(ms, Ordering::Relaxed);
@@ -198,6 +232,9 @@ impl Shell {
             return v.read(cx).ready(cx);
         }
         if let Ok(v) = active.clone().downcast::<Network>() {
+            return v.read(cx).ready(cx);
+        }
+        if let Ok(v) = active.clone().downcast::<Insights>() {
             return v.read(cx).ready(cx);
         }
         active.downcast::<Disk>().is_ok_and(|v| v.read(cx).ready(cx))
@@ -382,6 +419,7 @@ fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App
         Tab::Gpu => cx.new(|cx| Gpu::new(live, cx)).into(),
         Tab::Network => cx.new(|cx| Network::new(live, cx)).into(),
         Tab::Disk => cx.new(|cx| Disk::new(live, feed, cx)).into(),
+        Tab::Insights => cx.new(|cx| Insights::new(live, feed, cx)).into(),
         _ => cx.new(|_| Placeholder { tab, live }).into(),
     }
 }

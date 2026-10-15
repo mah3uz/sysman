@@ -35,7 +35,7 @@ use crate::data::live::Live;
 use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source, top_up};
 use crate::screens::dashboard::{Groups, cpu_colour};
-use crate::ui::shell::Tab;
+use crate::ui::shell::{Focus, Tab, take_focus};
 use crate::ui::theme::theme;
 use crate::ui::widgets::card::card;
 use crate::ui::widgets::hairline;
@@ -591,7 +591,7 @@ struct HierarchyMode(bool);
 impl Global for HierarchyMode {}
 
 /// Built once per run on the background executor.
-struct Icons(Arc<IconIndex>);
+pub(crate) struct Icons(pub(crate) Arc<IconIndex>);
 
 impl Global for Icons {}
 
@@ -691,6 +691,8 @@ pub struct Processes {
     version: u64,
     charts: [Rc<RefCell<ChartState>>; 4],
     cpu_meta: Option<CpuMeta>,
+    /// A process another screen asked to show, selected once the table holds it.
+    focus: Option<Focus>,
     #[cfg(debug_assertions)]
     dev_select: Option<String>,
 }
@@ -739,6 +741,7 @@ impl Processes {
             version: 0,
             charts: std::array::from_fn(|_| ChartState::with_cursor(cursor.clone())),
             cpu_meta: None,
+            focus: take_focus(cx),
             #[cfg(debug_assertions)]
             dev_select: std::env::var("SYSMAN_DEV_SELECT").ok(),
         };
@@ -796,6 +799,7 @@ impl Processes {
             return;
         };
         self.with_table(cx, |delegate| delegate.model.set_table(table.rows));
+        self.apply_focus(cx);
         #[cfg(debug_assertions)]
         if let Some(name) = self.dev_select.take() {
             let line = self.with_table(cx, |d| {
@@ -819,6 +823,26 @@ impl Processes {
             self.inspected = Some(p);
         }
         self.refresh(cx);
+    }
+
+    fn apply_focus(&mut self, cx: &mut Context<Self>) {
+        let Some(Focus::Process { comm, instance }) = self.focus.take() else {
+            return;
+        };
+        let line = self.with_table(cx, |d| {
+            let m = &mut d.model;
+            let line = instance
+                .and_then(|k| m.lines.iter().position(|l| key(&m.table[l.row]) == k))
+                .or_else(|| {
+                    let named = m.lines.iter().enumerate().filter(|(_, l)| m.table[l.row].comm == comm);
+                    named.max_by_key(|(_, l)| m.table[l.row].start_time).map(|(i, _)| i)
+                })?;
+            m.selected = m.process(line).map(key);
+            Some(line)
+        });
+        if let (Some(line), Some(table)) = (line, &self.table) {
+            table.update(cx, |state, cx| state.scroll_to_row(line, cx));
+        }
     }
 
     /// Follows a change of the selected row: a new process starts a new trail and history read.
