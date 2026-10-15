@@ -8,10 +8,18 @@ post_install() {
 }
 
 post_upgrade() {
-  # a running helper picks up the new binary; a disabled one stays off
+  # running services pick up the new binaries; stopped or disabled ones stay as they are
   systemctl try-restart sysman-helper.service 2>/dev/null || true
-  echo '==> Restart the collector to run the new version:'
-  echo '      systemctl --user restart sysmand'
+  local user restarted=()
+  for user in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+    if systemctl --user -M "$user@" is-active --quiet sysmand.service 2>/dev/null &&
+      systemctl --user -M "$user@" restart sysmand.service 2>/dev/null; then
+      restarted+=("$user")
+    fi
+  done
+  if [ ${#restarted[@]} -gt 0 ]; then
+    echo "==> Restarted the collector for: ${restarted[*]}"
+  fi
 }
 
 pre_remove() {
