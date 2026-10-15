@@ -11,6 +11,7 @@ mod sys;
 #[cfg(test)]
 mod testutil;
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -65,10 +66,17 @@ fn run() -> Result<()> {
 
     if once {
         thread::sleep(Duration::from_secs(base));
-        println!("{}", serde_json::to_string_pretty(&daemon.meta_record())?);
         let sample = daemon.sample_record(None).unwrap_or_default();
-        println!("{}", serde_json::to_string_pretty(&sample)?);
-        return Ok(());
+        let text = format!(
+            "{}\n{}\n",
+            serde_json::to_string_pretty(&daemon.meta_record())?,
+            serde_json::to_string_pretty(&sample)?
+        );
+        // `sysmand --once | head` closes the pipe early; that is not an error
+        return match std::io::stdout().write_all(text.as_bytes()) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            r => Ok(r?),
+        };
     }
 
     let data = config::data_dir();
