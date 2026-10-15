@@ -689,7 +689,7 @@ impl DiskMap {
         let mode = Mode::Map;
         let mut this = Self {
             live,
-            rail: cx.new(|_| Sidebar::transient("disk_map.right", Side::Right, RAIL)),
+            rail: cx.new(|_| Sidebar::on_demand("disk_map.right", Side::Right, RAIL)),
             root: PathBuf::new(),
             tree: None,
             scan: None,
