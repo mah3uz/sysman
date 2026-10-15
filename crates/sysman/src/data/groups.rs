@@ -563,8 +563,8 @@ mod tests {
         assert_eq!(unit_name("system.slice/tailscaled.service"), "tailscaled");
         assert_eq!(unit_name("system.slice/docker-cd29ba772c204c26.scope"), "docker");
         assert_eq!(
-            unit_name("x/insensical-daemon-903686bd6b2def88.scope"),
-            "insensical-daemon"
+            unit_name("x/demo-daemon-903686bd6b2def88.scope"),
+            "demo-daemon"
         );
         assert_eq!(unit_name("x/wayland-wm@hyprland.desktop.service"), "wayland-wm");
         assert_eq!(
