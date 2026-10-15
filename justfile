@@ -75,7 +75,7 @@ uninstall:
     systemctl --user disable --now sysmand || true
     sudo pacman -Rns sysman
 
-# The whole release, e.g. `just release 0.2.0`: checks, version bump, tag, CI build, GitHub release, AUR and the website
+# The whole release, e.g. `just release 0.2.0`: checks, version bump and tag, then `just publish`; GitHub builds the rest
 release ver:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -87,6 +87,7 @@ release ver:
 
     [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "give the version as x.y.z, e.g. just release 0.2.0"
     [[ $v != "$last" && $(printf '%s\n%s\n' "$last" "$v" | sort -V | tail -1) == "$v" ]] || fail "$v is not newer than the last release ($last)"
+    [[ -n $(dist/release-notes.sh Unreleased) ]] || fail "CHANGELOG.md has nothing under ## Unreleased"
     [[ $(git branch --show-current) == main ]] || fail "switch to main first"
     [[ -z $(git status --porcelain) ]] || fail "commit or stash your changes first"
     git fetch -q origin
@@ -108,6 +109,7 @@ release ver:
     fi
     sed -i -e "s/^pkgver=.*/pkgver=$v/" -e "s/^pkgrel=.*/pkgrel=1/" -e "s/^sha256sums=.*/sha256sums=('SKIP')/" dist/arch/sysman/PKGBUILD
     sed -i -e "s/^pkgver=.*/pkgver=$v/" -e "s/^pkgrel=.*/pkgrel=1/" -e "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('SKIP')/" dist/arch/sysman-bin/PKGBUILD
+    sed -i "s/^## Unreleased$/## Unreleased\n\n## $v - $(date +%F)/" CHANGELOG.md
     git commit -qam "sysman $v"
 
     # Everything after this is public and can't be taken back.
@@ -116,43 +118,71 @@ release ver:
         echo "Stopped before pushing. To undo the version commit: git reset --hard HEAD~1"
         exit 1
     fi
-    trap 'echo "release: stopped; finish the remaining steps by hand" >&2' ERR
 
     echo "==> tag and push"
     git tag -a "$tag" -m "sysman $v"
     git push -q origin main "$tag"
+    just publish "$v"
 
-    echo "==> CI build"
-    run=
-    for _ in $(seq 30); do
-        run=$(gh run list --workflow release.yml --event push --limit 10 --json databaseId,headBranch \
-            --jq ".[] | select(.headBranch == \"$tag\") | .databaseId" | head -1)
-        [[ -n $run ]] && break
-        sleep 5
+# After v<VER> is pushed: build the Arch tarball from the tag, publish the GitHub release with its notes, push the AUR packages and deploy the website
+publish ver:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    v={{ ver }} tag=v{{ ver }} root={{ justfile_directory() }}
+    fail() { echo "publish: $*" >&2; exit 1; }
+    trap 'echo "publish: stopped; fix the cause and run just publish $v again" >&2' ERR
+    [[ $(git branch --show-current) == main ]] || fail "switch to main first"
+    [[ -z $(git status --porcelain) ]] || fail "commit or stash your changes first"
+    git ls-remote --exit-code --tags origin "$tag" >/dev/null || fail "push $tag first"
+    grep -q "^pkgver=$v$" dist/arch/sysman/PKGBUILD || fail "dist/arch is not at $v"
+    notes=$(dist/release-notes.sh "$v")
+
+    name=sysman-$v-arch-x86_64
+    out=$root/target/publish/$v
+    echo "==> Arch binaries from $tag"
+    rm -rf "$out"
+    mkdir -p "$out/src" "$out/bin"
+    git archive "$tag" | tar -x -C "$out/src"
+    # a target dir of its own, kept between releases, so later builds are incremental
+    (cd "$out/src" && CARGO_TARGET_DIR="$root/target/publish-build" \
+        cargo build --release --locked -p sysmand -p sysman -p sysman-helper --features sysman-helper/static-libbpf)
+    for b in sysmand sysman sysman-helper; do
+        strip --strip-unneeded -o "$out/bin/$b" "$root/target/publish-build/release/$b"
     done
-    [[ -n $run ]] || fail "no release run for $tag after 150 s; see the Actions tab on GitHub"
-    gh run watch "$run" --exit-status --interval 15 || fail "the release workflow failed: $(gh run view "$run" --json url --jq .url)"
+    "$out/src/dist/stage.sh" "$out/bin" "$out/$name" sysman wheel /usr
+    tar -C "$out" --owner=0 --group=0 -czf "$out/$name.tar.gz" "$name"
 
-    echo "==> publish the GitHub release"
-    gh release edit "$tag" --draft=false --latest >/dev/null
+    echo "==> GitHub release"
+    if gh release view "$tag" >/dev/null 2>&1; then
+        gh release edit "$tag" --notes "$notes" >/dev/null
+        gh release upload "$tag" --clobber "$out/$name.tar.gz"
+    else
+        # GitHub marks it latest once its own assets are up, so install.sh never meets a half-filled release
+        gh release create "$tag" --verify-tag --title "sysman $v" --notes "$notes" --latest=false "$out/$name.tar.gz" ||
+            gh release upload "$tag" --clobber "$out/$name.tar.gz"
+    fi
 
     echo "==> AUR checksums"
-    # GitHub can take a few seconds to serve the assets of a release it has just published
-    sums=$(curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors "https://github.com/mah3uz/sysman/releases/download/$tag/SHA256SUMS")
-    src_sum=$(awk -v f="sysman-$v.tar.gz" '$2 == f {print $1}' <<<"$sums")
-    bin_sum=$(awk -v f="sysman-$v-x86_64.tar.gz" '$2 == f {print $1}' <<<"$sums")
-    [[ -n $src_sum && -n $bin_sum ]] || fail "SHA256SUMS lacks a tarball checksum"
+    src_sum=$(curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors "https://github.com/mah3uz/sysman/archive/refs/tags/$tag.tar.gz" | sha256sum | cut -d' ' -f1)
+    bin_sum=$(sha256sum "$out/$name.tar.gz" | cut -d' ' -f1)
     sed -i "s/^sha256sums=.*/sha256sums=('$src_sum')/" dist/arch/sysman/PKGBUILD
     sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$bin_sum')/" dist/arch/sysman-bin/PKGBUILD
-    git commit -qam "Release $v: AUR checksums"
-    git push -q origin main
+    if [[ -n $(git status --porcelain dist/arch) ]]; then
+        git commit -qm "Release $v: AUR checksums" dist/arch
+        git push -q origin main
+    fi
 
     echo "==> AUR: sysman and sysman-bin"
     just aur
 
     echo "==> the website"
     just site-deploy
-    echo "Released $v: $(gh release view "$tag" --json url --jq .url)"
+
+    run=$(gh run list --workflow release.yml --event push --limit 10 --json databaseId,headBranch,url \
+        --jq ".[] | select(.headBranch == \"$tag\") | .url" | head -1)
+    echo
+    echo "Published $v: $(gh release view "$tag" --json url --jq .url)"
+    echo "GitHub is building the .deb, generic tarball and install.sh, and marks the release latest when they are up${run:+: $run}"
 
 # Publish dist/arch (sysman, sysman-bin) to the AUR through throwaway clones in target/aur; bump pkgrel and commit first for a packaging-only fix
 aur:
@@ -162,7 +192,8 @@ aur:
     fail() { echo "aur: $*" >&2; exit 1; }
     [[ -z $(git status --porcelain dist/arch) ]] || fail "commit dist/arch first"
     curl -fsIL --retry 6 --retry-delay 5 --retry-all-errors -o /dev/null \
-        "https://github.com/mah3uz/sysman/releases/download/v$ver/SHA256SUMS" || fail "no published v$ver GitHub release"
+        "https://github.com/mah3uz/sysman/releases/download/v$ver/sysman-$ver-arch-x86_64.tar.gz" ||
+        fail "the v$ver GitHub release has no Arch tarball yet; run just publish $ver"
     for p in sysman sysman-bin; do
         src=dist/arch/$p
         grep -q "^pkgver=$ver$" "$src/PKGBUILD" || fail "$p: pkgver is not $ver"

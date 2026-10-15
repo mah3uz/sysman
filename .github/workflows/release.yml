@@ -3,9 +3,16 @@ name: release
 on:
   push:
     tags: ['v*']
+    # a tag's run can only restore caches saved on the default branch, so main keeps the build cache warm
+    branches: [main]
+    paths: [Cargo.lock, 'dist/ci/**', .github/workflows/release.yml]
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+env:
+  CACHE_DIR: ${{ github.workspace }}/.ci-cache
 
 jobs:
   release:
@@ -14,6 +21,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
 
       - name: Tag matches the workspace version
+        if: github.ref_type == 'tag'
         run: |
           ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           case "$GITHUB_REF_NAME" in
@@ -21,21 +29,52 @@ jobs:
             *) echo "tag $GITHUB_REF_NAME does not match version $ver" >&2; exit 1 ;;
           esac
 
+      - uses: actions/cache/restore@v6.1.0
+        with:
+          path: .ci-cache
+          key: release-build-${{ hashFiles('Cargo.lock', 'dist/ci/build.sh') }}
+          restore-keys: release-build-
+
       - name: Build in ubuntu:22.04
         run: dist/ci/run.sh build
 
+      - name: Hand the cache to the runner
+        if: github.ref_type != 'tag'
+        run: sudo chown -R "$(id -u):$(id -g)" "$CACHE_DIR"
+
+      - uses: actions/cache/save@v6.1.0
+        if: github.ref_type != 'tag'
+        with:
+          path: .ci-cache
+          key: release-build-${{ hashFiles('Cargo.lock', 'dist/ci/build.sh') }}
+
       - name: Install tests in fresh containers
+        if: github.ref_type == 'tag'
         run: dist/ci/run.sh test
 
       - uses: actions/upload-artifact@v7.0.2
+        if: github.ref_type == 'tag'
         with:
           name: release-assets
           path: target/release-assets/*/
 
-      - name: Draft release
+      # `just release` publishes the release with its notes and the Arch tarball; whichever side finishes first creates it
+      - name: Add the assets to the release
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          pre=; case "$GITHUB_REF_NAME" in *-*) pre=--prerelease ;; esac
-          gh release create "$GITHUB_REF_NAME" --draft $pre --verify-tag --title "sysman ${GITHUB_REF_NAME#v}" \
-            --generate-notes target/release-assets/*/*
+          tag=$GITHUB_REF_NAME v=${GITHUB_REF_NAME#v}
+          assets=(target/release-assets/*/*)
+          pre=false
+          case "$tag" in *-*) pre=true ;; esac
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" --clobber "${assets[@]}"
+          else
+            notes=$(dist/release-notes.sh "$v" 2>/dev/null || echo "Pre-release $v")
+            args=(--verify-tag --title "sysman $v" --notes "$notes" --latest=false)
+            if $pre; then args+=(--prerelease); fi
+            gh release create "$tag" "${args[@]}" "${assets[@]}" || gh release upload "$tag" --clobber "${assets[@]}"
+          fi
+          # only now does releases/latest, which install.sh downloads from, have every asset
+          if ! $pre; then gh release edit "$tag" --latest; fi

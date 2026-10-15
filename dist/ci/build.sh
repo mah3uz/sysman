@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the release assets inside an ubuntu:22.04 container (run by dist/ci/run.sh):
 #   /src  the checkout (read only is fine)
-#   /out  holds sysman-<ver>.tar.gz on entry; receives the other assets and SHA256SUMS
+#   /out  receives the assets and SHA256SUMS
 # Optional: CARGO_HOME and CARGO_TARGET_DIR on cached volumes, CARGO_BUILD_JOBS, HOST_UID/HOST_GID to own /out.
 set -euo pipefail
 
@@ -91,7 +91,7 @@ EOF
 echo "== Depends: $depends"
 dpkg-deb --root-owner-group -Zxz --build "$deb" "$out/sysman_$ver-1_amd64.deb"
 
-(cd "$out" && sha256sum "sysman-$ver.tar.gz" "$generic.tar.gz" "sysman_$ver-1_amd64.deb" install.sh >SHA256SUMS)
+(cd "$out" && sha256sum "$generic.tar.gz" "sysman_$ver-1_amd64.deb" install.sh >SHA256SUMS)
 if [ -n "${HOST_UID:-}" ]; then
   chown -R "$HOST_UID:${HOST_GID:-$HOST_UID}" "$out"
 fi
