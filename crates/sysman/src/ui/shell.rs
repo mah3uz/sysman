@@ -16,6 +16,7 @@ use gpui_kit_assets::IconName;
 use crate::data::live::{self, Conn, Event, Live};
 use crate::data::process::{self, Interval, ProcessFeed};
 use crate::screens::dashboard::Dashboard;
+use crate::screens::network::Network;
 use crate::screens::processes::Processes;
 use crate::ui::theme::{Theme, theme};
 
@@ -187,9 +188,12 @@ impl Shell {
         let active = self.active.clone();
         match active.downcast::<Dashboard>() {
             Ok(dashboard) => dashboard.read(cx).ready(cx),
-            Err(active) => active
-                .downcast::<Processes>()
-                .is_ok_and(|processes| processes.read(cx).ready(cx)),
+            Err(active) => match active.downcast::<Processes>() {
+                Ok(processes) => processes.read(cx).ready(cx),
+                Err(active) => active
+                    .downcast::<Network>()
+                    .is_ok_and(|network| network.read(cx).ready(cx)),
+            },
         }
     }
 
@@ -369,6 +373,7 @@ fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App
     match tab {
         Tab::Dashboard => cx.new(|cx| Dashboard::new(live, feed, cx)).into(),
         Tab::Processes => cx.new(|cx| Processes::new(live, feed, cx)).into(),
+        Tab::Network => cx.new(|cx| Network::new(live, cx)).into(),
         _ => cx.new(|_| Placeholder { tab, live }).into(),
     }
 }

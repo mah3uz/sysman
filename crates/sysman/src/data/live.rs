@@ -11,6 +11,8 @@ use schema::{Meta, Record, Sample};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::data::net;
+
 /// How long a series ring reaches back.
 pub const WINDOW_S: f64 = 30. * 60.;
 const RING_CAPACITY: usize = (WINDOW_S as usize) / 2;
@@ -106,6 +108,8 @@ pub struct Live {
     /// Each module as last reported; a sample carries only the modules due on its tick.
     pub latest: Option<Sample>,
     pub skipped: u64,
+    /// Kept here, not on the Network screen, so it counts while that tab is unmounted.
+    pub net_session: net::Session,
     series: HashMap<String, VecDeque<(f64, f64)>>,
 }
 
@@ -116,6 +120,7 @@ impl Default for Live {
             meta: None,
             latest: None,
             skipped: 0,
+            net_session: net::Session::default(),
             series: HashMap::new(),
         }
     }
@@ -141,6 +146,9 @@ impl Live {
                         ring.pop_front();
                     }
                     ring.push_back((t, v));
+                }
+                if let Some(n) = &sample.net {
+                    self.net_session.observe(n);
                 }
                 self.merge(*sample);
             }

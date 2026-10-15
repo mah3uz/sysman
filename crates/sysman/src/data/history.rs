@@ -140,6 +140,18 @@ impl History {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The newest stored JSON snapshot of a slow module (`netinfo`, `storage`, `power`), with its time.
+    pub fn snapshot(&self, module: &str) -> Result<Option<(i64, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT t, data FROM snapshots WHERE module = ?1 ORDER BY t DESC LIMIT 1",
+                [module],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// Per-process history: `proc_points` up to 6 h, `proc_rollup_1m` beyond.
     pub fn proc_series(&self, proc_id: i64, field: ProcField, from: i64, to: i64, buckets: u32) -> Result<Vec<Bucket>> {
         let tier = match Tier::for_span(to - from) {
@@ -319,6 +331,18 @@ mod tests {
         assert_eq!(h.series("/cpu/total_pct", 0, 30 * DAY, 120).unwrap()[0].avg, 7.0);
         assert_eq!(h.series("/cpu/total_pct", 0, 7 * DAY, 120).unwrap()[0].avg, 1.0);
         assert!(h.series("/nope", 0, 7 * DAY, 120).unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_is_the_newest_of_its_module() {
+        let (dir, conn) = db();
+        conn.execute_batch(
+            "INSERT INTO snapshots VALUES ('netinfo', 60, 'old'), ('netinfo', 120, 'new'), ('power', 180, 'other');",
+        )
+        .unwrap();
+        let h = history(&dir);
+        assert_eq!(h.snapshot("netinfo").unwrap(), Some((120, "new".into())));
+        assert_eq!(h.snapshot("storage").unwrap(), None);
     }
 
     #[test]
