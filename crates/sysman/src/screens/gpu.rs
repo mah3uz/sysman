@@ -5,15 +5,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, Context, Div, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px, relative,
+    AnyElement, App, Context, Div, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::tooltip::Tooltip;
 use gpui_kit_assets::IconName;
 use schema::gpu::{Device, DeviceInfo, Meta as GpuMeta, Process};
 use schema::series::escape;
 
-use crate::charts::format::{Unit, bytes};
+use crate::charts::format::{self, Unit, bytes};
 use crate::charts::sparkline::Sparkline;
 use crate::charts::trend::{ChartState, TrendChart, YScale};
 use crate::data::history::{Bucket, History, bucket_width, db_path};
@@ -21,7 +21,7 @@ use crate::data::live::Live;
 use crate::data::source::{Combine, Source};
 use crate::screens::dashboard::cpu_colour;
 use crate::ui::shell::Tab;
-use crate::ui::theme::{Theme, theme};
+use crate::ui::theme::{Theme, rem_px, theme};
 use crate::ui::widgets::card::card;
 use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
 use crate::ui::widgets::legend::legend;
@@ -546,12 +546,12 @@ fn value_row(value: String, detail: Option<String>, cx: &App) -> impl IntoElemen
         .flex()
         .flex_row()
         .items_baseline()
-        .gap(px(6.))
+        .gap(rem_px(6.))
         .child(
             div()
                 .flex_shrink_0()
                 .text_size(t.card_value)
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(t.weight_semibold)
                 .font_features(t.numbers.clone())
                 .child(value),
         )
@@ -569,7 +569,7 @@ fn readout(label: &str, value: String, color: Hsla, cx: &App) -> impl IntoElemen
         .child(
             div()
                 .text_size(t.card_value)
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(t.weight_semibold)
                 .font_features(t.numbers.clone())
                 .text_color(color)
                 .child(value),
@@ -608,7 +608,7 @@ impl Gpu {
                 .flex()
                 .flex_col()
                 .items_end()
-                .gap(px(5.))
+                .gap(rem_px(5.))
                 .child(caption_label(label, cx))
                 .child(body)
         };
@@ -627,7 +627,7 @@ impl Gpu {
                     .child(
                         div()
                             .text_size(t.panel_title)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .child(self.pci.as_deref().map_or("GPU".into(), name)),
                     )
                     .child(caption(facts.join(" · "), cx))
@@ -854,13 +854,13 @@ impl Gpu {
                 .temps_c
                 .iter()
                 .max_by(|a, b| a.1.total_cmp(b.1))
-                .map(|(label, c)| format!("{label} {c:.0}°C"));
+                .map(|(label, c)| format!("{label} {}", format::temperature(*c, 0)));
             cards.push(self.stat_card(
                 Field::Temp,
                 "card-temp",
                 "Temperature",
                 t.red,
-                d.temp_c.map_or("–".into(), |c| format!("{c:.0}°C")),
+                d.temp_c.map_or("–".into(), |c| format::temperature(c, 0)),
                 hottest,
                 self.spark(Field::Temp, t.red, cx),
                 cx,
@@ -899,7 +899,7 @@ impl Gpu {
                 cx,
             ));
         }
-        div().flex().flex_row().gap(px(10.)).children(cards)
+        div().flex().flex_row().gap(rem_px(10.)).children(cards)
     }
 
     fn util_panel(&self, d: &Device, info: Option<&DeviceInfo>, cx: &App) -> impl IntoElement {
@@ -921,7 +921,7 @@ impl Gpu {
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(28.))
+                    .gap(rem_px(28.))
                     .child(readout(
                         "Live GPU",
                         d.util_pct.map_or("–".into(), |v| format!("{v:.0}%")),
@@ -983,12 +983,12 @@ impl Gpu {
                 .flex()
                 .flex_col()
                 .items_center()
-                .gap(px(6.))
-                .py(px(48.))
+                .gap(rem_px(6.))
+                .py(rem_px(48.))
                 .child(
                     div()
                         .text_size(t.panel_title)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(t.weight_semibold)
                         .child("Suspended — not polled to avoid waking it"),
                 )
                 .child(caption(
@@ -1046,20 +1046,20 @@ impl Gpu {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(5.))
+                            .gap(rem_px(5.))
                             .children(self.residency.shares().into_iter().map(|(state, share)| {
                                 div()
                                     .flex()
                                     .flex_row()
                                     .items_center()
-                                    .gap(px(8.))
+                                    .gap(rem_px(8.))
                                     .text_size(t.caption)
                                     .font_features(t.numbers.clone())
-                                    .child(div().w(px(24.)).flex_shrink_0().child(state.to_owned()))
+                                    .child(div().w(rem_px(24.)).flex_shrink_0().child(state.to_owned()))
                                     .child(div().flex_1().child(proportion(share, t.blue, cx)))
                                     .child(
                                         div()
-                                            .w(px(34.))
+                                            .w(rem_px(34.))
                                             .flex()
                                             .justify_end()
                                             .text_color(t.text_secondary)
@@ -1079,16 +1079,16 @@ impl Gpu {
                         .flex()
                         .flex_row()
                         .flex_wrap()
-                        .gap(px(6.))
+                        .gap(rem_px(6.))
                         .children(throttles.into_iter().map(|label| {
                             div()
-                                .px(px(8.))
-                                .py(px(2.))
+                                .px(rem_px(8.))
+                                .py(rem_px(2.))
                                 .rounded_full()
                                 .bg(t.orange.opacity(0.16))
                                 .text_color(t.orange)
                                 .text_size(t.small_caption)
-                                .font_weight(FontWeight::MEDIUM)
+                                .font_weight(t.weight_medium)
                                 .child(label)
                         })),
                 )
@@ -1102,8 +1102,8 @@ impl Gpu {
         let bar = div()
             .flex()
             .flex_row()
-            .h(px(12.))
-            .rounded(px(6.))
+            .h(rem_px(12.))
+            .rounded(rem_px(6.))
             .overflow_hidden()
             .bg(t.card)
             .children(
@@ -1133,9 +1133,9 @@ impl Gpu {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(7.))
+                .gap(rem_px(7.))
                 .text_size(t.caption)
-                .child(div().flex_shrink_0().size(px(9.)).rounded(px(2.)).bg(c.colour(t)))
+                .child(div().flex_shrink_0().size(rem_px(9.)).rounded(px(2.)).bg(c.colour(t)))
                 .child(div().flex_shrink_0().child(c.label()))
                 .child(div().flex_1())
                 .child(
@@ -1156,7 +1156,7 @@ impl Gpu {
         };
         section(IconName::ChartColumnStacked, "By category", cx)
             .child(bar)
-            .child(div().flex().flex_col().gap(px(6.)).children(rows))
+            .child(div().flex().flex_col().gap(rem_px(6.)).children(rows))
             .child(caption(explain, cx))
     }
 
@@ -1168,14 +1168,14 @@ impl Gpu {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(9.))
+                .gap(rem_px(9.))
                 .children(procs.iter().take(PROCESS_ROWS).map(|(p, c)| {
                     div()
                         .flex()
                         .flex_row()
                         .items_start()
-                        .gap(px(8.))
-                        .child(div().mt(px(5.)).size(px(6.)).rounded_full().bg(c.colour(t)))
+                        .gap(rem_px(8.))
+                        .child(div().mt(rem_px(5.)).size(rem_px(6.)).rounded_full().bg(c.colour(t)))
                         .child(
                             div()
                                 .flex_1()
@@ -1185,7 +1185,7 @@ impl Gpu {
                                 .child(
                                     div()
                                         .text_size(t.caption)
-                                        .font_weight(FontWeight::MEDIUM)
+                                        .font_weight(t.weight_medium)
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .child(p.comm.clone()),
@@ -1201,7 +1201,7 @@ impl Gpu {
                                 .child(
                                     div()
                                         .text_size(t.caption)
-                                        .font_weight(FontWeight::MEDIUM)
+                                        .font_weight(t.weight_medium)
                                         .child(p.util_pct.map_or("–".into(), |u| format!("{u:.0}%"))),
                                 )
                                 .child(caption(p.mem_bytes.map_or("–".into(), |b| bytes(b as f64)), cx)),

@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
@@ -25,7 +25,7 @@ use crate::data::pressure::{self, Band, CRITICAL, WARNING};
 use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source, matching};
 use crate::ui::shell::Tab;
-use crate::ui::theme::{Theme, theme};
+use crate::ui::theme::{Theme, rem_px, theme};
 use crate::ui::widgets::card::metric_card;
 use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
 use crate::ui::widgets::legend::legend;
@@ -536,7 +536,7 @@ pub(crate) fn readout(
         .child(
             div()
                 .text_size(t.card_value)
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(t.weight_semibold)
                 .font_features(t.numbers.clone())
                 .text_color(color)
                 .child(value),
@@ -551,13 +551,13 @@ pub(crate) fn top_list(rows: Vec<(String, String)>, empty: &'static str, cx: &Ap
     div()
         .flex()
         .flex_col()
-        .gap(px(6.))
+        .gap(rem_px(6.))
         .text_size(t.caption)
         .children(rows.into_iter().map(|(name, value)| {
             div()
                 .flex()
                 .flex_row()
-                .gap(px(8.))
+                .gap(rem_px(8.))
                 .child(
                     div()
                         .flex_1()
@@ -610,7 +610,7 @@ impl Dashboard {
                     .child(
                         div()
                             .text_size(t.panel_title)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .child(meta.and_then(|m| m.model.clone()).unwrap_or_else(|| "Processor".into())),
                     )
                     .child(caption(facts.join(" · "), cx))
@@ -619,14 +619,14 @@ impl Dashboard {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(5.))
+                            .gap(rem_px(5.))
                             .mt(px(2.))
                             .text_size(t.caption)
                             .child(Icon::new(IconName::Clock).xsmall().text_color(t.text_secondary))
                             .child(div().text_color(t.text_secondary).child("Uptime"))
                             .child(
                                 div()
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(t.weight_semibold)
                                     .font_features(t.numbers.clone())
                                     .child(system.map_or("–".into(), |s| duration(s.uptime_s))),
                             )
@@ -645,7 +645,7 @@ impl Dashboard {
                     .flex()
                     .flex_col()
                     .items_end()
-                    .gap(px(5.))
+                    .gap(rem_px(5.))
                     .child(caption_label("History", cx))
                     .child(range_picker(
                         self.range,
@@ -687,7 +687,7 @@ impl Dashboard {
         div()
             .flex()
             .flex_row()
-            .gap(px(10.))
+            .gap(rem_px(10.))
             .child(
                 metric_card(
                     "card-pressure",
@@ -979,7 +979,7 @@ impl Dashboard {
             )
             .child(legend(self.width_s, cx))
             .child(div().h(t.hairline_width).bg(t.hairline))
-            .child(div().flex().flex_row().gap(px(28.)).children(footer))
+            .child(div().flex().flex_row().gap(rem_px(28.)).children(footer))
             .child(caption(CPU_CAPTION, cx))
     }
 
@@ -1002,7 +1002,7 @@ impl Dashboard {
             chart = chart.line(self.data(*metric), *colour, label.to_string());
         }
         panel(icon, title.to_owned(), self.expand(lines[0].0), cx)
-            .child(div().flex().flex_row().gap(px(28.)).children(lines.iter().map(
+            .child(div().flex().flex_row().gap(rem_px(28.)).children(lines.iter().map(
                 |(_, label, colour, arrow, value)| {
                     readout(
                         &format!("Live {label}"),
@@ -1042,17 +1042,17 @@ impl Dashboard {
             .flex()
             .flex_row()
             .flex_wrap()
-            .gap(px(12.))
+            .gap(rem_px(12.))
             .children(groups.groups.iter().map(|(label, colour, cpus)| {
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(5.))
+                    .gap(rem_px(5.))
                     .text_size(t.small_caption)
                     .text_color(t.text_secondary)
                     .font_features(t.numbers.clone())
-                    .child(div().size(px(8.)).rounded(px(2.)).bg(*colour))
+                    .child(div().size(rem_px(8.)).rounded(px(2.)).bg(*colour))
                     .child(format!("{label} · {} · {:.0}%", cpus.len(), Groups::mean(&cores, cpus)))
             }));
 

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, App, AppContext, BorderStyle, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, DispatchPhase,
-    Entity, FocusHandle, Font, FontWeight, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
+    Entity, FocusHandle, Font, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Pixels, Render, SharedString,
     StatefulInteractiveElement, Styled, TextAlign, WeakEntity, Window, canvas, div, fill, linear_color_stop,
     linear_gradient, outline, point, prelude::FluentBuilder, px, relative, rgb, size,
@@ -26,7 +26,7 @@ use crate::charts::trend::shape;
 use crate::data::diskmap::{self, DIR, FOLD, HARD_LINK, Kind, OTHER_FS, ROOT, SYMLINK, Scan, Top, Tree, UNREADABLE};
 use crate::data::live::Live;
 use crate::ui::shell::paused;
-use crate::ui::theme::theme;
+use crate::ui::theme::{rem_px, theme};
 use crate::ui::widgets::segmented::segmented;
 use crate::ui::widgets::sidebar::{self, Side, Sidebar, Toggled, Widths};
 
@@ -170,14 +170,14 @@ struct Tile {
     shape: Shape,
 }
 
-/// Every tile of the map with `zoom` filling `area`, parents before their children.
-fn scene(tree: &Tree, zoom: u32, area: Rect) -> Vec<Tile> {
+/// Every tile of the map with `zoom` filling `area`, parents before their children; `k` scales the title strip with the text.
+fn scene(tree: &Tree, zoom: u32, area: Rect, k: f32) -> Vec<Tile> {
     let mut out = Vec::new();
-    lay_out(tree, zoom, area, 0, &mut out);
+    lay_out(tree, zoom, area, k, 0, &mut out);
     out
 }
 
-fn lay_out(tree: &Tree, parent: u32, r: Rect, depth: u8, out: &mut Vec<Tile>) {
+fn lay_out(tree: &Tree, parent: u32, r: Rect, k: f32, depth: u8, out: &mut Vec<Tile>) {
     let kids: Vec<u32> = tree
         .node(parent)
         .children
@@ -225,20 +225,20 @@ fn lay_out(tree: &Tree, parent: u32, r: Rect, depth: u8, out: &mut Vec<Tile>) {
             });
             continue;
         }
-        let strip = rect.h >= STRIP + 12.;
+        let strip = rect.h >= (STRIP + 12.) * k;
         out.push(Tile {
             rect,
             node,
             shape: Shape::Folder { strip },
         });
-        let top = if strip { STRIP } else { PAD };
+        let top = if strip { STRIP * k } else { PAD };
         let inner = Rect {
             x: rect.x + PAD,
             y: rect.y + top,
             w: rect.w - PAD * 2.,
             h: rect.h - top - PAD,
         };
-        lay_out(tree, node, inner, depth + 1, out);
+        lay_out(tree, node, inner, k, depth + 1, out);
     }
 }
 
@@ -629,7 +629,7 @@ struct RowsKey {
 type KindTotals = Rc<Vec<(Kind, u64, u64)>>;
 
 struct SceneCache {
-    key: (usize, u32, (i32, i32)),
+    key: (usize, u32, (i32, i32), i32),
     tiles: Rc<Vec<Tile>>,
 }
 
@@ -952,18 +952,18 @@ fn hline(cx: &App) -> gpui::Div {
 }
 
 fn swatch(color: Hsla, side: f32) -> gpui::Div {
-    div().size(px(side)).flex_shrink_0().rounded(px(2.)).bg(color)
+    div().size(rem_px(side)).flex_shrink_0().rounded(px(2.)).bg(color)
 }
 
 fn chip(text: impl Into<SharedString>, color: Option<Hsla>, cx: &App) -> gpui::Div {
     let t = theme(cx);
     div()
-        .px(px(6.))
+        .px(rem_px(6.))
         .py(px(1.))
         .rounded_full()
         .text_size(t.small_caption)
         .map(|d| match color {
-            Some(c) => d.bg(c.opacity(0.16)).text_color(c).font_weight(FontWeight::SEMIBOLD),
+            Some(c) => d.bg(c.opacity(0.16)).text_color(c).font_weight(t.weight_semibold),
             None => d.bg(t.text.opacity(0.08)).text_color(t.text_secondary),
         })
         .child(text.into())
@@ -1027,7 +1027,7 @@ impl DiskMap {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(10.))
+                    .gap(rem_px(10.))
                     .child(
                         Button::new("disk-map-cancel")
                             .ghost()
@@ -1044,8 +1044,8 @@ impl DiskMap {
                         let fraction = (done as f64 / used as f64).clamp(0., 1.);
                         d.child(
                             div()
-                                .w(px(140.))
-                                .h(px(5.))
+                                .w(rem_px(140.))
+                                .h(rem_px(5.))
                                 .rounded_full()
                                 .bg(t.text.opacity(0.10))
                                 .child(div().h_full().rounded_full().bg(t.blue).w(relative(fraction as f32))),
@@ -1069,7 +1069,7 @@ impl DiskMap {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(10.))
+                .gap(rem_px(10.))
                 .child(
                     Button::new("disk-map-rescan")
                         .ghost()
@@ -1141,9 +1141,9 @@ impl DiskMap {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(12.))
+            .gap(rem_px(12.))
             .px(t.page_padding)
-            .py(px(8.))
+            .py(rem_px(8.))
             .child(volume)
             .child(status)
             .child(div().flex_1())
@@ -1204,7 +1204,7 @@ impl DiskMap {
                 .flex()
                 .flex_row()
                 .gap(px(2.))
-                .h(px(12.))
+                .h(rem_px(12.))
                 .w_full()
                 .children(parts.iter().filter(|p| p.1 > 0).map(|(_, b, c)| {
                     div()
@@ -1222,7 +1222,7 @@ impl DiskMap {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(5.))
+                    .gap(rem_px(5.))
                     .child(swatch(*c, 8.))
                     .child(div().text_color(t.text).child(*label))
                     .child(
@@ -1272,19 +1272,19 @@ impl DiskMap {
         div()
             .flex()
             .flex_col()
-            .gap(px(8.))
+            .gap(rem_px(8.))
             .px(t.page_padding)
-            .py(px(12.))
+            .py(rem_px(12.))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_end()
-                    .gap(px(8.))
+                    .gap(rem_px(8.))
                     .child(
                         div()
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(rem_px(12.))
+                            .font_weight(t.weight_semibold)
                             .font_features(t.numbers.clone())
                             .child(headline),
                     )
@@ -1303,7 +1303,7 @@ impl DiskMap {
                     .flex_row()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(14.))
+                    .gap(rem_px(14.))
                     .text_size(t.caption)
                     .children(legend)
                     .children(chips),
@@ -1318,9 +1318,9 @@ impl DiskMap {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.))
-            .px(px(14.))
-            .py(px(6.))
+            .gap(rem_px(6.))
+            .px(rem_px(14.))
+            .py(rem_px(6.))
             .child(
                 Button::new("disk-map-back")
                     .ghost()
@@ -1347,7 +1347,7 @@ impl DiskMap {
                     .id(("disk-map-crumb", i))
                     .text_size(t.caption)
                     .whitespace_nowrap()
-                    .when(i == last, |d| d.font_weight(FontWeight::SEMIBOLD).text_color(t.text))
+                    .when(i == last, |d| d.font_weight(t.weight_semibold).text_color(t.text))
                     .when(i != last, |d| {
                         d.text_color(t.text_secondary).hover(|d| d.text_color(t.text))
                     })
@@ -1397,7 +1397,7 @@ impl DiskMap {
             .flex_col()
             .child(self.breadcrumbs(tree, cx))
             .child(
-                div().flex_1().min_h_0().px(px(14.)).pb(px(8.)).child(
+                div().flex_1().min_h_0().px(rem_px(14.)).pb(rem_px(8.)).child(
                     canvas(
                         move |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
                         move |bounds, hitbox, window, cx| surface.paint(bounds, hitbox, window, cx),
@@ -1410,10 +1410,10 @@ impl DiskMap {
                     .flex()
                     .flex_row()
                     .flex_wrap()
-                    .gap_x(px(10.))
+                    .gap_x(rem_px(10.))
                     .gap_y(px(4.))
-                    .px(px(14.))
-                    .pb(px(8.))
+                    .px(rem_px(14.))
+                    .pb(rem_px(8.))
                     .text_size(t.small_caption)
                     .text_color(t.text_secondary)
                     .children(legend.into_iter().map(|(label, c)| {
@@ -1484,7 +1484,7 @@ impl DiskMap {
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(10.))
+                    .gap(rem_px(10.))
                     .child(segmented(
                         "disk-map-age",
                         AGE_CHOICES.iter().enumerate().map(|(i, (l, _))| (i, *l)),
@@ -1516,7 +1516,7 @@ impl DiskMap {
             }
             Mode::Kinds => div()
                 .text_size(t.panel_title)
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(t.weight_semibold)
                 .child(self.kind.map_or("", |k| k.label()))
                 .into_any_element(),
             _ => div()
@@ -1526,25 +1526,25 @@ impl DiskMap {
                 .into_any_element(),
         };
         let widths = |d: gpui::Stateful<gpui::Div>, c: Col| match c {
-            Col::Name => d.flex_1().min_w(px(180.)),
-            Col::Size => d.w(px(96.)).flex().justify_end(),
-            Col::Modified => d.w(px(124.)).pl(px(16.)),
-            Col::Kind => d.w(px(170.)),
-            Col::Location => d.flex_1().min_w(px(160.)),
+            Col::Name => d.flex_1().min_w(rem_px(180.)),
+            Col::Size => d.w(rem_px(96.)).flex().justify_end(),
+            Col::Modified => d.w(rem_px(124.)).pl(rem_px(16.)),
+            Col::Kind => d.w(rem_px(170.)),
+            Col::Location => d.flex_1().min_w(rem_px(160.)),
         };
         let header = div()
             .flex()
             .flex_row()
-            .gap(px(10.))
-            .px(px(16.))
-            .py(px(7.))
+            .gap(rem_px(10.))
+            .px(rem_px(16.))
+            .py(rem_px(7.))
             .text_size(t.panel_title)
-            .font_weight(FontWeight::SEMIBOLD)
+            .font_weight(t.weight_semibold)
             .child(widths(self.header_cell(Col::Name, "Name", cx), Col::Name))
             .child(widths(self.header_cell(Col::Size, "Size", cx), Col::Size))
             .child(
                 div()
-                    .w(px(64.))
+                    .w(rem_px(64.))
                     .flex()
                     .justify_end()
                     .text_color(t.text_secondary)
@@ -1562,10 +1562,10 @@ impl DiskMap {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(10.))
-                .h(px(ROW_H))
-                .px(px(16.))
-                .text_size(px(ROW_TEXT))
+                .gap(rem_px(10.))
+                .h(rem_px(ROW_H))
+                .px(rem_px(16.))
+                .text_size(rem_px(ROW_TEXT))
                 .when(i % 2 == 1, |d| d.bg(t.text.opacity(0.025)))
                 .when(selected == Some(id), |d| d.bg(t.selection))
                 .hover(|d| d.bg(t.card_hover))
@@ -1574,7 +1574,7 @@ impl DiskMap {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(8.))
+                        .gap(rem_px(8.))
                         .overflow_hidden()
                         .child(swatch(kind_colour(n.kind), 10.))
                         .child(
@@ -1592,7 +1592,7 @@ impl DiskMap {
                 )
                 .child(
                     div()
-                        .w(px(64.))
+                        .w(rem_px(64.))
                         .flex()
                         .justify_end()
                         .text_color(t.text_secondary)
@@ -1645,8 +1645,8 @@ impl DiskMap {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .px(px(16.))
-                    .py(px(8.))
+                    .px(rem_px(16.))
+                    .py(rem_px(8.))
                     .child(controls)
                     .child(div().flex_1())
                     .child(
@@ -1695,10 +1695,10 @@ impl DiskMap {
                 .id(("disk-map-kind", kind as usize))
                 .flex()
                 .flex_col()
-                .gap(px(5.))
-                .px(px(12.))
-                .py(px(9.))
-                .rounded(px(6.))
+                .gap(rem_px(5.))
+                .px(rem_px(12.))
+                .py(rem_px(9.))
+                .rounded(rem_px(6.))
                 .when(current == Some(kind), |d| d.bg(t.selection))
                 .hover(|d| d.bg(t.card_hover))
                 .child(
@@ -1706,14 +1706,14 @@ impl DiskMap {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(8.))
-                        .text_size(px(ROW_TEXT))
+                        .gap(rem_px(8.))
+                        .text_size(rem_px(ROW_TEXT))
                         .child(swatch(color, 10.))
                         .child(div().flex_1().child(kind.label()))
                         .child(div().font_features(t.numbers.clone()).child(bytes(b as f64))),
                 )
                 .child(
-                    div().h(px(5.)).rounded_full().bg(t.text.opacity(0.10)).child(
+                    div().h(rem_px(5.)).rounded_full().bg(t.text.opacity(0.10)).child(
                         div()
                             .h_full()
                             .rounded_full()
@@ -1746,10 +1746,10 @@ impl DiskMap {
             .child(
                 div()
                     .id("disk-map-kinds")
-                    .w(px(300.))
+                    .w(rem_px(300.))
                     .flex_shrink_0()
                     .overflow_y_scroll()
-                    .p(px(8.))
+                    .p(rem_px(8.))
                     .flex()
                     .flex_col()
                     .gap(px(2.))
@@ -1767,7 +1767,7 @@ impl DiskMap {
             .overflow_y_scroll()
             .border_l(t.hairline_width)
             .border_color(t.hairline)
-            .p(px(14.))
+            .p(rem_px(14.))
             .child(self.details(tree, id, cx))
     }
 
@@ -1833,25 +1833,25 @@ impl DiskMap {
         div()
             .flex()
             .flex_col()
-            .gap(px(14.))
+            .gap(rem_px(14.))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_start()
-                    .gap(px(10.))
+                    .gap(rem_px(10.))
                     .child(
                         div()
-                            .size(px(36.))
+                            .size(rem_px(36.))
                             .flex_shrink_0()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(8.))
+                            .rounded(rem_px(8.))
                             .bg(colour.opacity(0.18))
                             .child(
                                 Icon::new(if dir { IconName::Folder } else { IconName::File })
-                                    .size(px(20.))
+                                    .size(rem_px(20.))
                                     .text_color(colour),
                             ),
                     )
@@ -1865,7 +1865,7 @@ impl DiskMap {
                             .child(
                                 div()
                                     .text_size(t.panel_title)
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(t.weight_semibold)
                                     .child(name),
                             )
                             .child(
@@ -1889,13 +1889,13 @@ impl DiskMap {
                     .flex()
                     .flex_row()
                     .items_start()
-                    .gap(px(6.))
+                    .gap(rem_px(6.))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .font_family(t.mono.clone())
-                            .text_size(px(12.))
+                            .text_size(rem_px(12.))
                             .text_color(t.text_secondary)
                             .child(path_text),
                     )
@@ -1914,7 +1914,7 @@ impl DiskMap {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
+                    .gap(rem_px(6.))
                     .child(fact("Size", bytes(n.bytes as f64)))
                     .when(dir || fold, |d| {
                         d.child(fact("Items", compact(n.items.saturating_sub(u64::from(dir)))))
@@ -1926,7 +1926,7 @@ impl DiskMap {
                     .child(fact("Modified", modified_text(n.modified, now))),
             )
             .when(!badges.is_empty(), |d| {
-                d.child(div().flex().flex_row().flex_wrap().gap(px(5.)).children(badges))
+                d.child(div().flex().flex_row().flex_wrap().gap(rem_px(5.)).children(badges))
             })
             .when_some(note, |d, note| {
                 d.child(div().text_size(t.caption).text_color(t.text_secondary).child(note))
@@ -1935,13 +1935,13 @@ impl DiskMap {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(8.))
+                    .gap(rem_px(8.))
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .flex_wrap()
-                            .gap(px(8.))
+                            .gap(rem_px(8.))
                             .when(!fold, |d| {
                                 d.child(
                                     Button::new("disk-map-open")
@@ -1974,7 +1974,7 @@ impl DiskMap {
                             .flex()
                             .flex_row()
                             .flex_wrap()
-                            .gap(px(8.))
+                            .gap(rem_px(8.))
                             .when(self.mode == Mode::Map && tree.openable(id) && self.zoom != id, |d| {
                                 d.child(
                                     Button::new("disk-map-zoom")
@@ -2014,11 +2014,11 @@ impl DiskMap {
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(6.))
+                        .gap(rem_px(6.))
                         .child(
                             div()
                                 .text_size(t.small_caption)
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_weight(t.weight_semibold)
                                 .text_color(t.text_tertiary)
                                 .child("TOP CONTENTS"),
                         )
@@ -2040,7 +2040,7 @@ impl DiskMap {
                                     div()
                                         .flex()
                                         .flex_row()
-                                        .gap(px(6.))
+                                        .gap(rem_px(6.))
                                         .text_size(t.caption)
                                         .child(
                                             div()
@@ -2139,17 +2139,17 @@ impl DiskMap {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(14.))
+            .gap(rem_px(14.))
             .child(
                 div()
-                    .size(px(48.))
+                    .size(rem_px(48.))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(12.))
+                    .rounded(rem_px(12.))
                     .bg(t.blue.opacity(0.16))
-                    .child(Icon::new(IconName::HardDrive).size(px(24.)).text_color(t.blue)),
+                    .child(Icon::new(IconName::HardDrive).size(rem_px(24.)).text_color(t.blue)),
             )
             .child(
                 div()
@@ -2161,20 +2161,20 @@ impl DiskMap {
                     .child(
                         div()
                             .text_size(t.small_caption)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .text_color(t.blue)
                             .child(if progress.cancelled() { "STOPPING" } else { "SCANNING" }),
                     )
                     .child(
                         div()
-                            .text_size(px(22.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(rem_px(22.))
+                            .font_weight(t.weight_semibold)
                             .child(self.root.display().to_string()),
                     )
                     .when_some(subtitle, |d, sub| {
                         d.child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(rem_px(12.))
                                 .text_color(t.text_secondary)
                                 .font_features(t.numbers.clone())
                                 .child(sub),
@@ -2209,7 +2209,7 @@ impl DiskMap {
                 _ => (bytes(found as f64), "found so far".to_string()),
             };
             div()
-                .size(px(212.))
+                .size(rem_px(212.))
                 .flex_shrink_0()
                 .relative()
                 .flex()
@@ -2232,14 +2232,14 @@ impl DiskMap {
                 )
                 .child(
                     div()
-                        .text_size(px(if determinate { 40. } else { 28. }))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(rem_px(if determinate { 40. } else { 28. }))
+                        .font_weight(t.weight_semibold)
                         .font_features(t.numbers.clone())
                         .child(big),
                 )
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(rem_px(12.))
                         .text_color(t.text_secondary)
                         .font_features(t.numbers.clone())
                         .child(small),
@@ -2253,23 +2253,23 @@ impl DiskMap {
                 .flex()
                 .flex_col()
                 .gap(px(4.))
-                .px(px(14.))
-                .py(px(10.))
-                .rounded(px(10.))
+                .px(rem_px(14.))
+                .py(rem_px(10.))
+                .rounded(rem_px(10.))
                 .bg(t.text.opacity(0.035))
                 .border_1()
                 .border_color(t.hairline)
                 .child(
                     div()
                         .text_size(t.small_caption)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(t.weight_semibold)
                         .text_color(t.text_tertiary)
                         .child(label),
                 )
                 .child(
                     div()
-                        .text_size(px(20.))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(rem_px(20.))
+                        .font_weight(t.weight_semibold)
                         .font_features(t.numbers.clone())
                         .whitespace_nowrap()
                         .child(value),
@@ -2279,12 +2279,12 @@ impl DiskMap {
             .w_full()
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(rem_px(10.))
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(10.))
+                    .gap(rem_px(10.))
                     .child(stat("ITEMS", compact(items)))
                     .child(stat("FOUND", bytes(found as f64))),
             )
@@ -2292,7 +2292,7 @@ impl DiskMap {
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(10.))
+                    .gap(rem_px(10.))
                     .child(stat(
                         "FOLDERS / S",
                         rate.map_or("–".into(), |r| compact(r.round() as u64)),
@@ -2316,7 +2316,7 @@ impl DiskMap {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(5.))
+                .gap(rem_px(5.))
                 .child(swatch(color, 9.))
                 .child(label)
         };
@@ -2338,9 +2338,9 @@ impl DiskMap {
             .min_w_0()
             .flex()
             .flex_col()
-            .gap(px(10.))
-            .p(px(12.))
-            .rounded(px(12.))
+            .gap(rem_px(10.))
+            .p(rem_px(12.))
+            .rounded(rem_px(12.))
             .bg(t.text.opacity(0.025))
             .border_1()
             .border_color(t.hairline)
@@ -2349,14 +2349,14 @@ impl DiskMap {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(14.))
+                    .gap(rem_px(14.))
                     .text_size(t.caption)
                     .text_color(t.text_secondary)
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(t.panel_title)
+                            .font_weight(t.weight_semibold)
                             .text_color(t.text)
                             .font_features(t.numbers.clone())
                             .child(map_title),
@@ -2371,16 +2371,16 @@ impl DiskMap {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(10.))
-            .px(px(14.))
-            .py(px(9.))
-            .rounded(px(8.))
+            .gap(rem_px(10.))
+            .px(rem_px(14.))
+            .py(rem_px(9.))
+            .rounded(rem_px(8.))
             .bg(t.text.opacity(0.035))
             .child(
                 div()
                     .flex_shrink_0()
                     .text_size(t.caption)
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(t.weight_semibold)
                     .text_color(t.text_tertiary)
                     .child("READING"),
             )
@@ -2391,7 +2391,7 @@ impl DiskMap {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .font_family(t.mono.clone())
-                    .text_size(px(12.))
+                    .text_size(rem_px(12.))
                     .text_color(t.text_secondary)
                     .child(if current.as_os_str().is_empty() {
                         "–".to_string()
@@ -2405,9 +2405,9 @@ impl DiskMap {
             .min_h_0()
             .flex()
             .flex_col()
-            .gap(px(18.))
+            .gap(rem_px(18.))
             .px(t.page_padding)
-            .py(px(18.))
+            .py(rem_px(18.))
             .child(header)
             .child(
                 div()
@@ -2415,15 +2415,15 @@ impl DiskMap {
                     .min_h_0()
                     .flex()
                     .flex_row()
-                    .gap(px(18.))
+                    .gap(rem_px(18.))
                     .child(
                         div()
-                            .w(px(330.))
+                            .w(rem_px(330.))
                             .flex_shrink_0()
                             .flex()
                             .flex_col()
                             .items_center()
-                            .gap(px(16.))
+                            .gap(rem_px(16.))
                             .child(ring)
                             .child(counters),
                     )
@@ -2447,11 +2447,11 @@ impl DiskMap {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap(px(8.))
+            .gap(rem_px(8.))
             .child(
                 div()
                     .text_size(t.panel_title)
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(t.weight_semibold)
                     .child(title),
             )
             .child(
@@ -2572,11 +2572,12 @@ fn paint_partial(
         (v.glide.at(now), v.done_at.clone())
     };
     let mut medium = font.clone();
-    medium.weight = FontWeight::MEDIUM;
+    medium.weight = t.weight_medium;
     let mut numbers = font.clone();
     numbers.features = t.numbers.clone();
     let (text_secondary, text_tertiary, blue) = (t.text_secondary, t.text_tertiary, t.blue);
-    let line = px(TILE_LINE + 1.);
+    let k = window.rem_size() / px(16.);
+    let line = px((TILE_LINE + 1.) * k);
     let clock = now.saturating_duration_since(started).as_secs_f32();
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         for (i, rect) in shown.iter().enumerate() {
@@ -2620,25 +2621,25 @@ fn paint_partial(
                     .corner_radii(radius),
                 );
             }
-            if r.w < LABEL_MIN_W + 8. || r.h < LABEL_MIN_H + 8. {
+            if r.w < LABEL_MIN_W * k + 8. || r.h < LABEL_MIN_H * k + 8. {
                 continue;
             }
             let ink = if shade > 0.5 { label_ink(colour) } else { text_secondary };
             let max = r.w - 14.;
             let x = b.origin.x + px(7.);
-            if let Some(name) = fitted(window, &medium, &top.name, px(TILE_NAME + 1.), max, ink) {
+            if let Some(name) = fitted(window, &medium, &top.name, px((TILE_NAME + 1.) * k), max, ink) {
                 name.paint(point(x, b.origin.y + px(6.)), line, TextAlign::Left, None, window, cx)
                     .ok();
             }
-            if r.h >= 6. + 2. * (TILE_LINE + 1.) + 6. {
+            if r.h >= 2. * (TILE_LINE + 1.) * k + 12. {
                 let (text, size_ink) = if top.done {
                     (bytes(top.bytes as f64), ink.opacity(0.8))
                 } else {
                     (format!("{}…", bytes(top.bytes as f64)), text_tertiary)
                 };
-                if let Some(size) = fitted(window, &numbers, &text, px(TILE_SIZE + 1.), max, size_ink) {
+                if let Some(size) = fitted(window, &numbers, &text, px((TILE_SIZE + 1.) * k), max, size_ink) {
                     size.paint(
-                        point(x, b.origin.y + px(6. + TILE_LINE + 1.)),
+                        point(x, b.origin.y + px(6. + (TILE_LINE + 1.) * k)),
                         line,
                         TextAlign::Left,
                         None,
@@ -2683,14 +2684,15 @@ fn fitted(
 }
 
 impl Surface {
-    fn tiles(&self, bounds: Bounds<Pixels>) -> Rc<Vec<Tile>> {
+    fn tiles(&self, bounds: Bounds<Pixels>, k: f32) -> Rc<Vec<Tile>> {
         let (w, h) = (bounds.size.width / px(1.), bounds.size.height / px(1.));
-        let key = (tree_key(&self.tree), self.zoom, (w as i32, h as i32));
+        let k = k.max(0.);
+        let key = (tree_key(&self.tree), self.zoom, (w as i32, h as i32), (k * 100.) as i32);
         let mut cache = self.scene.borrow_mut();
         if let Some(c) = cache.as_ref().filter(|c| c.key == key) {
             return c.tiles.clone();
         }
-        let tiles = Rc::new(scene(&self.tree, self.zoom, Rect { x: 0., y: 0., w, h }));
+        let tiles = Rc::new(scene(&self.tree, self.zoom, Rect { x: 0., y: 0., w, h }, k));
         *cache = Some(SceneCache {
             key,
             tiles: tiles.clone(),
@@ -2711,17 +2713,18 @@ impl Surface {
     fn paint(self, bounds: Bounds<Pixels>, hitbox: Hitbox, window: &mut Window, cx: &mut App) {
         let t = theme(cx);
         let (secondary, text, page) = (t.text_secondary, t.text, t.window);
-        let (name_size, size_size) = (px(TILE_NAME), px(TILE_SIZE));
+        let k = window.rem_size() / px(16.);
+        let (name_size, size_size) = (px(TILE_NAME * k), px(TILE_SIZE * k));
         let features = t.numbers.clone();
-        let tiles = self.tiles(bounds);
+        let tiles = self.tiles(bounds, k);
         let origin = bounds.origin;
         let mut bold = self.font.clone();
-        bold.weight = FontWeight::SEMIBOLD;
+        bold.weight = t.weight_semibold;
         let mut medium = self.font.clone();
-        medium.weight = FontWeight::MEDIUM;
+        medium.weight = t.weight_medium;
         let mut numbers = self.font.clone();
         numbers.features = features;
-        let text_line = px(TILE_LINE);
+        let text_line = px(TILE_LINE * k);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for tile in tiles.iter() {
                 let b = to_bounds(tile.rect, origin);
@@ -2737,7 +2740,7 @@ impl Surface {
                             let (name, size_text) = self.label(tile);
                             let size_line = shape(window, &numbers, size_text.into(), size_size, secondary);
                             let room = tile.rect.w - 10. - size_line.width / px(1.) - 6.;
-                            let y = b.origin.y + px((STRIP - TILE_LINE) / 2.);
+                            let y = b.origin.y + px((STRIP - TILE_LINE) * k / 2.);
                             if let Some(name_line) = fitted(window, &bold, &name, name_size, room, text.opacity(0.88)) {
                                 name_line
                                     .paint(
@@ -2787,7 +2790,7 @@ impl Surface {
                                 outline(mark, gpui::white().opacity(0.22), BorderStyle::Solid).border_widths(px(1.)),
                             );
                         }
-                        if tile.rect.w >= LABEL_MIN_W && tile.rect.h >= LABEL_MIN_H {
+                        if tile.rect.w >= LABEL_MIN_W * k && tile.rect.h >= LABEL_MIN_H * k {
                             let ink = label_ink(if matches!(tile.shape, Shape::More { .. }) {
                                 page
                             } else {
@@ -2807,12 +2810,12 @@ impl Surface {
                                 )
                                 .ok();
                             }
-                            if tile.rect.h >= 3. + 2. * TILE_LINE + 2.
+                            if tile.rect.h >= (2. * TILE_LINE + 2.) * k + 3.
                                 && let Some(line) =
                                     fitted(window, &numbers, &size_text, size_size, max, ink.opacity(0.8))
                             {
                                 line.paint(
-                                    point(x, b.origin.y + px(3. + TILE_LINE)),
+                                    point(x, b.origin.y + px(3. + TILE_LINE * k)),
                                     text_line,
                                     TextAlign::Left,
                                     None,
@@ -3027,7 +3030,7 @@ mod tests {
             w: 800.,
             h: 500.,
         };
-        let tiles = scene(&tree, ROOT, area);
+        let tiles = scene(&tree, ROOT, area, 1.);
         assert!(tiles.iter().all(|t| inside(&t.rect, &area)));
         let more: Vec<_> = tiles.iter().filter(|t| matches!(t.shape, Shape::More { .. })).collect();
         assert_eq!(more.len(), 1, "the 490 tiny files fold into one tile");
@@ -3053,7 +3056,7 @@ mod tests {
             w: 4000.,
             h: 3000.,
         };
-        let tiles = scene(&tree, 2, area);
+        let tiles = scene(&tree, 2, area, 1.);
         let shown = tiles.iter().filter(|t| matches!(t.shape, Shape::Leaf)).count();
         assert!(shown > 100, "with room, small files get tiles of their own ({shown})");
         let covered: f64 = tiles.iter().map(|t| t.rect.area()).sum();
@@ -3076,6 +3079,7 @@ mod tests {
                 w: 300.,
                 h: 300.,
             },
+            1.,
         );
         let folder = tiles
             .iter()

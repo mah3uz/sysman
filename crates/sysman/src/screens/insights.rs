@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
@@ -30,7 +30,7 @@ use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source};
 use crate::screens::processes::Icons;
 use crate::ui::shell::{Focus, Tab, navigate};
-use crate::ui::theme::{Theme, theme};
+use crate::ui::theme::{Theme, rem_px, theme};
 use crate::ui::widgets::app_icon::app_icon;
 use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::panel::{heading, section_with};
@@ -632,8 +632,8 @@ impl Insights {
             .flex()
             .flex_row()
             .items_start()
-            .gap(px(12.))
-            .p(px(14.))
+            .gap(rem_px(12.))
+            .p(rem_px(14.))
             .rounded(t.panel_radius)
             .bg(tint.opacity(0.08))
             .border_1()
@@ -652,7 +652,7 @@ impl Insights {
                     .child(
                         div()
                             .text_size(t.panel_title)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .child(insight.title.clone()),
                     )
                     .child(
@@ -666,7 +666,7 @@ impl Insights {
                 div()
                     .flex_shrink_0()
                     .text_size(t.card_value)
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(t.weight_semibold)
                     .font_features(t.numbers.clone())
                     .text_color(tint)
                     .child(insight.value.clone()),
@@ -681,8 +681,8 @@ impl Insights {
             .flex()
             .flex_row()
             .items_start()
-            .gap(px(12.))
-            .p(px(14.))
+            .gap(rem_px(12.))
+            .p(rem_px(14.))
             .rounded(t.panel_radius)
             .bg(tint.opacity(0.08))
             .border_1()
@@ -698,7 +698,7 @@ impl Insights {
                     .child(
                         div()
                             .text_size(t.panel_title)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .child("Nothing needs attention"),
                     )
                     .child(div().text_size(t.caption).text_color(t.text_secondary).child(
@@ -723,9 +723,9 @@ impl Insights {
         div()
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(rem_px(10.))
             .child(heading(IconName::Sparkles, "What's happening", cx))
-            .child(div().grid().grid_cols(3).gap(px(10.)).children(cards))
+            .child(div().grid().grid_cols(3).gap(rem_px(10.)).children(cards))
     }
 
     fn pressure_section(&self, cx: &App) -> impl IntoElement {
@@ -768,8 +768,8 @@ impl Insights {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(12.))
-                        .py(px(8.))
+                        .gap(rem_px(12.))
+                        .py(rem_px(8.))
                         .when(i > 0, |d| d.border_t_1().border_color(t.hairline))
                         .child(Icon::new(icon).small().text_color(colour))
                         .child(
@@ -837,7 +837,7 @@ impl Insights {
              prove a leak.",
             cx,
         )
-        .child(div().grid().grid_cols(3).gap(px(10.)).children(cards))
+        .child(div().grid().grid_cols(3).gap(rem_px(10.)).children(cards))
     }
 
     fn growth_card(&self, i: usize, g: &Growth, cx: &App) -> AnyElement {
@@ -865,7 +865,7 @@ impl Insights {
                 .child(
                     div()
                         .text_size(t.caption)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(t.weight_semibold)
                         .font_features(t.numbers.clone())
                         .child(value),
                 )
@@ -880,8 +880,8 @@ impl Insights {
             .id(("growth", i))
             .flex()
             .flex_col()
-            .gap(px(8.))
-            .p(px(12.))
+            .gap(rem_px(8.))
+            .p(rem_px(12.))
             .rounded(t.card_radius)
             .bg(t.orange.opacity(0.06))
             .border_1()
@@ -894,7 +894,7 @@ impl Insights {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(rem_px(6.))
                     .child(app_icon(
                         &g.comm,
                         g.cmdline.as_deref().unwrap_or(""),
@@ -909,19 +909,19 @@ impl Insights {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_size(t.panel_title)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .child(g.comm.clone()),
                     )
                     .child(
                         div()
                             .flex_shrink_0()
-                            .px(px(6.))
+                            .px(rem_px(6.))
                             .py(px(1.))
                             .rounded_full()
                             .bg(t.orange.opacity(0.15))
                             .text_color(t.orange)
                             .text_size(t.small_caption)
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(t.weight_medium)
                             .child(format!("{:.0} min observed", g.observed_s / 60.)),
                     ),
             )
@@ -930,7 +930,7 @@ impl Insights {
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(18.))
+                    .gap(rem_px(18.))
                     .child(stat(format!("+{}", bytes(g.grew)), "Grew"))
                     .child(stat(format!("~{}/min", bytes(g.slope_bps * 60.)), "Rate"))
                     .child(stat(bytes(g.now_bytes), "Now")),
@@ -1007,7 +1007,7 @@ impl Insights {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(12.))
+                    .gap(rem_px(12.))
                     .child(window_picker)
                     .child(div().flex_1())
                     .child(segmented(
@@ -1042,15 +1042,15 @@ impl Insights {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(12.))
-            .py(px(7.))
+            .gap(rem_px(12.))
+            .py(rem_px(7.))
             .cursor_pointer()
             .when(i > 0, |d| d.border_t_1().border_color(t.hairline))
             .hover(|d| d.bg(t.card))
             .on_click(move |_, _, cx| navigate(Tab::Processes, Some(focus.clone()), cx))
             .child(
                 div()
-                    .w(px(22.))
+                    .w(rem_px(22.))
                     .flex_shrink_0()
                     .text_right()
                     .text_size(t.panel_title)
@@ -1077,14 +1077,14 @@ impl Insights {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.))
+                            .gap(rem_px(6.))
                             .child(
                                 div()
                                     .min_w_0()
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_size(t.panel_title)
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .font_weight(t.weight_medium)
                                     .child(c.comm.clone()),
                             )
                             .when(growing, |d| {
@@ -1095,7 +1095,7 @@ impl Insights {
                                 div()
                                     .flex_shrink_0()
                                     .text_size(t.panel_title)
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(t.weight_semibold)
                                     .font_features(t.numbers.clone())
                                     .child(primary(value(c, metric).unwrap_or(0.), metric)),
                             ),
@@ -1116,8 +1116,8 @@ impl Insights {
 fn icon_tile(icon: IconName, tint: Hsla) -> impl IntoElement {
     div()
         .flex_shrink_0()
-        .size(px(28.))
-        .rounded(px(8.))
+        .size(rem_px(28.))
+        .rounded(rem_px(8.))
         .bg(tint)
         .flex()
         .items_center()
@@ -1156,7 +1156,7 @@ impl Render for Insights {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(20.))
+                    .gap(rem_px(20.))
                     .p(page_padding)
                     .when_some(error, |d, error| {
                         d.child(
@@ -1164,7 +1164,7 @@ impl Render for Insights {
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                .gap(px(6.))
+                                .gap(rem_px(6.))
                                 .text_size(caption)
                                 .text_color(secondary)
                                 .child(Icon::new(IconName::Database).xsmall())

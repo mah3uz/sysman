@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
-    Anchor, AnyElement, App, AppContext, ClipboardItem, Context, Div, Entity, FocusHandle, FontWeight, Global, Hsla,
+    Anchor, AnyElement, App, AppContext, ClipboardItem, Context, Div, Entity, FocusHandle, Global, Hsla,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Stateful,
     StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
@@ -38,7 +38,7 @@ use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source, top_up};
 use crate::screens::dashboard::{Groups, cpu_colour};
 use crate::ui::shell::{CONTROL_HEIGHT, Focus, Tab, pill, take_focus};
-use crate::ui::theme::theme;
+use crate::ui::theme::{rem_px, theme};
 use crate::ui::widgets::app_icon::app_icon;
 use crate::ui::widgets::card::card;
 use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
@@ -239,9 +239,9 @@ impl Col {
     }
 }
 
-/// Widths for `cols` in a table `total` wide: fixed columns keep theirs, Process and Command share the rest.
-pub fn widths(cols: &[Col], total: f32) -> Vec<f32> {
-    let fixed: f32 = cols.iter().filter(|c| !c.flexes()).map(|c| c.width()).sum();
+/// Widths for `cols` in a table `total` wide, column widths scaled by `scale` for the text size: fixed columns keep theirs, Process and Command share the rest.
+pub fn widths(cols: &[Col], total: f32, scale: f32) -> Vec<f32> {
+    let fixed: f32 = cols.iter().filter(|c| !c.flexes()).map(|c| c.width() * scale).sum();
     let spare = (total - fixed).max(0.);
     let both = cols.contains(&Col::Process) && cols.contains(&Col::Command);
     cols.iter()
@@ -252,9 +252,9 @@ pub fn widths(cols: &[Col], total: f32) -> Vec<f32> {
                 _ => 1.,
             };
             if c.flexes() {
-                (spare * share).max(c.width()).floor()
+                (spare * share).max(c.width() * scale).floor()
             } else {
-                c.width()
+                c.width() * scale
             }
         })
         .collect()
@@ -651,11 +651,11 @@ impl TableDelegate for ProcessTable {
             .flex_row()
             .items_center()
             .gap(px(3.))
-            .px(px(CELL_PAD))
+            .px(rem_px(CELL_PAD))
             .when(col.numeric(), |d| d.justify_end())
             .cursor_pointer()
-            .text_size(px(TABLE_TEXT - 1.))
-            .font_weight(FontWeight::SEMIBOLD)
+            .text_size(rem_px(TABLE_TEXT - 1.))
+            .font_weight(t.weight_semibold)
             .text_color(t.text)
             .child(
                 div()
@@ -671,7 +671,7 @@ impl TableDelegate for ProcessTable {
                 } else {
                     IconName::ChevronUp
                 })
-                .size(px(12.))
+                .size(rem_px(12.))
                 .flex_shrink_0()
                 .text_color(t.text_secondary)
             }))
@@ -715,7 +715,7 @@ impl TableDelegate for ProcessTable {
             .min_w_0()
             .flex()
             .items_center()
-            .px(px(CELL_PAD))
+            .px(rem_px(CELL_PAD))
             .overflow_hidden();
         let number = |text: String| {
             div()
@@ -773,7 +773,7 @@ impl TableDelegate for ProcessTable {
                             } else {
                                 IconName::ChevronRight
                             })
-                            .size(px(12.))
+                            .size(rem_px(12.))
                             .text_color(t.text_secondary),
                         )
                         .on_click(cx.listener(move |table, _, _, cx| {
@@ -787,15 +787,15 @@ impl TableDelegate for ProcessTable {
                         }))
                         .into_any_element()
                 } else {
-                    div().w(px(12.)).flex_shrink_0().into_any_element()
+                    div().w(rem_px(12.)).flex_shrink_0().into_any_element()
                 };
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(rem_px(6.))
                     .min_w_0()
-                    .pl(px(f32::from(line.depth) * INDENT))
+                    .pl(rem_px(f32::from(line.depth) * INDENT))
                     .when(self.model.hierarchy, |d| d.child(disclosure))
                     .child(app_icon(&p.comm, &p.cmdline, &self.icons, 16., cx))
                     .child(
@@ -883,7 +883,7 @@ impl TableDelegate for ProcessTable {
             .size_full()
             .flex()
             .justify_center()
-            .pt(px(40.))
+            .pt(rem_px(40.))
             .text_size(t.caption)
             .text_color(t.text_secondary)
             .child("No matching processes")
@@ -1477,7 +1477,7 @@ fn value_row(value: String, detail: Option<String>, cx: &App) -> impl IntoElemen
         .child(
             div()
                 .text_size(t.card_value)
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(t.weight_semibold)
                 .font_features(t.numbers.clone())
                 .child(value),
         )
@@ -1564,17 +1564,17 @@ impl Processes {
             .flex()
             .flex_row()
             .flex_wrap()
-            .gap(px(10.))
+            .gap(rem_px(10.))
             .children(groups.groups.iter().map(|(label, color, cpus)| {
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(5.))
+                    .gap(rem_px(5.))
                     .text_size(t.small_caption)
                     .text_color(t.text_secondary)
                     .font_features(t.numbers.clone())
-                    .child(div().size(px(8.)).rounded(px(2.)).bg(*color))
+                    .child(div().size(rem_px(8.)).rounded(px(2.)).bg(*color))
                     .child(format!("{label} · {} · {:.0}%", cpus.len(), Groups::mean(&cores, cpus)))
             }));
         let topology = self.cpu_meta.as_ref().map(|m| &m.topology);
@@ -1601,10 +1601,10 @@ impl Processes {
         div()
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(rem_px(10.))
             .px(t.page_padding)
-            .pt(px(14.))
-            .pb(px(10.))
+            .pt(rem_px(14.))
+            .pb(rem_px(10.))
             .child(
                 div()
                     .flex()
@@ -1617,7 +1617,7 @@ impl Processes {
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(10.))
+                    .gap(rem_px(10.))
                     .child(
                         card("card-cpu", "CPU usage", cpu_color, cx)
                             .on_click(self.expand(Card::Cpu))
@@ -1674,13 +1674,13 @@ impl Processes {
         let this = cx.entity().downgrade();
         let search = self.search.as_ref().map(|search| {
             div()
-                .w(px(380.))
-                .min_w(px(160.))
+                .w(rem_px(380.))
+                .min_w(rem_px(160.))
                 .h(CONTROL_HEIGHT)
                 .flex()
                 .items_center()
-                .px(px(4.))
-                .rounded(px(8.))
+                .px(rem_px(4.))
+                .rounded(rem_px(8.))
                 .bg(t.window)
                 .border_1()
                 .border_color(t.control_border)
@@ -1691,15 +1691,15 @@ impl Processes {
                         .prefix(Icon::new(IconName::Search).small().text_color(t.text_secondary)),
                 )
         });
-        let button = |id: &'static str| pill(Button::new(id).ghost().small(), t).font_weight(FontWeight::MEDIUM);
+        let button = |id: &'static str| pill(Button::new(id).ghost().small(), t).font_weight(t.weight_medium);
         div()
             .flex_shrink_0()
-            .h(px(TOOLBAR_HEIGHT))
+            .h(rem_px(TOOLBAR_HEIGHT))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.))
-            .px(px(12.))
+            .gap(rem_px(8.))
+            .px(rem_px(12.))
             .bg(t.panel)
             .border_t_1()
             .border_b_1()
@@ -1708,7 +1708,7 @@ impl Processes {
             .child(div().flex_1())
             .child(
                 button("hierarchy")
-                    .px(px(12.))
+                    .px(rem_px(12.))
                     .icon(Icon::new(IconName::ListTree))
                     .label("Hierarchy")
                     .when(hierarchy, |b| b.bg(t.strip_active).border_color(t.strip_border))
@@ -1716,7 +1716,7 @@ impl Processes {
             )
             .child(
                 button("columns")
-                    .px(px(12.))
+                    .px(rem_px(12.))
                     .icon(Icon::new(IconName::Columns3))
                     .label("Columns")
                     .dropdown_caret(true)
@@ -1775,18 +1775,18 @@ impl Processes {
         div()
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(rem_px(6.))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(7.))
+                    .gap(rem_px(7.))
                     .child(Icon::new(icon).small().text_color(t.text_secondary))
                     .child(
                         div()
                             .text_size(t.panel_title)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(t.weight_semibold)
                             .child(title.to_owned()),
                     )
                     .child(div().flex_1())
@@ -1815,7 +1815,7 @@ impl Processes {
         let close = this.clone();
         let cx: &App = cx;
         let t = theme(cx);
-        let body = div().flex().flex_col().gap(px(16.)).p(px(16.));
+        let body = div().flex().flex_col().gap(rem_px(16.)).p(rem_px(16.));
         // only while sliding out after a deselect
         let Some(p) = &self.inspected else {
             return body.into_any_element();
@@ -1837,18 +1837,23 @@ impl Processes {
             div()
                 .flex()
                 .flex_row()
-                .gap(px(8.))
+                .gap(rem_px(8.))
                 .text_size(t.caption)
-                .child(div().w(px(64.)).text_color(t.text_secondary).child(label.to_owned()))
+                .child(
+                    div()
+                        .w(rem_px(64.))
+                        .text_color(t.text_secondary)
+                        .child(label.to_owned()),
+                )
                 .child(div().flex_1().min_w_0().font_features(t.numbers.clone()).child(value))
         };
         let details = hairline(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(6.))
-                .py(px(10.))
-                .px(px(12.))
+                .gap(rem_px(6.))
+                .py(rem_px(10.))
+                .px(rem_px(12.))
                 .rounded(t.card_radius)
                 .bg(t.card)
                 .border_color(t.hairline),
@@ -1895,7 +1900,7 @@ impl Processes {
                 .gap(px(4.))
                 .text_size(t.small_caption)
                 .text_color(t.text_secondary)
-                .child(div().size(px(6.)).rounded_full().bg(color))
+                .child(div().size(rem_px(6.)).rounded_full().bg(color))
                 .child(label)
         };
         let field = |f: ProcField| Self::data(&self.fields, f);
@@ -1924,7 +1929,7 @@ impl Processes {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(10.))
+                .gap(rem_px(10.))
                 .child(app_icon(&p.comm, &p.cmdline, &icons, 32., cx))
                 .child(
                     div()
@@ -1933,8 +1938,8 @@ impl Processes {
                         .min_w_0()
                         .child(
                             div()
-                                .text_size(px(15.))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(t.card_value)
+                                .font_weight(t.weight_semibold)
                                 .overflow_hidden()
                                 .text_ellipsis()
                                 .whitespace_nowrap()
@@ -2025,7 +2030,7 @@ impl Processes {
                     div()
                         .flex()
                         .flex_row()
-                        .gap(px(10.))
+                        .gap(rem_px(10.))
                         .child(swatch(t.blue, "Read"))
                         .child(swatch(t.orange, "Write"))
                         .into_any_element(),
@@ -2084,6 +2089,7 @@ impl Render for Processes {
         let widths = widths(
             &cols,
             f32::from(window.viewport_size().width - inspector_width) - SCROLLBAR,
+            window.rem_size() / px(16.),
         );
         let mem_total = sample.as_ref().and_then(|s| s.memory.as_ref()).map(|m| m.total_bytes);
         if let Some(table) = &self.table {
@@ -2141,8 +2147,8 @@ impl Render for Processes {
                     .when(!helper_running, |d| {
                         d.child(
                             div()
-                                .px(px(12.))
-                                .py(px(3.))
+                                .px(rem_px(12.))
+                                .py(rem_px(3.))
                                 .border_b_1()
                                 .border_color(t.hairline)
                                 .child(helper_hint(
@@ -2156,7 +2162,7 @@ impl Render for Processes {
                         div()
                             .flex_1()
                             .min_h_0()
-                            .text_size(px(TABLE_TEXT))
+                            .text_size(rem_px(TABLE_TEXT))
                             .font_features(t.numbers.clone())
                             // so Escape reaches this screen after a row is clicked
                             .on_mouse_down(MouseButton::Left, move |_, window, cx| keys.focus(window, cx))
@@ -2412,12 +2418,12 @@ mod tests {
     #[test]
     fn process_and_command_share_the_spare_width() {
         let cols = [Col::Process, Col::Memory, Col::Pid];
-        let w = widths(&cols, 1000.);
+        let w = widths(&cols, 1000., 1.);
         assert_eq!(w.iter().sum::<f32>(), 1000., "the table fills its width");
         assert_eq!(w[1..], [Col::Memory.width(), Col::Pid.width()]);
-        let w = widths(&[Col::Process, Col::Command, Col::Pid], 1076.);
+        let w = widths(&[Col::Process, Col::Command, Col::Pid], 1076., 1.);
         assert_eq!(w, [400., 600., 76.]);
-        let w = widths(&cols, 100.);
+        let w = widths(&cols, 100., 1.);
         assert_eq!(
             w[0],
             Col::Process.width(),
