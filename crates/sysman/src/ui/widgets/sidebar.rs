@@ -131,7 +131,10 @@ impl Sidebar {
         }
         self.from = Some((self.shown(Instant::now()), Instant::now()));
         self.collapsed = collapsed;
-        self.persist();
+        // an on-demand panel always starts hidden, so its shown state is not worth a write per selection
+        if !self.on_demand {
+            self.persist();
+        }
         cx.emit(Toggled);
         cx.notify();
     }
