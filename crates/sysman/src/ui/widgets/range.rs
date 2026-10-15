@@ -66,6 +66,16 @@ pub fn range_picker(
     on_select: impl Fn(Range, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> impl IntoElement {
+    range_picker_of(&Range::ALL, current, on_select, cx)
+}
+
+/// A picker offering only `choices`, for screens whose reference shows fewer ranges.
+pub fn range_picker_of(
+    choices: &[Range],
+    current: Range,
+    on_select: impl Fn(Range, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> impl IntoElement {
     let t = theme(cx);
     let on_select = Rc::new(on_select);
     div()
@@ -75,7 +85,7 @@ pub fn range_picker(
         .rounded(px(6.))
         .bg(t.card)
         .text_size(t.caption)
-        .children(Range::ALL.into_iter().map(|range| {
+        .children(choices.iter().map(|&range| {
             let on_select = on_select.clone();
             let selected = range == current;
             div()

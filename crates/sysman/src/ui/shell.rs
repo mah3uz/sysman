@@ -16,6 +16,7 @@ use gpui_kit_assets::IconName;
 use crate::data::live::{self, Conn, Event, Live};
 use crate::data::process::{self, Interval, ProcessFeed};
 use crate::screens::dashboard::Dashboard;
+use crate::screens::disk::Disk;
 use crate::screens::network::Network;
 use crate::screens::processes::Processes;
 use crate::ui::theme::{Theme, theme};
@@ -176,7 +177,7 @@ impl Shell {
     /// Only the tabs that show the process table pay for the daemon's scan.
     fn sync_feed(&self) {
         let ms = match self.tab {
-            Tab::Dashboard | Tab::Processes => self.refresh.0.as_millis() as u64,
+            Tab::Dashboard | Tab::Processes | Tab::Disk => self.refresh.0.as_millis() as u64,
             _ => 0,
         };
         self.feed_interval.store(ms, Ordering::Relaxed);
@@ -186,15 +187,16 @@ impl Shell {
     #[cfg(debug_assertions)]
     pub fn ready(&self, cx: &App) -> bool {
         let active = self.active.clone();
-        match active.downcast::<Dashboard>() {
-            Ok(dashboard) => dashboard.read(cx).ready(cx),
-            Err(active) => match active.downcast::<Processes>() {
-                Ok(processes) => processes.read(cx).ready(cx),
-                Err(active) => active
-                    .downcast::<Network>()
-                    .is_ok_and(|network| network.read(cx).ready(cx)),
-            },
+        if let Ok(v) = active.clone().downcast::<Dashboard>() {
+            return v.read(cx).ready(cx);
         }
+        if let Ok(v) = active.clone().downcast::<Processes>() {
+            return v.read(cx).ready(cx);
+        }
+        if let Ok(v) = active.clone().downcast::<Network>() {
+            return v.read(cx).ready(cx);
+        }
+        active.downcast::<Disk>().is_ok_and(|v| v.read(cx).ready(cx))
     }
 
     fn drain(&mut self, cx: &mut Context<Self>) {
@@ -374,6 +376,7 @@ fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App
         Tab::Dashboard => cx.new(|cx| Dashboard::new(live, feed, cx)).into(),
         Tab::Processes => cx.new(|cx| Processes::new(live, feed, cx)).into(),
         Tab::Network => cx.new(|cx| Network::new(live, cx)).into(),
+        Tab::Disk => cx.new(|cx| Disk::new(live, feed, cx)).into(),
         _ => cx.new(|_| Placeholder { tab, live }).into(),
     }
 }

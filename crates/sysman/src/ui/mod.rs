@@ -44,7 +44,10 @@ gpui_kit_assets::icon_assets!(
         Settings,
         ArrowLeftRight,
         Plug,
-        ChartLine
+        ChartLine,
+        HeartPulse,
+        ChartArea,
+        CircleCheck
     ]
 );
 
