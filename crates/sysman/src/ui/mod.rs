@@ -47,9 +47,21 @@ gpui_kit_assets::icon_assets!(
         ChartLine,
         HeartPulse,
         ChartArea,
-        CircleCheck
+        CircleCheck,
+        Mouse,
+        Keyboard,
+        Headphones,
+        Gamepad2,
+        Battery,
+        BatteryFull,
+        BatteryMedium,
+        BatteryLow,
+        BatteryCharging,
+        Laptop
     ]
 );
+
+pub fn open_settings(_cx: &mut gpui::App) {}
 
 /// Our icons first, then the component library's own.
 pub struct Assets;

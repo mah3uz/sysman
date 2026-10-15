@@ -17,6 +17,7 @@ use crate::data::live::{self, Conn, Event, Live};
 use crate::data::process::{self, Interval, ProcessFeed};
 use crate::screens::dashboard::Dashboard;
 use crate::screens::disk::Disk;
+use crate::screens::energy::Energy;
 use crate::screens::gpu::Gpu;
 use crate::screens::network::Network;
 use crate::screens::processes::Processes;
@@ -195,6 +196,9 @@ impl Shell {
             return v.read(cx).ready(cx);
         }
         if let Ok(v) = active.clone().downcast::<Gpu>() {
+            return v.read(cx).ready(cx);
+        }
+        if let Ok(v) = active.clone().downcast::<Energy>() {
             return v.read(cx).ready(cx);
         }
         if let Ok(v) = active.clone().downcast::<Network>() {
@@ -382,6 +386,7 @@ fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App
         Tab::Gpu => cx.new(|cx| Gpu::new(live, cx)).into(),
         Tab::Network => cx.new(|cx| Network::new(live, cx)).into(),
         Tab::Disk => cx.new(|cx| Disk::new(live, feed, cx)).into(),
+        Tab::Energy => cx.new(|cx| Energy::new(live, cx)).into(),
         _ => cx.new(|_| Placeholder { tab, live }).into(),
     }
 }
