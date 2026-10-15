@@ -7,7 +7,7 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use serde_json::{Map, Value, json};
 
-use crate::collector::{MODULES, Spec};
+use crate::collector::Spec;
 use crate::config::Config;
 use crate::pool::{Outcome, Pool, Reply, Req};
 use crate::sys::Sys;
@@ -27,19 +27,19 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub fn new(config: Config, sys: Sys) -> Result<Self> {
+    pub fn new(config: Config, sys: Sys, specs: &'static [Spec]) -> Result<Self> {
         let unknown: Vec<_> = config
             .modules
             .keys()
-            .filter(|n| !MODULES.iter().any(|s| s.name == *n))
+            .filter(|n| !specs.iter().any(|s| s.name == *n))
             .collect();
         if !unknown.is_empty() {
-            let known: Vec<_> = MODULES.iter().map(|s| s.name).collect();
+            let known: Vec<_> = specs.iter().map(|s| s.name).collect();
             bail!("config names unknown modules: {unknown:?}; available: {known:?}");
         }
         let base = config.general.interval;
         let (mut modules, mut collectors, mut failed) = (Vec::new(), Vec::new(), BTreeMap::new());
-        for spec in MODULES {
+        for spec in specs {
             let mc = config.modules.get(spec.name);
             if mc.is_some_and(|m| !m.enabled) {
                 continue;
@@ -187,6 +187,18 @@ mod tests {
     use super::*;
     use crate::testutil::Fixture;
 
+    const ONLY_PSI: &[Spec] = &[Spec {
+        name: "pressure",
+        default_interval: 2,
+        snapshot: false,
+        build: |o, sys| {
+            Ok(Box::new(crate::collectors::pressure::Pressure::new(
+                crate::collector::options(o)?,
+                sys,
+            )?))
+        },
+    }];
+
     fn psi() -> Fixture {
         Fixture::new().file("proc/pressure/cpu", "some avg10=1.00 avg60=2.00 avg300=0 total=0\n")
     }
@@ -194,13 +206,13 @@ mod tests {
     #[test]
     fn unknown_module_stops_startup() {
         let config = Config::parse("[modules.presure]\nenabled = true").unwrap();
-        let err = Daemon::new(config, psi().sys()).err().unwrap().to_string();
+        let err = Daemon::new(config, psi().sys(), ONLY_PSI).err().unwrap().to_string();
         assert!(err.contains("presure"), "{err}");
     }
 
     #[test]
     fn module_that_cannot_start_is_listed_not_fatal() {
-        let mut d = Daemon::new(Config::parse("").unwrap(), Fixture::new().sys()).unwrap();
+        let mut d = Daemon::new(Config::parse("").unwrap(), Fixture::new().sys(), ONLY_PSI).unwrap();
         let meta = d.meta_record();
         assert!(meta["failed_modules"]["pressure"].as_str().unwrap().contains("PSI"));
     }
@@ -209,7 +221,7 @@ mod tests {
     fn output_round_trips_through_the_schema_crate() {
         // the app reads these records with the schema types; a field the types drop would be lost to it
         let f = psi();
-        let mut d = Daemon::new(Config::parse("").unwrap(), f.sys()).unwrap();
+        let mut d = Daemon::new(Config::parse("").unwrap(), f.sys(), ONLY_PSI).unwrap();
         for record in [d.meta_record(), d.sample_record(None).unwrap()] {
             let typed: schema::Record = serde_json::from_value(record.clone()).unwrap();
             assert_eq!(serde_json::to_value(typed).unwrap(), record);
@@ -220,7 +232,7 @@ mod tests {
     fn slow_modules_run_only_on_their_ticks() {
         let config = Config::parse("[general]\ninterval = 2\n[modules.pressure]\ninterval = 10").unwrap();
         let f = psi();
-        let mut d = Daemon::new(config, f.sys()).unwrap();
+        let mut d = Daemon::new(config, f.sys(), ONLY_PSI).unwrap();
         assert!(d.sample_record(Some(3)).is_none(), "nothing due, so no line is written");
         assert!(d.sample_record(Some(5)).unwrap().get("pressure").is_some());
     }

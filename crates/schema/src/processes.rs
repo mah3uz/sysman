@@ -1,0 +1,60 @@
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+/// One process. `cpu_pct` is percent of one core. `read_bps`, `write_bps`, `user`
+/// and `fds` are absent for processes the daemon's user may not inspect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Process {
+    pub pid: u32,
+    pub ppid: u32,
+    pub comm: String,
+    pub state: String,
+    pub threads: u64,
+    pub rss_bytes: u64,
+    pub cpu_pct: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_bps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_bps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fds: Option<u64>,
+    pub cmdline: String,
+}
+
+/// Processes sharing a `comm`, summed. Shared memory is counted once per process.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Group {
+    pub name: String,
+    pub count: u64,
+    pub cpu_pct: f64,
+    pub rss_bytes: u64,
+}
+
+/// Every process, as served on demand. Processes first seen on this scan have
+/// no rate yet and are counted but have no row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Table {
+    pub count: u64,
+    pub threads: u64,
+    /// State letter → number of processes.
+    pub states: BTreeMap<String, u64>,
+    pub rows: Vec<Process>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Processes {
+    pub count: u64,
+    pub threads: u64,
+    pub states: BTreeMap<String, u64>,
+    pub top_cpu: Vec<Process>,
+    pub top_memory: Vec<Process>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_io: Option<Vec<Process>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups_cpu: Option<Vec<Group>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups_memory: Option<Vec<Group>>,
+}

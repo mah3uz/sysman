@@ -481,7 +481,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "jiff",
+ "libc",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sysman-schema",

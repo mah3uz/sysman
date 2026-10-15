@@ -2,6 +2,7 @@ mod collector;
 mod collectors;
 mod config;
 mod daemon;
+mod db;
 mod deltas;
 mod jsonl;
 mod pool;
@@ -15,6 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 
+use crate::collector::MODULES;
 use crate::config::Config;
 use crate::daemon::{Daemon, local_date, unix_now};
 use crate::jsonl::Jsonl;
@@ -52,8 +54,8 @@ fn run() -> Result<()> {
     }
 
     let config = Config::load(&config_path)?;
-    let (fsync, log_days) = (config.general.fsync, config.retention.log_days);
-    let mut daemon = Daemon::new(config, Sys::host())?;
+    let (fsync, retention) = (config.general.fsync, config.retention.clone());
+    let mut daemon = Daemon::new(config, Sys::host(), MODULES)?;
     let base = daemon.base();
 
     // the first reading only primes the rate counters
@@ -67,7 +69,14 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    let mut log = Jsonl::new(config::data_dir().join("log"), fsync, log_days)?;
+    let data = config::data_dir();
+    let mut log = Jsonl::new(data.join("log"), fsync, retention.log_days)?;
+    let snapshots = MODULES
+        .iter()
+        .filter(|s| s.snapshot)
+        .map(|s| s.name.to_string())
+        .collect();
+    let mut history = db::Writer::spawn(db::Db::open(&data.join("history.db"), retention, snapshots)?);
     loop {
         let now = unix_now();
         thread::sleep(Duration::from_secs_f64(base as f64 - now % base as f64));
@@ -75,11 +84,14 @@ fn run() -> Result<()> {
         let today = local_date(now);
         if log.day() != Some(today) {
             log.open(today)?;
-            log.write(&daemon.meta_record())?;
+            let meta = daemon.meta_record();
+            log.write(&meta)?;
+            history.send(meta);
         }
         let tick = (now / base as f64).round() as u64;
         if let Some(record) = daemon.sample_record(Some(tick)) {
             log.write(&record)?;
+            history.send(record);
         }
     }
 }

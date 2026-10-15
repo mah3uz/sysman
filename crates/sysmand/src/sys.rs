@@ -15,6 +15,7 @@ impl Sys {
         }
     }
 
+    #[cfg(test)]
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }

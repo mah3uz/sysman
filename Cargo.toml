@@ -12,7 +12,9 @@ license = "MIT"
 schema = { path = "crates/schema", package = "sysman-schema" }
 anyhow = "1"
 jiff = "0.2"
+libc = "0.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
+rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "1"

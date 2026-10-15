@@ -35,11 +35,19 @@ impl Default for General {
 #[serde(deny_unknown_fields, default)]
 pub struct Retention {
     pub log_days: u32,
+    pub raw_hours: u32,
+    pub rollup_1m_days: u32,
+    pub rollup_15m_days: u32,
 }
 
 impl Default for Retention {
     fn default() -> Self {
-        Self { log_days: 2 }
+        Self {
+            log_days: 2,
+            raw_hours: 48,
+            rollup_1m_days: 90,
+            rollup_15m_days: 730,
+        }
     }
 }
 
@@ -76,6 +84,10 @@ impl Config {
         }
         if file.retention.log_days == 0 {
             bail!("[retention] log_days must be at least 1 (today's file)");
+        }
+        let r = &file.retention;
+        if r.raw_hours == 0 || r.rollup_1m_days == 0 || r.rollup_15m_days == 0 {
+            bail!("[retention] raw_hours, rollup_1m_days and rollup_15m_days must be at least 1");
         }
         let mut modules = BTreeMap::new();
         for (name, mut table) in file.modules {
