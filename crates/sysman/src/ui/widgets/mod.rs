@@ -3,6 +3,7 @@ pub mod hint;
 pub mod legend;
 pub mod panel;
 pub mod range;
+pub mod sidebar;
 
 use gpui::{Pixels, Styled};
 

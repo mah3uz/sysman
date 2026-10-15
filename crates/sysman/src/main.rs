@@ -32,6 +32,8 @@ fn main() {
                 table_hover = gpui::white().opacity(0.05),
                 table_active = theme.selection
             );
+            // the default dialog backdrop is too faint to read as dimmed over a dark window
+            table_colour!(overlay = gpui::black().opacity(0.5));
             cx.set_global(theme);
 
             let shell = cx.new(Shell::new);
