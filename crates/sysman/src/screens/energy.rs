@@ -1945,7 +1945,7 @@ impl Energy {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::black().opacity(0.45))
+            .bg(t.scrim.opacity(0.9))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {

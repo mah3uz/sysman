@@ -1204,7 +1204,7 @@ impl Groups {
                 .px(rem_px(6.))
                 .text_size(rem_px(12.))
                 .font_features(t.numbers.clone())
-                .when(k % 2 == 1, |d| d.bg(gpui::white().opacity(0.03)))
+                .when(k % 2 == 1, |d| d.bg(t.wash.opacity(0.03)))
                 .child(
                     div()
                         .flex_1()
@@ -1646,7 +1646,7 @@ impl Editor {
                             .px(rem_px(8.))
                             .text_size(rem_px(12.))
                             .font_features(t.numbers.clone())
-                            .when(k % 2 == 1, |d| d.bg(gpui::white().opacity(0.03)))
+                            .when(k % 2 == 1, |d| d.bg(t.wash.opacity(0.03)))
                             .child(app_icon(&p.comm, &p.cmdline, &icons, 14., cx))
                             .child(
                                 div()

@@ -1,40 +1,17 @@
 use gpui::{
     App, AppContext, Bounds, Entity, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions, px, size,
 };
-use gpui_component::{Root, ThemeMode};
+use gpui_component::Root;
 
 use sysman::ui;
 use sysman::ui::shell::Shell;
-use sysman::ui::theme::{TextSize, Theme};
 
 fn main() {
     gpui_platform::application()
         .with_assets(ui::Assets)
         .run(|cx: &mut App| {
             gpui_component::init(cx);
-            gpui_component::Theme::change(ThemeMode::Dark, None, cx);
-            let theme = Theme::dark();
-            let component = gpui_component::Theme::global_mut(cx);
-            component.font_family = theme.font.clone();
-            component.mono_font_family = theme.mono.clone();
-            macro_rules! table_colour {
-                ($($field:ident = $value:expr),*) => {$(
-                    component.colors.$field = $value;
-                    component.tokens.$field = $value.into();
-                )*};
-            }
-            let clear = gpui::transparent_black();
-            table_colour!(
-                table = clear,
-                table_head = clear,
-                table_row_border = clear,
-                table_even = gpui::white().opacity(0.03),
-                table_hover = gpui::white().opacity(0.05),
-                table_active = theme.selection
-            );
-            // the default dialog backdrop is too faint to read as dimmed over a dark window
-            table_colour!(overlay = gpui::black().opacity(0.5));
-            ui::theme::install(TextSize::load(), cx);
+            ui::theme::init(cx);
 
             let shell = cx.new(Shell::new);
             #[cfg(debug_assertions)]

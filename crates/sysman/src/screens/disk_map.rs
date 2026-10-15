@@ -515,7 +515,7 @@ fn paint_ring(
     bounds: Bounds<Pixels>,
     fraction: Option<f32>,
     turn: f32,
-    (track, start, end): (Hsla, Hsla, Hsla),
+    (track, start, end, comet): (Hsla, Hsla, Hsla, Hsla),
     window: &mut Window,
 ) {
     let c = bounds.center();
@@ -556,7 +556,7 @@ fn paint_ring(
         let head = turn;
         for (k, alpha) in [(0.10, 0.10), (0.05, 0.16), (0.02, 0.24)] {
             if let Some(p) = arc(c, r, head - k, head, stroke) {
-                window.paint_path(p, gpui::white().opacity(alpha));
+                window.paint_path(p, comet.opacity(alpha));
             }
         }
     }
@@ -2200,7 +2200,7 @@ impl DiskMap {
             let visual = self.visual.clone();
             let started = scan.started;
             let determinate = fraction.is_some();
-            let colours = (t.text.opacity(0.07), t.blue, t.teal);
+            let colours = (t.text.opacity(0.07), t.blue, t.teal, t.wash);
             let (big, small) = match (fraction, used) {
                 (Some(f), Some(used)) => (
                     format!("{:.0}%", (f * 100.).floor()),
@@ -2575,7 +2575,7 @@ fn paint_partial(
     medium.weight = t.weight_medium;
     let mut numbers = font.clone();
     numbers.features = t.numbers.clone();
-    let (text_secondary, text_tertiary, blue) = (t.text_secondary, t.text_tertiary, t.blue);
+    let (text_secondary, text_tertiary, blue, wash) = (t.text_secondary, t.text_tertiary, t.blue, t.wash);
     let k = window.rem_size() / px(16.);
     let line = px((TILE_LINE + 1.) * k);
     let clock = now.saturating_duration_since(started).as_secs_f32();
@@ -2597,10 +2597,10 @@ fn paint_partial(
             let radius = px(if r.w >= 24. && r.h >= 24. { 5. } else { 2. });
             let pulse = 0.5 + 0.5 * (clock * std::f32::consts::TAU / 1.8 - i as f32 * 0.45).sin();
             window.paint_quad(
-                fill(b, gpui::white().opacity(0.04 + 0.04 * pulse))
+                fill(b, wash.opacity(0.04 + 0.04 * pulse))
                     .corner_radii(radius)
                     .border_widths(px(1.))
-                    .border_color(gpui::white().opacity(0.08 + 0.05 * pulse)),
+                    .border_color(wash.opacity(0.08 + 0.05 * pulse)),
             );
             let colour = if top.dir { blue } else { kind_colour(top.kind) };
             let shade = done_at
@@ -2712,7 +2712,7 @@ impl Surface {
 
     fn paint(self, bounds: Bounds<Pixels>, hitbox: Hitbox, window: &mut Window, cx: &mut App) {
         let t = theme(cx);
-        let (secondary, text, page) = (t.text_secondary, t.text, t.window);
+        let (secondary, text, page, wash) = (t.text_secondary, t.text, t.window, t.wash);
         let k = window.rem_size() / px(16.);
         let (name_size, size_size) = (px(TILE_NAME * k), px(TILE_SIZE * k));
         let features = t.numbers.clone();
@@ -2731,10 +2731,10 @@ impl Surface {
                 match tile.shape {
                     Shape::Folder { strip } => {
                         window.paint_quad(
-                            fill(b, gpui::white().opacity(0.07))
+                            fill(b, wash.opacity(0.07))
                                 .corner_radii(px(2.))
                                 .border_widths(px(1.))
-                                .border_color(gpui::white().opacity(0.14)),
+                                .border_color(wash.opacity(0.14)),
                         );
                         if strip && tile.rect.w > 30. {
                             let (name, size_text) = self.label(tile);
@@ -2767,7 +2767,7 @@ impl Surface {
                     }
                     Shape::Leaf | Shape::More { .. } => {
                         let color = match tile.shape {
-                            Shape::More { .. } => gpui::white().opacity(0.12),
+                            Shape::More { .. } => wash.opacity(0.12),
                             _ => fill_of(&self.tree, tile.node, self.colour, self.now),
                         };
                         let inner = Bounds::new(
