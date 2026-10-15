@@ -1,0 +1,33 @@
+[Unit]
+Description=sysman privileged helper (SMART, CPU power, per-process I/O and network)
+
+[Service]
+ExecStart=/usr/bin/sysman-helper
+Restart=on-failure
+RestartSec=10
+# Creating the socket with this group lets the helper hand it to wheel without CAP_CHOWN; keep it equal to --group.
+Group=wheel
+
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_BPF CAP_PERFMON
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_BPF CAP_PERFMON
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The eBPF programs count traffic in every network namespace, so the helper needs no network of its own.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+RuntimeDirectory=sysman-helper
+# Read-only /proc/sys and /sys still lets it read RAPL counters and /sys/kernel/btf.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# bpf() is not in @system-service and loading the network counters needs it.
+SystemCallFilter=@system-service bpf
+SystemCallErrorNumber=EPERM
+# No PrivateDevices or DevicePolicy: SMART opens /dev/nvme* and smartctl opens /dev/sd*.
+
+[Install]
+WantedBy=multi-user.target

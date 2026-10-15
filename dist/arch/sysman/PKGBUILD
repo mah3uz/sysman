@@ -10,12 +10,16 @@ license=('MIT')
 depends=(
   'gcc-libs' 'glibc'
   'iproute2'
+  'libbpf'
   'libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'libxau' 'libxdmcp'
   'wayland' 'libglvnd' 'vulkan-icd-loader'
   'adwaita-fonts'
 )
-makedepends=('cargo' 'librsvg')
-optdepends=('nvidia-utils: NVIDIA GPU metrics through NVML')
+makedepends=('cargo' 'clang' 'libbpf' 'librsvg')
+optdepends=(
+  'nvidia-utils: NVIDIA GPU metrics through NVML'
+  'smartmontools: SATA drive health'
+)
 install=sysman.install
 # makepkg's LTO turns the bundled SQLite into GCC bitcode that Rust's linker cannot read
 options=('!lto')
@@ -31,7 +35,7 @@ prepare() {
 build() {
   cd "$pkgname-$pkgver"
   export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
-  cargo build --frozen --release -p sysmand -p sysman
+  cargo build --frozen --release -p sysmand -p sysman -p sysman-helper
 }
 
 check() {

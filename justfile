@@ -8,9 +8,9 @@ assets := justfile_directory() / "target/release-assets"
 default:
     @just --list
 
-# Build both binaries (release)
+# Build the binaries (release)
 build:
-    cargo build --release -p sysmand -p sysman
+    cargo build --release -p sysmand -p sysman -p sysman-helper
 
 # Run the app from this checkout (release)
 run: build
@@ -88,7 +88,7 @@ release:
     rm -rf "$out"
     mkdir -p "$out"
     git archive --prefix="sysman-$ver/" -o "$out/sysman-$ver.tar.gz" "$tag"
-    cargo build --release --locked -p sysmand -p sysman
+    cargo build --release --locked -p sysmand -p sysman -p sysman-helper
     dist/stage.sh target/release "$out/sysman-$ver-x86_64" sysman
     tar -C "$out" -czf "$out/sysman-$ver-x86_64.tar.gz" "sysman-$ver-x86_64"
     rm -rf "$out/sysman-$ver-x86_64"
