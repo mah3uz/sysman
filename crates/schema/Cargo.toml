@@ -1,0 +1,10 @@
+[package]
+name = "sysman-schema"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

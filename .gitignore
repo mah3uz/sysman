@@ -1,0 +1,17 @@
+# build
+/target
+**/*.rs.bk
+
+# IDE and editor
+.idea/
+*.iml
+.vscode/
+.fleet/
+.zed/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# reference implementation, kept outside the repo
+/sensor-log/
