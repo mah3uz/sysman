@@ -3,9 +3,12 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>sysman — a system monitor for Linux, live, recorded and crash-proof</title>
-    <meta name="description" content="sysman is a Linux system monitor: a small collector daemon records CPU, memory, GPUs, disks, network, sensors and processes every 2 seconds, keeps history, and writes a crash-proof log. A native app shows it all live and as history." />
+    <title>sysman — Linux system monitor with history and a crash log</title>
+    <meta name="description" content="sysman records CPU, memory, GPUs, disks, network, sensors and processes every 2 seconds, keeps years of history and a crash log that survives a hard freeze." />
     <link rel="canonical" href="https://sysman.asmechanics.com/" />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
+    <meta name="author" content="Mahfuz Shaikh" />
+    <meta name="application-name" content="sysman" />
     <meta name="color-scheme" content="dark light" />
     <meta name="theme-color" content="#14151b" />
     <script>
@@ -27,20 +30,64 @@
     <link rel="icon" type="image/svg+xml" href="../../assets/logo.svg" />
     <link rel="icon" href="/favicon.ico" sizes="32x32" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
 
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="sysman" />
+    <meta property="og:locale" content="en_US" />
     <meta property="og:url" content="https://sysman.asmechanics.com/" />
     <meta property="og:title" content="sysman — a system monitor for Linux" />
-    <meta property="og:description" content="Live, recorded and crash-proof. A collector daemon and a native app for CPU, memory, GPUs, disks, network, sensors and processes on Linux." />
+    <meta property="og:description" content="Live, recorded and crash-proof. A small collector daemon and a native app for CPU, memory, GPUs, disks, network, sensors and processes on Linux." />
     <meta property="og:image" content="https://sysman.asmechanics.com/og.jpg" />
+    <meta property="og:image:secure_url" content="https://sysman.asmechanics.com/og.jpg" />
+    <meta property="og:image:type" content="image/jpeg" />
     <meta property="og:image:width" content="1200" />
-    <meta property="og:image:height" content="675" />
-    <meta property="og:image:alt" content="The sysman app's GPU screen, showing utilisation, power, VRAM, temperature and clock over the last 30 minutes." />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="The sysman logo and tagline beside the app's GPU screen, with utilisation, power, VRAM and temperature charts." />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="sysman — a system monitor for Linux" />
-    <meta name="twitter:description" content="Live, recorded and crash-proof. A collector daemon and a native app for Linux." />
+    <meta name="twitter:description" content="Live, recorded and crash-proof. A small collector daemon and a native app that keep a history and a crash log on Linux." />
     <meta name="twitter:image" content="https://sysman.asmechanics.com/og.jpg" />
+    <meta name="twitter:image:alt" content="The sysman logo and tagline beside the app's GPU screen, with utilisation, power, VRAM and temperature charts." />
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "WebSite",
+            "@id": "https://sysman.asmechanics.com/#website",
+            "url": "https://sysman.asmechanics.com/",
+            "name": "sysman",
+            "description": "A system monitor for Linux: live, recorded and crash-proof.",
+            "inLanguage": "en"
+          },
+          {
+            "@type": "SoftwareApplication",
+            "@id": "https://sysman.asmechanics.com/#software",
+            "name": "sysman",
+            "description": "A Linux system monitor. A small collector daemon records CPU, memory, GPUs, disks, network, sensors and processes every 2 seconds, keeps history in a local database and writes a crash log that survives a hard freeze; a native app shows it live and as history.",
+            "url": "https://sysman.asmechanics.com/",
+            "image": "https://sysman.asmechanics.com/og.jpg",
+            "screenshot": "https://sysman.asmechanics.com/shots/gpu.webp",
+            "operatingSystem": "Linux",
+            "applicationCategory": "UtilitiesApplication",
+            "softwareVersion": "0.1.0",
+            "downloadUrl": "https://github.com/mah3uz/sysman/releases/latest",
+            "offers": {
+              "@type": "Offer",
+              "price": "0",
+              "priceCurrency": "USD"
+            },
+            "author": {
+              "@type": "Person",
+              "name": "Mahfuz Shaikh",
+              "url": "https://github.com/mah3uz"
+            }
+          }
+        ]
+      }
+    </script>
   </head>
   <body>
     <div id="app"><!--app-html--></div>
