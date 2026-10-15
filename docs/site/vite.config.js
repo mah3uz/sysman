@@ -5,6 +5,8 @@ import vue from '@vitejs/plugin-vue'
 import tailwindcss from '@tailwindcss/vite'
 
 const installScript = fileURLToPath(new URL('../../dist/install.sh', import.meta.url))
+const cargoToml = readFileSync(fileURLToPath(new URL('../../Cargo.toml', import.meta.url)), 'utf8')
+const version = cargoToml.match(/^version = "(.+)"$/m)[1]
 
 // dist/install.sh stays the only copy; the site serves it at /install.sh
 function installSh() {
@@ -27,8 +29,13 @@ function installSh() {
   }
 }
 
+// the workspace version, so a release deploys the site with its own number
+function sysmanVersion() {
+  return { name: 'sysman-version', transformIndexHtml: (html) => html.replaceAll('%SYSMAN_VERSION%', version) }
+}
+
 export default defineConfig({
-  plugins: [vue(), tailwindcss(), installSh()],
+  plugins: [vue(), tailwindcss(), installSh(), sysmanVersion()],
   resolve: {
     alias: { '@repo': fileURLToPath(new URL('../..', import.meta.url)) },
   },
