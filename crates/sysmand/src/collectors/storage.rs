@@ -2,26 +2,12 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 use schema::storage::{Btrfs, Device, DeviceErrors, Drive, StorageMeta};
-use serde::Deserialize;
 use serde_json::Value;
 
 use crate::collector::Collector;
 use crate::sys::Sys;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Options {
-    /// Block device name prefixes to skip.
-    pub exclude: Vec<String>,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            exclude: vec!["loop".into(), "zram".into()],
-        }
-    }
-}
+pub use sysman_config::modules::storage::Options;
 
 pub struct Storage {
     sys: Sys,

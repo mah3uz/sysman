@@ -4,25 +4,12 @@ use std::path::Path;
 
 use anyhow::Result;
 use schema::fs::Filesystem;
-use serde::Deserialize;
 use serde_json::Value;
 
 use crate::collector::Collector;
 use crate::sys::Sys;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Options {
-    pub exclude_fstypes: Vec<String>,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            exclude_fstypes: vec!["squashfs".to_string(), "iso9660".to_string()],
-        }
-    }
-}
+pub use sysman_config::modules::fs::Options;
 
 pub struct Usage {
     pub frsize: u64,

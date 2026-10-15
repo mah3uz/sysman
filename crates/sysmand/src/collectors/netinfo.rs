@@ -14,20 +14,7 @@ use crate::sys::Sys;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Options {
-    /// Interface name prefixes to skip.
-    pub exclude: Vec<String>,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            exclude: vec!["lo".into(), "veth".into()],
-        }
-    }
-}
+pub use sysman_config::modules::netinfo::Options;
 
 #[derive(Deserialize)]
 struct IpLink {

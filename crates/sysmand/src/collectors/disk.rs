@@ -2,28 +2,13 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use schema::disk::Device;
-use serde::Deserialize;
 use serde_json::Value;
 
 use crate::collector::Collector;
 use crate::deltas::Deltas;
 use crate::sys::Sys;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Options {
-    pub partitions: bool,
-    pub exclude: Vec<String>,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            partitions: false,
-            exclude: vec!["loop".to_string()],
-        }
-    }
-}
+pub use sysman_config::modules::disk::Options;
 
 const READS: usize = 0;
 const READ_BYTES: usize = 1;

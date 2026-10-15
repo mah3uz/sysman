@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use schema::cgroups::Cgroup;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::collector::Collector;
@@ -11,17 +10,7 @@ use crate::sys::Sys;
 
 const ROOT: &str = "/sys/fs/cgroup";
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Options {
-    pub top_n: usize,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self { top_n: 10 }
-    }
-}
+pub use sysman_config::modules::cgroups::Options;
 
 pub struct Cgroups {
     sys: Sys,

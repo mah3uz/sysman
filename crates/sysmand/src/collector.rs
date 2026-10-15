@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 
-use anyhow::{Context, Result};
-use serde::de::DeserializeOwned;
+use anyhow::Result;
 use serde_json::{Map, Value};
 
 use crate::collectors;
@@ -163,21 +162,24 @@ pub fn loggable<'a>(record: &'a Value, specs: &[Spec]) -> Cow<'a, Value> {
     Cow::Owned(Value::Object(out))
 }
 
-/// Parse a module's own options, rejecting keys it does not know.
-pub fn options<T: DeserializeOwned>(table: toml::Table) -> Result<T> {
-    toml::Value::Table(table).try_into().context("invalid module options")
-}
-
-/// For modules without options; any key is a typo.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NoOptions {}
+pub use sysman_config::modules::{NoOptions, options};
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn the_settings_form_knows_every_module_and_its_interval() {
+        // the form reads module names and default intervals from the shared list, not from here
+        let shared: Vec<_> = sysman_config::modules::MODULES
+            .iter()
+            .map(|m| (m.name, m.default_interval))
+            .collect();
+        let ours: Vec<_> = MODULES.iter().map(|s| (s.name, s.default_interval)).collect();
+        assert_eq!(shared, ours);
+    }
 
     #[test]
     fn unlogged_keys_are_dropped_from_the_log_copy_only() {

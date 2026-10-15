@@ -5,32 +5,13 @@ use std::time::SystemTime;
 use anyhow::{Context, Result, bail};
 use schema::helper::ProcCounters;
 use schema::processes::{Group, Process, Table};
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::collector::Collector;
 use crate::deltas::Deltas;
 use crate::sys::Sys;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Options {
-    pub top_n: usize,
-    pub io: bool,
-    pub groups: bool,
-    pub cmdline_max: usize,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            top_n: 10,
-            io: true,
-            groups: true,
-            cmdline_max: 200,
-        }
-    }
-}
+pub use sysman_config::modules::processes::Options;
 
 struct Snapshot {
     pid: u32,

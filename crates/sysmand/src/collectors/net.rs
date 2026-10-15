@@ -2,27 +2,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result, bail};
 use schema::net::{Interface, Sockets, Tcp};
-use serde::Deserialize;
 use serde_json::Value;
 
 use crate::collector::Collector;
 use crate::deltas::Deltas;
 use crate::sys::Sys;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Options {
-    /// Interface name prefixes to skip.
-    pub exclude: Vec<String>,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            exclude: vec!["lo".into(), "veth".into()],
-        }
-    }
-}
+pub use sysman_config::modules::net::Options;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Key {
