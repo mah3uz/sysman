@@ -8,10 +8,10 @@ post_install() {
 }
 
 post_upgrade() {
+  # a running helper picks up the new binary; a disabled one stays off
+  systemctl try-restart sysman-helper.service 2>/dev/null || true
   echo '==> Restart the collector to run the new version:'
   echo '      systemctl --user restart sysmand'
-  echo '==> If the privileged helper is enabled, restart it too:'
-  echo '      sudo systemctl try-restart sysman-helper'
 }
 
 pre_remove() {

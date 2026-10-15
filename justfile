@@ -67,7 +67,10 @@ install: package
     systemctl --user daemon-reload
     systemctl --user enable sysmand
     systemctl --user restart sysmand
+    # only restarts the helper if it is already running; a disabled helper stays off
+    sudo systemctl try-restart sysman-helper.service
     systemctl --user --no-pager status sysmand | head -3
+    echo "sysman-helper: $(systemctl is-active sysman-helper.service || true)"
 
 # Stop the collector and remove the package
 uninstall:
