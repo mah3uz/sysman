@@ -565,35 +565,41 @@ impl Network {
                             .child(rate(bps)),
                     )
             };
-            let list = if top.is_empty() {
-                caption("No process is sending or receiving", cx).into_any_element()
-            } else {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(rem_px(6.))
-                    .text_size(t.caption)
-                    .children(top.into_iter().map(|p| {
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(rem_px(8.))
-                            .child(app_icon(&p.comm, &p.cmdline, &icons, 16., cx))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .child(p.comm.clone()),
-                            )
-                            .child(rate_cell(IconName::ArrowDown, t.green, p.net_rx_bps))
-                            .child(rate_cell(IconName::ArrowUp, t.red, p.net_tx_bps))
-                    }))
+            let row = || div().h(rem_px(18.)).flex_shrink_0();
+            // Every slot is drawn even when empty, so the panels below stay put as apps come and go.
+            let empty = TOP_APPS.saturating_sub(top.len().max(1));
+            let first = top.is_empty().then(|| {
+                row()
+                    .child(caption("No process is sending or receiving", cx))
                     .into_any_element()
-            };
+            });
+            let list = div()
+                .flex()
+                .flex_col()
+                .gap(rem_px(6.))
+                .text_size(t.caption)
+                .children(first)
+                .children(top.into_iter().map(|p| {
+                    row()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(rem_px(8.))
+                        .child(app_icon(&p.comm, &p.cmdline, &icons, 16., cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(p.comm.clone()),
+                        )
+                        .child(rate_cell(IconName::ArrowDown, t.green, p.net_rx_bps))
+                        .child(rate_cell(IconName::ArrowUp, t.red, p.net_tx_bps))
+                }))
+                .children((0..empty).map(|_| row()))
+                .into_any_element();
             vec![
                 list,
                 caption("TCP and UDP bytes per process, loopback excluded.", cx).into_any_element(),
