@@ -26,6 +26,11 @@ const GPU_MAX_PRIORITY: u8 = 6;
 
 // Every text pattern the rules match on, kernel unless noted.
 const OOM_KILL: &[&str] = &["ut of memory: Kill", "Out of memory (oom_kill_allocating_task): Kill"];
+const OOM_SUMMARY: u8 = 1;
+const OOM_KILL_LINE: u8 = 2;
+const OOM_SYSTEM: u8 = 4;
+const OOM_USER: u8 = 8;
+const OOM_OOMD: u8 = 16;
 const OOM_KILL_SUMMARY: &str = "oom-kill:constraint=";
 const THROTTLE: &[&str] = &[
     "temperature is above threshold, cpu clock is throttled",
@@ -488,7 +493,8 @@ pub struct Detector {
     failed: HashMap<(String, String), usize>,
     grouped: HashMap<(&'static str, String, String), usize>,
     bursts: HashMap<BurstKey, Burst>,
-    last_oom: Option<usize>,
+    /// Open OOM findings (index, sources already folded in), so a later line of another source joins the nearest one.
+    open_ooms: Vec<(usize, u8)>,
     /// Kernel crash lines waiting to see whether a core dump of the same pid follows.
     pending_crashes: Vec<PendingCrash>,
     /// (boot, pid, time) of recent core dumps.
@@ -565,7 +571,8 @@ impl Detector {
         self.crashes.retain(|k, _| k.0 == boot);
         self.bursts
             .retain(|k, b| b.events.back().is_some_and(|h| !ended(h.t, burst_window(k.0))));
-        self.last_oom = self.last_oom.filter(|&i| !ended(self.out[i].last_us, OOM_MERGE_US));
+        self.open_ooms
+            .retain(|&(i, _)| !ended(self.out[i].last_us, OOM_MERGE_US));
 
         let mut held = vec![false; self.out.len()];
         for i in self.held() {
@@ -586,7 +593,9 @@ impl Detector {
         for b in self.bursts.values_mut() {
             b.finding = b.finding.map(|i| moved[i]);
         }
-        self.last_oom = self.last_oom.map(|i| moved[i]);
+        for o in &mut self.open_ooms {
+            o.0 = moved[o.0];
+        }
         self.reported = self.out.iter().map(|f| f.count).collect();
         fresh
     }
@@ -611,7 +620,7 @@ impl Detector {
             .chain(self.grouped.values())
             .copied()
             .chain(bursts)
-            .chain(self.last_oom)
+            .chain(self.open_ooms.iter().map(|o| o.0))
     }
 
     /// `current_boot` is never reported as ended without shutdown, it has not ended yet.
@@ -864,38 +873,69 @@ impl Detector {
         }
     }
 
-    // A kernel kill line and the manager's report of it arrive within seconds of each other.
+    // One kill is logged by the kernel and reported by the system manager, the user manager and systemd-oomd, within
+    // seconds of each other and in either order. A line joins the nearest open kill that lacks its source and is not
+    // another pid's; two kills in quick succession each have their own kernel lines and stay two.
     fn oom(&mut self, index: usize, e: &Entry, boot: &str) {
         let message = e.message();
         let (pid, comm) = oom_victim(message);
+        let source = match e.get("MESSAGE_ID") {
+            Some(ids::UNIT_OOM) if system_manager(e) => OOM_SYSTEM,
+            Some(ids::UNIT_OOM) => OOM_USER,
+            Some(ids::OOMD_KILL) => OOM_OOMD,
+            _ if message.contains(OOM_KILL_SUMMARY) => OOM_SUMMARY,
+            _ => OOM_KILL_LINE,
+        };
         let mut extra = Vec::new();
-        if let Some(p) = pid {
+        if let Some(p) = pid.clone() {
             extra.push(("pid", p));
         }
         if let Some(c) = comm {
             extra.push(("comm", c));
         }
-        if let Some(u) = e.get("UNIT") {
+        if let Some(u) = e.get("UNIT").or_else(|| e.get("USER_UNIT")) {
             extra.push(("unit", u.to_string()));
         }
-        let merge = self.last_oom.filter(|&i| {
-            let f = &self.out[i];
-            f.boot_id == boot && e.t_us.saturating_sub(f.last_us) <= OOM_MERGE_US
-        });
+        let t = e.t_us;
+        let gap = |f: &Finding| {
+            if t < f.first_us {
+                f.first_us - t
+            } else {
+                t.saturating_sub(f.last_us)
+            }
+        };
+        let merge = self
+            .open_ooms
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(i, seen))| {
+                let f = &self.out[i];
+                let other_pid = pid
+                    .as_deref()
+                    .is_some_and(|p| !f.field("pid").is_empty() && f.field("pid") != p);
+                seen & source == 0 && f.boot_id == boot && gap(f) <= OOM_MERGE_US && !other_pid
+            })
+            .min_by_key(|&(_, &(i, _))| (gap(&self.out[i]), std::cmp::Reverse(self.out[i].last_us)))
+            .map(|(k, _)| k);
         let i = match merge {
-            Some(i) => {
-                self.out[i].add(e.t_us, index);
+            Some(k) => {
+                let i = self.open_ooms[k].0;
+                let last = self.out[i].last_us;
+                self.out[i].add(t, index);
+                self.out[i].last_us = last.max(t);
+                self.open_ooms[k].1 |= source;
                 i
             }
             None => {
                 self.out.push(Finding::new(
                     FindingKind::OomKill,
-                    e.t_us,
+                    t,
                     index,
                     boot,
                     String::new(),
                     evidence(message),
                 ));
+                self.open_ooms.push((self.out.len() - 1, source));
                 self.out.len() - 1
             }
         };
@@ -909,7 +949,6 @@ impl Detector {
                 .or_insert_with(|| "systemd-oomd".to_string());
         }
         f.retitle();
-        self.last_oom = Some(i);
     }
 
     fn group(&mut self, key: (&'static str, String, String), index: usize, e: &Entry, make: impl FnOnce() -> Finding) {
@@ -1381,6 +1420,137 @@ mod tests {
         assert_eq!(oom[0].data["comm"], "firefox");
         assert_eq!(oom[0].data["unit"], "app.service");
         assert_eq!(oom[0].title, "firefox was killed by the OOM killer");
+    }
+
+    fn oom_lines(t_s: u64, pid: &str, comm: &str) -> [Entry; 2] {
+        [
+            kernel(
+                t_s,
+                BOOT_A,
+                &format!(
+                    "oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task_memcg=/user.slice,task={comm},pid={pid},uid=1000"
+                ),
+            ),
+            kernel(
+                t_s,
+                BOOT_A,
+                &format!("Out of memory: Killed process {pid} ({comm}) total-vm:9000kB"),
+            ),
+        ]
+    }
+
+    fn user_manager_oom(t_s: u64, unit: &str) -> Entry {
+        let mut e = ev(
+            t_s,
+            BOOT_A,
+            &[
+                ("MESSAGE_ID", ids::UNIT_OOM),
+                ("USER_UNIT", unit),
+                ("MESSAGE", "A process of this unit has been killed by the OOM killer."),
+            ],
+        );
+        e.fields.insert("_PID".into(), "900".into());
+        e.fields.insert("_COMM".into(), "systemd".into());
+        e.fields.insert("_UID".into(), unsafe { libc::geteuid() }.to_string());
+        e
+    }
+
+    fn system_manager_oom(t_s: u64, unit: &str) -> Entry {
+        manager(
+            t_s,
+            BOOT_A,
+            &[
+                ("MESSAGE_ID", ids::UNIT_OOM),
+                ("UNIT", unit),
+                ("MESSAGE", "A process of this unit has been killed by the OOM killer."),
+            ],
+        )
+    }
+
+    #[test]
+    fn one_kill_logged_by_the_kernel_and_the_user_manager_is_one_finding_in_either_order_and_through_drain() {
+        let [s, k] = oom_lines(100, "777", "firefox");
+        let m = user_manager_oom(103, "app-firefox.scope");
+        let f = run(&[s.clone(), k.clone(), m.clone()], Some(BOOT_A));
+        let oom = of(&f, FindingKind::OomKill);
+        assert_eq!(oom.len(), 1, "{f:#?}");
+        assert_eq!(
+            (oom[0].data["comm"].as_str(), oom[0].data["unit"].as_str()),
+            ("firefox", "app-firefox.scope")
+        );
+        assert_eq!(oom[0].count, 3);
+
+        let early = user_manager_oom(99, "app-firefox.scope");
+        assert_eq!(
+            of(
+                &run(&[early.clone(), s.clone(), k.clone()], Some(BOOT_A)),
+                FindingKind::OomKill
+            )
+            .len(),
+            1
+        );
+
+        let mut d = Detector::new();
+        for (i, e) in [&s, &k, &m].into_iter().enumerate() {
+            d.push(i, e);
+        }
+        let mut seen = d.drain(104 * S);
+        seen.extend(d.drain(200 * S));
+        let last = seen.iter().rfind(|f| f.kind == FindingKind::OomKill).unwrap();
+        assert_eq!(
+            seen.iter()
+                .filter(|f| f.kind == FindingKind::OomKill && f.first_us == 100 * S)
+                .count(),
+            1
+        );
+        assert_eq!(last.count, 3);
+        assert!(d.finish(Some(BOOT_A)).is_empty(), "drained and closed");
+    }
+
+    #[test]
+    fn the_system_manager_and_oomd_reports_of_the_same_kill_fold_in_too() {
+        let [s, k] = oom_lines(100, "5", "big");
+        let sys = system_manager_oom(101, "user@1000.service");
+        let usr = user_manager_oom(102, "app.scope");
+        let oomd = ev(
+            102,
+            BOOT_A,
+            &[
+                ("MESSAGE_ID", ids::OOMD_KILL),
+                ("UNIT", "app.scope"),
+                ("MESSAGE", "Killed /app.scope due to memory pressure"),
+            ],
+        );
+        let f = run(&[s, k, sys, usr, oomd], Some(BOOT_A));
+        let oom = of(&f, FindingKind::OomKill);
+        assert_eq!((oom.len(), oom[0].count), (1, 5), "{f:#?}");
+    }
+
+    #[test]
+    fn two_kills_in_quick_succession_stay_two_each_with_its_own_unit() {
+        let [s1, k1] = oom_lines(100, "1", "a");
+        let [s2, k2] = oom_lines(102, "2", "b");
+        let f = run(
+            &[
+                s1,
+                k1,
+                user_manager_oom(101, "a.scope"),
+                user_manager_oom(102, "b.scope"),
+                s2,
+                k2,
+            ],
+            Some(BOOT_A),
+        );
+        let oom = of(&f, FindingKind::OomKill);
+        assert_eq!(oom.len(), 2, "{f:#?}");
+        assert_eq!(
+            (oom[0].data["comm"].as_str(), oom[0].data["unit"].as_str()),
+            ("a", "a.scope")
+        );
+        assert_eq!(
+            (oom[1].data["comm"].as_str(), oom[1].data["unit"].as_str()),
+            ("b", "b.scope")
+        );
     }
 
     #[test]
