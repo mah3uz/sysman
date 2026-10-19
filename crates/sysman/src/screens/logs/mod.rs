@@ -111,6 +111,7 @@ struct Dev {
     select: Option<String>,
     finding: Option<usize>,
     own_only: bool,
+    hover: Option<usize>,
 }
 
 /// A row to select once the scan reaches it, asked for by another screen.
@@ -275,8 +276,9 @@ impl Logs {
     }
 
     /// Screenshot aids: `SYSMAN_DEV_LOGS_QUERY` (search text), `_RANGE` (`5min` … `7day`), `_BOOT` (`-1`, …),
-    /// `_FINDING` (the nth card, once the scan ends), `_SELECT` (`error`, or rows back from the newest) and
-    /// `_ACCESS=own` (the own-entries banner).
+    /// `_FINDING` (the nth card, once the scan ends), `_SELECT` (`error`, or rows back from the newest),
+    /// `_ACCESS=own` (the own-entries banner), `_AT` (open at the entry this many seconds ago) and `_HOVER` (hover the
+    /// busiest mark of this lane).
     #[cfg(debug_assertions)]
     fn dev_setup(&mut self, cx: &mut Context<Self>) {
         use crate::ui::widgets::range::Range;
@@ -309,6 +311,7 @@ impl Logs {
         self.dev.select = var("SELECT");
         self.dev.finding = var("FINDING").and_then(|f| f.parse().ok());
         self.dev.own_only = var("ACCESS").as_deref() == Some("own");
+        self.dev.hover = var("HOVER").and_then(|l| l.parse().ok());
         if let Some(ago) = var("AT").and_then(|s| s.parse::<u64>().ok()) {
             self.open_at(now_us().saturating_sub(ago * 1_000_000), cx);
         }
@@ -318,6 +321,12 @@ impl Logs {
     fn dev_apply(&mut self, cx: &mut Context<Self>) {
         if !self.view.key.settled {
             return;
+        }
+        if let Some(li) = self.dev.hover
+            && let Some(lane) = self.view.lanes.get(li)
+        {
+            let busiest = lane.counts.iter().enumerate().max_by_key(|(_, c)| **c).map(|(b, _)| b);
+            self.lane_hover = busiest.map(|b| (li, b));
         }
         if let Some(n) = self.dev.finding.take()
             && let Some(card) = self.view.cards.get(n)

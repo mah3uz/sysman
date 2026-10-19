@@ -248,7 +248,7 @@ impl Logs {
                 .flex_col()
                 .gap(rem_px(6.))
                 .child(heading("What sysman recorded", t))
-                .child(recorded::charts("logs-finding-chart", r, 3, 28., t))
+                .child(recorded::charts("logs-finding-chart", r, true, 28., t))
         });
         Some(
             hair_b(

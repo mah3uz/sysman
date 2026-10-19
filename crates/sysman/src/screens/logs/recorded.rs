@@ -241,8 +241,8 @@ fn chart(
         )
 }
 
-/// CPU, memory and CPU temperature (and the process's own memory, if any) in `cols` columns.
-pub(super) fn charts(id: &'static str, recorded: &Recorded, cols: u16, height: f32, t: &Theme) -> AnyElement {
+/// CPU, memory and CPU temperature (and the process's own memory, if any): in one row when `wide`, else two columns.
+pub(super) fn charts(id: &'static str, recorded: &Recorded, wide: bool, height: f32, t: &Theme) -> AnyElement {
     let Some(data) = recorded.data() else {
         return div().h(px(height + 18.)).into_any_element();
     };
@@ -306,7 +306,7 @@ pub(super) fn charts(id: &'static str, recorded: &Recorded, cols: u16, height: f
     }
     div()
         .grid()
-        .grid_cols(cols)
+        .grid_cols(if wide { items.len() as u16 } else { 2 })
         .gap_x(rem_px(14.))
         .gap_y(rem_px(10.))
         .children(items)
@@ -370,7 +370,7 @@ impl Logs {
                         .child(div().flex_1().min_w(rem_px(8.)))
                         .child(open_in_explorer("logs-entry-explorer", at, self)),
                 )
-                .child(charts("logs-entry-chart", recorded, 2, 26., t))
+                .child(charts("logs-entry-chart", recorded, false, 26., t))
                 .into_any_element(),
         )
     }
