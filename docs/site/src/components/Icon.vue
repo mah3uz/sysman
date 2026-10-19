@@ -25,6 +25,9 @@ const paths = {
   moon: 'M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z',
   layers: 'M12 2 2 7l10 5 10-5-10-5z M2 17l10 5 10-5 M2 12l10 5 10-5',
   list: 'M8 6h13 M8 12h13 M8 18h13 M3 6h.01 M3 12h.01 M3 18h.01',
+  expand: 'M15 3h6v6 M9 21H3v-6 M21 3l-7 7 M3 21l7-7',
+  prev: 'M15 18l-6-6 6-6',
+  next: 'M9 18l6-6-6-6',
 }
 </script>
 

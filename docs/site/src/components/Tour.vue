@@ -1,5 +1,7 @@
 <script setup>
 import { computed, ref } from 'vue'
+import Icon from './Icon.vue'
+import Lightbox from './Lightbox.vue'
 import Shot from './Shot.vue'
 
 const screens = [
@@ -77,6 +79,7 @@ const screens = [
 
 const active = ref('dashboard')
 const current = computed(() => screens.find((s) => s.id === active.value))
+const lightbox = ref(null)
 
 function onKey(e, i) {
   const step = { ArrowRight: 1, ArrowLeft: -1 }[e.key]
@@ -132,7 +135,15 @@ function onKey(e, i) {
           :aria-labelledby="`tab-${current.id}`"
           class="mt-10 grid gap-8 lg:grid-cols-[1fr_20rem] lg:items-start xl:grid-cols-[1fr_22rem]"
         >
-          <div class="relative">
+          <button
+            type="button"
+            class="group relative block w-full cursor-zoom-in text-left focus-visible:rounded-[0.875rem]"
+            aria-label="View larger"
+            aria-describedby="tour-shot-alt"
+            aria-haspopup="dialog"
+            @click="lightbox.open($event.currentTarget)"
+          >
+            <span id="tour-shot-alt" class="sr-only">{{ current.alt }}</span>
             <Transition name="swap" mode="out-in">
               <Shot
                 :id="current.id"
@@ -143,7 +154,13 @@ function onKey(e, i) {
                 class="shot h-auto w-full"
               />
             </Transition>
-          </div>
+            <span
+              class="absolute top-3 right-3 grid size-9 place-items-center rounded-full border border-line-strong bg-surface/85 text-ink opacity-0 shadow-sm backdrop-blur transition group-hover:opacity-100 group-focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+              aria-hidden="true"
+            >
+              <Icon name="expand" :size="17" />
+            </span>
+          </button>
           <Transition name="fade" mode="out-in">
             <div :key="current.id" class="lg:pt-4">
               <h3 class="text-2xl font-semibold tracking-tight">{{ current.title }}</h3>
@@ -151,6 +168,8 @@ function onKey(e, i) {
             </div>
           </Transition>
         </div>
+
+        <Lightbox ref="lightbox" v-model="active" :screens="screens" />
 
         <p class="mt-12 text-center text-sm text-subtle">
           Plus <span class="text-ink">Groups</span>: sets of processes you define, such as a browser and its
