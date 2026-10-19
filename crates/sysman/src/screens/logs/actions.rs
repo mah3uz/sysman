@@ -186,13 +186,13 @@ impl Logs {
             .children(
                 i.entry
                     .as_deref()
-                    .map(|e| copy("logs-copy-fields", "Copy fields", IconName::Braces, fields_json(e), cx)),
+                    .map(|e| copy("logs-copy-fields", "Copy fields", IconName::Copy, fields_json(e), cx)),
             )
             .children(crash.map(|e| {
                 Button::new("logs-backtrace")
                     .ghost()
                     .xsmall()
-                    .icon(Icon::new(IconName::ScrollText))
+                    .icon(Icon::new(IconName::ListTree))
                     .label("Show backtrace")
                     .on_click(move |_, window, cx| open_backtrace(&e, window, cx))
             }))
@@ -360,12 +360,16 @@ pub(super) fn open_backtrace(e: &Entry, window: &mut Window, cx: &mut gpui::App)
         }
         sheet
     });
-    window.open_dialog(cx, move |dialog, window, _| {
+    window.open_dialog(cx, move |dialog, window, cx| {
+        let t = theme(cx);
         let rem = window.rem_size();
         dialog
             .title("Backtrace")
             .w(rem_px(SHEET_WIDTH).to_pixels(rem))
             .margin_top(rem_px(40.).to_pixels(rem))
+            .bg(t.window)
+            .border_color(t.control_border)
+            .rounded(rem_px(12.))
             .child(sheet.clone())
     });
 }
