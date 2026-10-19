@@ -21,7 +21,7 @@ use journal::reader::{self, Access, Backend, Journal};
 pub use fetch::{Around, Fetcher};
 pub use index::{BootEnd, BootSummary, Bucket, CategoryCounts, Index, Lane, Matches, Row, Visible};
 pub use query::{BootRef, Query, SearchSpec};
-pub use scan::{Narrow, Scan, ScanState, Scope, Search, Span, now_us};
+pub use scan::{FOLLOW_ROW_CAP, Narrow, Scan, ScanState, Scope, Search, Span, now_us};
 
 /// What the page needs for its access and backend banners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
