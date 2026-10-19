@@ -8,9 +8,10 @@ use gpui_kit_assets::IconName;
 use journal::findings::FindingKind;
 
 use super::inspector::heading;
+use super::list::{STALE, spinner};
 use super::toolbar::{hair_b, severity_colour};
-use super::{Logs, model, now_us, recorded};
-use crate::ui::theme::{rem_px, theme};
+use super::{Card, Logs, model, now_us, recorded};
+use crate::ui::theme::{Theme, rem_px, theme};
 use crate::ui::widgets::hairline;
 
 const CARD_MIN_WIDTH: f32 = 250.;
@@ -32,13 +33,20 @@ pub(super) fn kind_icon(kind: FindingKind) -> IconName {
 
 impl Logs {
     /// "Worth a look": the scope's findings as cards, most severe first, in at most two rows unless all are asked
-    /// for. Shown once the scan has ended, as the rules need the whole stream.
+    /// for. The rules need the whole stream, so until the scan has ended it holds the cards it had, dimmed, or a
+    /// row of empty ones on the first read.
     pub(super) fn findings(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
-        if !self.view.scanned || super::scan_failed(&self.scan.state()).is_some() {
+        if super::scan_failed(&self.scan.state()).is_some() {
             return None;
         }
         let t = theme(cx);
-        let cards = &self.view.cards;
+        let cards: &[Card] = if self.view.scanned {
+            &self.view.cards
+        } else {
+            self.held.as_deref().unwrap_or_default()
+        };
+        let first = !self.view.scanned && self.held.is_none();
+        let stale = self.stale() || !self.view.scanned;
         let width = window.viewport_size().width - self.left.read(cx).width() - self.right.read(cx).width();
         let rem = f32::from(window.rem_size()) / 16.;
         let cols = ((f32::from(width) - 28.) / (CARD_MIN_WIDTH * rem))
@@ -52,6 +60,7 @@ impl Logs {
         };
         let collapsed = self.findings_collapsed;
         let caption = match cards.len() {
+            _ if stale => format!("Looking for problems in {}…", self.scope_name()),
             0 if self.own_only() => format!("No problems found among your own entries in {}", self.scope_name()),
             0 => format!("Nothing stands out in {}", self.scope_name()),
             1 => format!("1 finding in {}", self.scope_name()),
@@ -97,6 +106,7 @@ impl Logs {
                     .font_weight(t.weight_semibold)
                     .child("Worth a look"),
             )
+            .children(stale.then(|| spinner(cx)))
             .child(
                 div()
                     .text_size(t.caption)
@@ -105,11 +115,28 @@ impl Logs {
                     .child(caption),
             )
             .on_click(cx.listener(move |this, _, _, cx| this.set_findings_collapsed(!collapsed, cx)));
-        let grid = (!collapsed && !cards.is_empty()).then(|| {
+        let blank = || {
+            hairline(card_box(t), t.hairline_width)
+                .bg(t.panel)
+                .border_color(t.hairline)
+                .opacity(0.5)
+                .child(div().flex_shrink_0().size(rem_px(22.)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.))
+                        .child(div().text_size(t.caption).child(" "))
+                        .child(div().text_size(t.small_caption).child(" ")),
+                )
+        };
+        let grid = (!collapsed && (first || !cards.is_empty())).then(|| {
             div()
                 .grid()
                 .grid_cols(cols as u16)
                 .gap(rem_px(8.))
+                .when(stale, |d| d.opacity(STALE))
+                .when(first, |d| d.children((0..cols).map(|_| blank())))
                 .children(cards[..shown].iter().map(|card| {
                     let colour = severity_colour(card.severity, t);
                     let selected = self.controls.finding.as_ref() == Some(&card.members);
@@ -128,35 +155,27 @@ impl Logs {
                     } else {
                         self.evidence(card)
                     };
-                    div()
+                    card_box(t)
                         .id(("logs-finding", card.members[0]))
-                        .min_w_0()
-                        .flex()
-                        .flex_row()
-                        .items_start()
-                        .gap(rem_px(9.))
-                        .px(rem_px(10.))
-                        .py(rem_px(8.))
-                        .rounded(t.card_radius)
-                        .cursor_pointer()
                         .map(|d| {
                             if selected {
                                 d.bg(colour.opacity(0.10)).border_1().border_color(colour.opacity(0.55))
                             } else {
-                                hairline(d, t.hairline_width)
-                                    .bg(t.panel)
-                                    .border_color(t.hairline)
-                                    .hover(|d| d.bg(t.card_hover))
+                                hairline(d, t.hairline_width).bg(t.panel).border_color(t.hairline)
                             }
                         })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let next = if this.controls.finding.as_ref() == Some(&members) {
-                                None
-                            } else {
-                                Some(members.clone())
-                            };
-                            this.set_finding(next, cx);
-                        }))
+                        .when(!stale, |d| {
+                            d.cursor_pointer()
+                                .when(!selected, |d| d.hover(|d| d.bg(t.card_hover)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let next = if this.controls.finding.as_ref() == Some(&members) {
+                                        None
+                                    } else {
+                                        Some(members.clone())
+                                    };
+                                    this.set_finding(next, cx);
+                                }))
+                        })
                         .child(
                             div()
                                 .flex_shrink_0()
@@ -216,7 +235,7 @@ impl Logs {
                     .gap(rem_px(8.))
                     .px(rem_px(14.))
                     .pt(rem_px(4.))
-                    .pb(rem_px(if collapsed || cards.is_empty() { 8. } else { 12. })),
+                    .pb(rem_px(if grid.is_none() { 8. } else { 12. })),
                 t,
             )
             .child(
@@ -349,4 +368,16 @@ impl Logs {
             .into_any_element(),
         )
     }
+}
+
+fn card_box(t: &Theme) -> gpui::Div {
+    div()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(rem_px(9.))
+        .px(rem_px(10.))
+        .py(rem_px(8.))
+        .rounded(t.card_radius)
 }

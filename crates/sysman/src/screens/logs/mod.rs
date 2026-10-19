@@ -13,12 +13,12 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, UniformListScrollHandle, Window,
-    div,
+    div, prelude::FluentBuilder,
 };
 use gpui_component::input::{InputEvent, InputState, TextareaState};
 use jiff::tz::TimeZone;
@@ -120,6 +120,13 @@ struct Dev {
     action: Option<String>,
 }
 
+/// A scan started while an older one's results are on screen; they stay until this one has enough to replace them.
+struct Next {
+    scan: Arc<Scan>,
+    search: Option<Arc<Search>>,
+    view: Option<View>,
+}
+
 /// A row to select once the scan reaches it, asked for by another screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
@@ -132,6 +139,12 @@ pub struct Logs {
     logs: data::Logs,
     scan: Arc<Scan>,
     search: Option<Arc<Search>>,
+    next: Option<Next>,
+    /// Until the first scan has been read, which is shown whole and at its newest entries.
+    first: bool,
+    /// The replaced scan's cards, kept until the scan on screen has its own.
+    held: Option<Vec<Card>>,
+    /// The latest scan started, which [`Logs::next`] holds until it is on screen.
     scan_gen: u64,
     query_gen: u64,
     span: Span,
@@ -146,7 +159,8 @@ pub struct Logs {
     watching: bool,
     status: Option<Status>,
     fetcher: Arc<Mutex<Option<Fetcher>>>,
-    lines: HashMap<u32, SharedString>,
+    /// First lines by their entry's time and hash, which outlive the row ids of any one scan, with when they came.
+    lines: HashMap<(u64, u64), (SharedString, Instant)>,
     wanted: Vec<u32>,
     in_flight: HashSet<u32>,
     selected: Option<u32>,
@@ -233,6 +247,9 @@ impl Logs {
             logs,
             scan,
             search: None,
+            next: None,
+            first: true,
+            held: None,
             scan_gen: 0,
             query_gen: 0,
             span,
@@ -299,7 +316,8 @@ impl Logs {
     /// `_FINDING` (the nth card, once the scan ends), `_SELECT` (`error`, or rows back from the newest),
     /// `_ACCESS=own` (read as if only the user's own journal were readable), `_COREDUMP=missing`, `_JOURNAL=none`,
     /// `_PACKAGES=dnf` (the "can't tell" notes), `_CAP` (a lower row cap), `_AT` (open at the entry this many seconds
-    /// ago) and `_HOVER` (hover the busiest mark of this lane) and `_ACTION` (see [`Dev::action`]).
+    /// ago), `_HOVER` (hover the busiest mark of this lane), `_ACTION` (see [`Dev::action`]) and `_SWITCH`
+    /// (`7day@6`: change to that range after so many seconds).
     #[cfg(debug_assertions)]
     fn dev_setup(&mut self, cx: &mut Context<Self>) {
         use crate::ui::widgets::range::Range;
@@ -335,6 +353,16 @@ impl Logs {
         self.dev.action = var("ACTION");
         if let Some(ago) = var("AT").and_then(|s| s.parse::<u64>().ok()) {
             self.open_at(now_us().saturating_sub(ago * 1_000_000), cx);
+        }
+        if let Some((r, after)) = var("SWITCH").as_deref().and_then(|s| s.split_once('@'))
+            && let Some(range) = Range::ALL.into_iter().find(|x| x.label().replace(' ', "") == r)
+            && let Ok(after) = after.parse::<f32>()
+        {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_secs_f32(after)).await;
+                this.update(cx, |this, cx| this.set_span(Span::Last(range), cx)).ok();
+            })
+            .detach();
         }
     }
 
@@ -487,7 +515,11 @@ impl Logs {
         let restart = query.search() != self.query.search();
         self.query = query;
         if restart {
-            self.search = self.logs.search(&self.query);
+            let search = self.logs.search(&self.query);
+            match &mut self.next {
+                Some(next) => next.search = search,
+                None => self.search = search,
+            }
         }
         self.query_gen += 1;
         self.stick = true;
@@ -673,32 +705,106 @@ impl Logs {
             data::Span::Range { from_us, .. } => from_us,
             data::Span::Boot(_) => now,
         };
-        self.scan = self.logs.scan(scope);
-        self.scan.set_follow(self.follow);
+        let scan = self.logs.scan(scope);
+        scan.set_follow(self.follow);
         self.scan_gen += 1;
-        self.fetcher = Arc::default();
-        self.dropped = 0;
-        self.forget_rows(cx);
         // finding indexes and the strip's slice belong to the old index
         self.controls.finding = None;
         self.finding_rec = None;
         self.lane_hover = None;
         self.controls.window = None;
         self.query = self.controls.apply(self.parsed.clone());
-        self.search = self.logs.search(&self.query);
-        let boots = std::mem::take(&mut self.view.boots);
-        self.view = View {
-            boots,
-            ..View::default()
-        };
-        self.stick = true;
+        let search = self.logs.search(&self.query);
+        self.next = Some(Next {
+            scan,
+            search,
+            view: None,
+        });
         self.recompute(cx);
         self.watch(cx);
         cx.notify();
     }
 
+    /// The scan being read, whether or not its results are on screen yet.
+    fn reading(&self) -> &Arc<Scan> {
+        self.next.as_ref().map_or(&self.scan, |n| &n.scan)
+    }
+
+    fn searching(&self) -> Option<&Arc<Search>> {
+        match &self.next {
+            Some(n) => n.search.as_ref(),
+            None => self.search.as_ref(),
+        }
+        .filter(|s| s.state().is_running())
+    }
+
+    /// Whether what is on screen is the older scan's, waiting for [`Logs::next`].
+    fn stale(&self) -> bool {
+        self.next.is_some()
+    }
+
+    /// The newer scan's view replaces the older one once it is complete: the scan reads oldest first, so the
+    /// newest entries the list opens at come last.
+    fn ready(&self, view: &View) -> bool {
+        view.key.settled || self.view.items.is_empty() || self.first
+    }
+
+    fn offer(&mut self, view: View, cx: &mut Context<Self>) {
+        if self.ready(&view) {
+            self.promote(view, cx);
+        } else if let Some(next) = &mut self.next {
+            next.view = Some(view);
+            cx.notify();
+        }
+    }
+
+    /// Puts the newer scan on screen, keeping the selected entry when it has it too and the older scan's cards
+    /// until its own findings are in.
+    fn promote(&mut self, view: View, cx: &mut Context<Self>) {
+        let Some(next) = self.next.take() else { return };
+        let carried = self.selected.and_then(|r| carry(&self.scan, &next.scan, r));
+        match (self.selected, carried) {
+            (Some(_), None) => self.select(None, cx),
+            (Some(old), Some(new)) => {
+                self.selected = Some(new);
+                if let Some(i) = self.inspected.as_mut().filter(|i| i.row == old) {
+                    i.row = new;
+                    i.finding = view
+                        .scanned
+                        .then(|| {
+                            let index = next.scan.index();
+                            index
+                                .findings()
+                                .iter()
+                                .position(|f| f.entries.contains(&(new as usize)))
+                        })
+                        .flatten();
+                }
+                if self.message_row == Some(old) {
+                    self.message_row = Some(new);
+                }
+                if let Some((r, _)) = &mut self.restart {
+                    *r = new;
+                }
+                self.copied = None;
+            }
+            _ => {}
+        }
+        self.held = (!view.scanned).then(|| std::mem::take(&mut self.view.cards));
+        self.scan = next.scan;
+        self.search = next.search;
+        self.fetcher = Arc::default();
+        self.dropped = view.key.dropped;
+        self.wanted.clear();
+        self.in_flight.clear();
+        self.stick = carried.is_none();
+        self.apply_view(view, cx);
+        if let Some(row) = carried {
+            self.reveal(row);
+        }
+    }
+
     fn forget_rows(&mut self, cx: &mut Context<Self>) {
-        self.lines.clear();
         self.wanted.clear();
         self.in_flight.clear();
         self.select(None, cx);
@@ -711,6 +817,9 @@ impl Logs {
     fn set_follow(&mut self, on: bool, cx: &mut Context<Self>) {
         self.follow = on;
         self.scan.set_follow(on);
+        if let Some(next) = &self.next {
+            next.scan.set_follow(on);
+        }
         if on {
             self.stick = true;
             self.list.scroll_to_bottom();
@@ -732,17 +841,33 @@ impl Logs {
         self.scan.state() == ScanState::FollowCapped
     }
 
+    /// The scan and search the next view is computed from.
+    fn target(&self) -> (&Arc<Scan>, Option<&Arc<Search>>) {
+        match &self.next {
+            Some(n) => (&n.scan, n.search.as_ref()),
+            None => (&self.scan, self.search.as_ref()),
+        }
+    }
+
     fn key(&self) -> Key {
-        let state = self.scan.state();
-        let searching = self.search.as_ref().is_some_and(|s| s.state().is_running());
+        let (scan, search) = self.target();
+        let searching = search.is_some_and(|s| s.state().is_running());
         Key {
             scan: self.scan_gen,
             query: self.query_gen,
-            rows: self.scan.index().len(),
-            dropped: self.scan.index().dropped(),
-            hits: self.search.as_ref().map_or(0, |s| s.hits().len()),
-            settled: !state.is_running() && !searching,
+            rows: scan.index().len(),
+            dropped: scan.index().dropped(),
+            hits: search.map_or(0, |s| s.hits().len()),
+            settled: !scan.state().is_running() && !searching,
             lanes: self.lanes_open,
+        }
+    }
+
+    /// The key of the latest view computed for [`Logs::target`].
+    fn latest(&self) -> Key {
+        match &self.next {
+            Some(n) => n.view.as_ref().map_or_else(Key::default, |v| v.key),
+            None => self.view.key,
         }
     }
 
@@ -752,9 +877,10 @@ impl Logs {
         }
         self.computing = true;
         let key = self.key();
+        let (scan, search) = self.target();
         let (scan, search, query, span, from) = (
-            self.scan.clone(),
-            self.search.clone(),
+            scan.clone(),
+            search.cloned(),
             self.query.clone(),
             self.span.clone(),
             self.from_us,
@@ -771,7 +897,11 @@ impl Logs {
                     return;
                 }
                 let requery = view.key.query != this.query_gen || view.key.lanes != this.lanes_open;
-                this.apply_view(view, cx);
+                if this.stale() {
+                    this.offer(view, cx);
+                } else {
+                    this.apply_view(view, cx);
+                }
                 // growth is picked up by the poll at its own pace; a new query should not wait for it
                 if requery {
                     this.recompute(cx);
@@ -786,7 +916,9 @@ impl Logs {
         let at_end = self.list.is_scrolled_to_end().unwrap_or(true);
         let fresh_query = view.key.query != self.view.key.query;
         self.view = view;
+        self.first &= !self.view.key.settled;
         if self.view.scanned {
+            self.held = None;
             if self.controls.finding.is_some() && self.shown_card().is_none() {
                 self.set_finding(None, cx);
             }
@@ -831,15 +963,15 @@ impl Logs {
             self.forget_rows(cx);
         }
         let key = self.key();
-        let state = self.scan.state();
-        if key != self.view.key {
+        let state = self.target().0.state();
+        if key != self.latest() {
             self.recompute(cx);
         }
-        if state.is_running() || self.search.as_ref().is_some_and(|s| s.state().is_running()) {
+        if state.is_running() || self.searching().is_some() {
             // the progress line moves even when no batch landed
             cx.notify();
         }
-        let live = state.is_running() || state.is_following() || !key.settled || self.computing || key != self.view.key;
+        let live = state.is_running() || state.is_following() || !key.settled || self.computing || key != self.latest();
         if !live {
             self.watching = false;
         }
@@ -880,14 +1012,15 @@ impl Logs {
     }
 
     fn inspect(&mut self, row: u32, cx: &mut Context<Self>) {
-        let (scan, fetcher, scan_gen) = (self.scan.clone(), self.fetcher.clone(), self.scan_gen);
+        let (scan, fetcher) = (self.scan.clone(), self.fetcher.clone());
         let task = cx
             .background_executor()
             .spawn(async move { read_entry(scan, &fetcher, row) });
+        let scan = self.scan.clone();
         cx.spawn(async move |this, cx| {
             let inspected = task.await;
             this.update(cx, |this, cx| {
-                if this.scan_gen == scan_gen && this.selected == Some(row) {
+                if Arc::ptr_eq(&this.scan, &scan) && this.selected == Some(row) {
                     let t = this.scan.index().row(row).map(|r| secs(r.t_us));
                     if let Some(t) = t.filter(|_| inspected.transaction.is_none()) {
                         this.record(Ask::around(t, inspected.pid), |l| &mut l.entry_rec, cx);
@@ -903,10 +1036,11 @@ impl Logs {
 
     /// Asks for the messages of the rows on screen; only the latest ask is kept, so a fast scroll does not queue
     /// up every row it passed.
-    fn want_lines(&mut self, rows: Vec<u32>, cx: &mut Context<Self>) {
+    fn want_lines(&mut self, rows: Vec<(u32, (u64, u64))>, cx: &mut Context<Self>) {
         self.wanted = rows
             .into_iter()
-            .filter(|r| !self.lines.contains_key(r) && !self.in_flight.contains(r))
+            .filter(|(r, key)| !self.lines.contains_key(key) && !self.in_flight.contains(r))
+            .map(|(r, _)| r)
             .collect();
         self.fetch_lines(cx);
     }
@@ -917,22 +1051,24 @@ impl Logs {
         }
         let rows = std::mem::take(&mut self.wanted);
         self.in_flight.extend(rows.iter().copied());
-        let (scan, fetcher, scan_gen) = (self.scan.clone(), self.fetcher.clone(), self.scan_gen);
+        let (scan, fetcher) = (self.scan.clone(), self.fetcher.clone());
         let task = cx
             .background_executor()
             .spawn(async move { read_lines(scan, &fetcher, &rows) });
+        let scan = self.scan.clone();
         cx.spawn(async move |this, cx| {
             let lines = task.await;
             this.update(cx, |this, cx| {
-                if this.scan_gen != scan_gen {
-                    return;
-                }
-                this.in_flight.clear();
                 if this.lines.len() > LINE_CACHE {
                     this.lines.clear();
                 }
-                this.lines.extend(lines);
-                this.fetch_lines(cx);
+                let now = Instant::now();
+                this.lines
+                    .extend(lines.into_iter().map(|(key, line)| (key, (line, now))));
+                if Arc::ptr_eq(&this.scan, &scan) {
+                    this.in_flight.clear();
+                    this.fetch_lines(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -1119,7 +1255,25 @@ fn with_fetcher<T>(
     Ok(f(slot.as_mut().expect("set above")))
 }
 
-fn read_lines(scan: Arc<Scan>, fetcher: &Mutex<Option<Fetcher>>, rows: &[u32]) -> Vec<(u32, SharedString)> {
+/// The same entry in another scan's index, found by its time and hash.
+fn carry(from: &Scan, to: &Scan, row: u32) -> Option<u32> {
+    let (t_us, hash) = from.index().row(row).map(|r| (r.t_us, r.hash))?;
+    let index = to.index();
+    let at = index.rows().iter().position(|r| r.t_us == t_us && r.hash == hash)?;
+    u32::try_from(at).ok()
+}
+
+pub(super) fn line_key(row: &data::Row) -> (u64, u64) {
+    (row.t_us, row.hash)
+}
+
+fn read_lines(scan: Arc<Scan>, fetcher: &Mutex<Option<Fetcher>>, rows: &[u32]) -> Vec<((u64, u64), SharedString)> {
+    let keys: HashMap<u32, (u64, u64)> = {
+        let index = scan.index();
+        rows.iter()
+            .filter_map(|&r| Some((r, line_key(index.row(r)?))))
+            .collect()
+    };
     let packages: Vec<(u32, String)> = {
         let index = scan.index();
         rows.iter()
@@ -1158,7 +1312,9 @@ fn read_lines(scan: Arc<Scan>, fetcher: &Mutex<Option<Fetcher>>, rows: &[u32]) -
                 .map(|&r| (r, format!("(could not open the journal: {e})").into())),
         ),
     }
-    out
+    out.into_iter()
+        .filter_map(|(r, line)| Some((*keys.get(&r)?, line)))
+        .collect()
 }
 
 fn first_line(message: &str) -> String {
@@ -1225,6 +1381,10 @@ impl Render for Logs {
         } else {
             self.strip(cx).into_any_element()
         };
+        let strip = div().flex_shrink_0().relative().child(strip).when(self.stale(), |d| {
+            d.opacity(list::STALE)
+                .child(div().id("logs-strip-stale").absolute().inset_0().occlude())
+        });
         let group = self.finding_header(cx);
         let list = self.list(cx);
         let inspector = sidebar::showing(&self.right, cx).then(|| self.inspector(cx));
