@@ -7,5 +7,6 @@ pub mod gpu;
 pub mod groups;
 pub mod hardware;
 pub mod insights;
+pub mod logs;
 pub mod network;
 pub mod processes;
