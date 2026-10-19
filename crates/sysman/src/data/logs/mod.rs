@@ -8,6 +8,8 @@
 //! index does not hold: [`Logs::search`] streams them and yields ascending row ids to pass back as `hits`. A
 //! [`Fetcher`] reads whole entries for visible rows and the inspector.
 
+#[cfg(debug_assertions)]
+mod demo;
 mod fetch;
 mod index;
 mod query;
@@ -44,7 +46,7 @@ pub fn status() -> Status {
     #[allow(unused_mut)]
     let mut s = Status {
         access: access(),
-        backend: Journal::open().ok().map(|j| j.backend()),
+        backend: open_journal().ok().map(|j| j.backend()),
         no_journal: !["/var/log/journal", "/run/log/journal"]
             .iter()
             .any(|d| Path::new(d).is_dir()),
@@ -61,6 +63,15 @@ pub fn status() -> Status {
         }
     }
     s
+}
+
+/// The journal, or with `SYSMAN_DEV_LOGS_DEMO` the made-up week of [`demo`].
+pub fn open_journal() -> Result<Journal> {
+    #[cfg(debug_assertions)]
+    if let Some(demo) = demo::get() {
+        return Journal::open_files(std::slice::from_ref(&demo.journal));
+    }
+    Journal::open()
 }
 
 /// The journal permission; `SYSMAN_DEV_LOGS_ACCESS=own` pretends only the user's own journal is readable.

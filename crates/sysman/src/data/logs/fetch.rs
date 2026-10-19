@@ -32,7 +32,7 @@ pub struct Fetcher {
 impl Fetcher {
     pub fn new(scan: Arc<Scan>) -> Result<Fetcher> {
         Ok(Fetcher {
-            journal: Journal::open()?,
+            journal: super::open_journal()?,
             scan,
             cache: VecDeque::new(),
         })

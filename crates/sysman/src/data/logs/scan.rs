@@ -150,9 +150,25 @@ pub fn now_us() -> u64 {
 }
 
 fn current_boot_id() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(demo) = super::demo::get() {
+        return demo.boot.clone();
+    }
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|s| s.trim().replace('-', ""))
         .unwrap_or_default()
+}
+
+fn package_history(from_us: u64) -> Result<Vec<Transaction>> {
+    #[cfg(debug_assertions)]
+    if let Some(demo) = super::demo::get() {
+        return Ok(packages::read_history_in(
+            &demo.dir,
+            from_us,
+            &jiff::tz::TimeZone::system(),
+        ));
+    }
+    packages::read_history(from_us)
 }
 
 /// Hash of the source and the first KiB of the message: what makes two entries "the same message".
@@ -490,7 +506,7 @@ impl Scan {
     }
 
     fn open(&self) -> Result<(Journal, Vec<Boot>, Seek)> {
-        let mut j = Journal::open()?;
+        let mut j = super::open_journal()?;
         *self.backend.lock().unwrap() = Some(j.backend());
         // A journalctl too old to list boots costs the boot timeline, not the whole scan.
         let boots = j.boots().unwrap_or_default();
@@ -522,7 +538,7 @@ impl Scan {
             index.set_cap(Some(self.cap));
         }
         let mut packages = if self.scope.narrow.is_empty() {
-            let mut t = packages::read_history(pkg_from).unwrap_or_default();
+            let mut t = package_history(pkg_from).unwrap_or_default();
             t.retain(|t| t.start_us >= pkg_from && t.start_us <= pkg_to);
             t
         } else {

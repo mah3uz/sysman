@@ -311,7 +311,7 @@ impl Logs {
             }
         }
         if let Some(back) = var("BOOT").and_then(|b| b.trim_start_matches('-').parse::<usize>().ok()) {
-            let boots = journal::reader::Journal::open()
+            let boots = crate::data::logs::open_journal()
                 .and_then(|mut j| j.boots())
                 .unwrap_or_default();
             if let Some(b) = boots.len().checked_sub(back + 1).and_then(|i| boots.get(i)) {
@@ -569,7 +569,7 @@ impl Logs {
     fn open_at(&mut self, t_us: u64, cx: &mut Context<Self>) {
         self.pending = Some(Pending::Scope(t_us));
         let boots = cx.background_executor().spawn(async {
-            journal::reader::Journal::open()
+            crate::data::logs::open_journal()
                 .and_then(|mut j| j.boots())
                 .unwrap_or_default()
         });
