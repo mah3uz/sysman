@@ -2180,6 +2180,8 @@ impl Render for Processes {
                 .size_full()
                 .overflow_y_scroll()
                 .border_l_1()
+                .border_t_1()
+                .rounded_tl(t.panel_radius)
                 .border_color(t.hairline)
                 .bg(t.panel)
                 .child(self.inspector(cx))
