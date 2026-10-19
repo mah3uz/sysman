@@ -105,6 +105,8 @@ pub struct Finding {
     pub entries: Vec<usize>,
     pub boot_id: String,
     pub data: BTreeMap<String, String>,
+    /// `__CURSOR` of the first entry, when entries were read with it.
+    pub cursor: Option<String>,
 }
 
 impl Finding {
@@ -120,6 +122,7 @@ impl Finding {
             entries: vec![index],
             boot_id: boot.to_string(),
             data: BTreeMap::new(),
+            cursor: None,
         }
     }
 
@@ -194,16 +197,25 @@ struct BootSpan {
 
 type BurstKey = (&'static str, String, String);
 
+struct Hit {
+    t: u64,
+    index: usize,
+    cursor: Option<String>,
+}
+
 #[derive(Default)]
 struct Burst {
-    events: VecDeque<(u64, usize)>,
+    events: VecDeque<Hit>,
     finding: Option<usize>,
 }
 
-/// Feed entries in time order with `push`, then `finish`. Holds per-rule state, never the entries.
+/// Feed entries in time order with `push`, then `finish`; or, when following, `drain` as time moves on. Holds
+/// per-rule state, never the entries.
 #[derive(Default)]
 pub struct Detector {
     out: Vec<Finding>,
+    /// Each finding's `count` when `drain` last returned it.
+    reported: Vec<usize>,
     boots: Vec<BootSpan>,
     current: usize,
     crashes: HashMap<(String, String), usize>,
@@ -222,6 +234,7 @@ impl Detector {
         let boot = e.get("_BOOT_ID").unwrap_or_default();
         self.track_boot(index, e, boot);
         let t = e.t_us;
+        let before = self.out.len();
         match e.get("MESSAGE_ID") {
             Some(ids::COREDUMP) => self.crash(index, e, boot),
             Some(ids::UNIT_FAILURE) => self.failed_unit(index, e, boot),
@@ -238,6 +251,78 @@ impl Detector {
                 self.signin_failure(index, t, e, boot);
             }
         }
+        // A burst names its own first entry; every other new finding starts at this one.
+        for f in &mut self.out[before..] {
+            if f.cursor.is_none() {
+                f.cursor = e.get("__CURSOR").map(str::to_string);
+            }
+        }
+    }
+
+    /// The findings created or grown since the last drain, oldest first. `now_us` promises that no entry older than
+    /// it is still to be pushed, so every rule window that ended before it is closed and its state dropped: a long
+    /// follow holds only what can still grow. An open finding is returned again each time it grows, with the same
+    /// `first_us` and `cursor`. A unit's failures fold until an entry of another boot arrives. Findings drained and
+    /// closed are not returned by `finish`.
+    pub fn drain(&mut self, now_us: u64) -> Vec<Finding> {
+        let mut fresh: Vec<Finding> = self
+            .out
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| self.reported.get(*i) != Some(&f.count))
+            .map(|(_, f)| f.clone())
+            .collect();
+        fresh.sort_by_key(|f| f.first_us);
+
+        let boot = self.boots.get(self.current).map(|b| b.id.clone()).unwrap_or_default();
+        let ended = |last: u64, window: u64| now_us.saturating_sub(last) > window;
+        self.failed.retain(|k, _| k.0 == boot);
+        self.grouped.retain(|k, _| k.1 == boot);
+        self.crashes.retain(|k, _| k.0 == boot);
+        self.bursts
+            .retain(|k, b| b.events.back().is_some_and(|h| !ended(h.t, burst_window(k.0))));
+        self.last_oom = self.last_oom.filter(|&i| !ended(self.out[i].last_us, OOM_MERGE_US));
+
+        let mut held = vec![false; self.out.len()];
+        for i in self.held() {
+            held[i] = true;
+        }
+        let mut moved = vec![usize::MAX; held.len()];
+        for (to, (from, _)) in held.iter().enumerate().filter(|(_, h)| **h).enumerate() {
+            moved[from] = to;
+        }
+        let mut i = 0;
+        self.out.retain(|_| {
+            i += 1;
+            held[i - 1]
+        });
+        for v in self.failed.values_mut().chain(self.grouped.values_mut()) {
+            *v = moved[*v];
+        }
+        for b in self.bursts.values_mut() {
+            b.finding = b.finding.map(|i| moved[i]);
+        }
+        self.last_oom = self.last_oom.map(|i| moved[i]);
+        self.reported = self.out.iter().map(|f| f.count).collect();
+        fresh
+    }
+
+    /// The earliest time a still-open rule depends on, as of the last `drain`. A new detector fed from it rebuilds the
+    /// open findings with the same first entries, so a reader that stops and resumes there neither splits nor
+    /// repeats an episode.
+    pub fn open_since(&self) -> Option<u64> {
+        let quiet = self.bursts.values().filter_map(|b| b.events.front().map(|h| h.t));
+        self.held().map(|i| self.out[i].first_us).chain(quiet).min()
+    }
+
+    fn held(&self) -> impl Iterator<Item = usize> + '_ {
+        let bursts = self.bursts.values().filter_map(|b| b.finding);
+        self.failed
+            .values()
+            .chain(self.grouped.values())
+            .copied()
+            .chain(bursts)
+            .chain(self.last_oom)
     }
 
     /// `current_boot` is never reported as ended without shutdown, it has not ended yet.
@@ -346,7 +431,7 @@ impl Detector {
     fn restart(&mut self, index: usize, e: &Entry, boot: &str) {
         let Some(unit) = unit_of(e) else { return };
         let key = ("restart", boot.to_string(), unit.to_string());
-        let hit = self.burst(&key, e.t_us, index, RESTART_WINDOW_US, RESTART_LOOP_MIN);
+        let hit = self.burst(&key, e, index, RESTART_WINDOW_US, RESTART_LOOP_MIN);
         self.finish_burst(key, hit, e.t_us, index, |first| {
             Finding::new(
                 FindingKind::RestartLoop,
@@ -362,7 +447,7 @@ impl Detector {
 
     fn signin_failure(&mut self, index: usize, t: u64, e: &Entry, boot: &str) {
         let key = ("signin", boot.to_string(), String::new());
-        let hit = self.burst(&key, t, index, SIGNIN_WINDOW_US, SIGNIN_FAILURES_MIN);
+        let hit = self.burst(&key, e, index, SIGNIN_WINDOW_US, SIGNIN_FAILURES_MIN);
         let service = pam_service(e.message());
         self.finish_burst(key, hit, t, index, |first| {
             let f = Finding::new(
@@ -400,7 +485,7 @@ impl Detector {
         if let Some(at) = message.find(USB_DISCONNECT) {
             let device = &message[..at];
             let key = ("usb", boot.to_string(), device.to_string());
-            let hit = self.burst(&key, e.t_us, index, USB_WINDOW_US, USB_STORM_MIN);
+            let hit = self.burst(&key, e, index, USB_WINDOW_US, USB_STORM_MIN);
             self.finish_burst(key, hit, e.t_us, index, |first| {
                 Finding::new(
                     FindingKind::HardwareError,
@@ -492,26 +577,28 @@ impl Detector {
 
     /// Records an event in its sliding window; reports whether it extends an open episode or just
     /// reached the threshold. A gap longer than the window ends the episode.
-    fn burst(&mut self, key: &BurstKey, t: u64, index: usize, window: u64, min: usize) -> BurstHit {
+    fn burst(&mut self, key: &BurstKey, e: &Entry, index: usize, window: u64, min: usize) -> BurstHit {
+        let t = e.t_us;
         let b = self.bursts.entry(key.clone()).or_default();
-        if b.events
-            .back()
-            .is_some_and(|&(last, _)| t.saturating_sub(last) > window)
-        {
+        if b.events.back().is_some_and(|last| t.saturating_sub(last.t) > window) {
             b.events.clear();
             b.finding = None;
         }
-        b.events.push_back((t, index));
-        while b
-            .events
-            .front()
-            .is_some_and(|&(first, _)| t.saturating_sub(first) > window)
-        {
+        b.events.push_back(Hit {
+            t,
+            index,
+            cursor: e.get("__CURSOR").map(str::to_string),
+        });
+        while b.events.front().is_some_and(|first| t.saturating_sub(first.t) > window) {
             b.events.pop_front();
         }
         match b.finding {
             Some(i) => BurstHit::Extend(i),
-            None if b.events.len() >= min => BurstHit::Open(b.events.iter().copied().collect()),
+            None if b.events.len() >= min => BurstHit::Open {
+                t: b.events[0].t,
+                cursor: b.events[0].cursor.clone(),
+                entries: b.events.iter().map(|h| h.index).collect(),
+            },
             None => BurstHit::Quiet,
         }
     }
@@ -520,10 +607,15 @@ impl Detector {
         match hit {
             BurstHit::Quiet => {}
             BurstHit::Extend(i) => self.out[i].add(t, index),
-            BurstHit::Open(events) => {
-                let mut f = make(events[0].0);
-                f.entries = events.iter().map(|&(_, i)| i).collect();
-                f.count = events.len();
+            BurstHit::Open {
+                t: first,
+                cursor,
+                entries,
+            } => {
+                let mut f = make(first);
+                f.count = entries.len();
+                f.entries = entries;
+                f.cursor = cursor;
                 f.last_us = t;
                 f.retitle();
                 if let Some(b) = self.bursts.get_mut(&key) {
@@ -538,7 +630,19 @@ impl Detector {
 enum BurstHit {
     Quiet,
     Extend(usize),
-    Open(Vec<(u64, usize)>),
+    Open {
+        t: u64,
+        cursor: Option<String>,
+        entries: Vec<usize>,
+    },
+}
+
+fn burst_window(rule: &str) -> u64 {
+    match rule {
+        "restart" => RESTART_WINDOW_US,
+        "usb" => USB_WINDOW_US,
+        _ => SIGNIN_WINDOW_US,
+    }
 }
 
 fn evidence(message: &str) -> String {
@@ -1053,6 +1157,145 @@ mod tests {
         assert!(same_message(&a, &b));
         assert!(!same_message(&a, &other_source));
         assert!(!same_message(&a, &other_text));
+    }
+
+    fn cursored(mut e: Entry, n: usize) -> Entry {
+        e.fields.insert("__CURSOR".into(), format!("c{n}"));
+        e
+    }
+
+    fn unit_failed(t_s: u64, boot: &str) -> Entry {
+        ev(
+            t_s,
+            boot,
+            &[
+                ("MESSAGE_ID", ids::UNIT_FAILURE),
+                ("UNIT", "backup.service"),
+                ("UNIT_RESULT", "exit-code"),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_drained_crash_comes_out_at_once_and_only_once() {
+        let mut d = Detector::new();
+        d.push(0, &cursored(coredump(10, BOOT_A, "Hyprland"), 0));
+        let f = d.drain(10 * S);
+        assert_eq!(f.len(), 1, "a follower records a crash within one read");
+        assert_eq!(f[0].cursor.as_deref(), Some("c0"));
+        assert!(d.drain(20 * S).is_empty(), "a second drain would write it twice");
+        assert!(
+            d.out.is_empty(),
+            "nothing can grow a crash, so a long follow does not keep it"
+        );
+        assert_eq!(d.open_since(), None);
+    }
+
+    #[test]
+    fn a_restart_loop_read_across_drains_is_one_episode_that_grows() {
+        let mut d = Detector::new();
+        for (i, t) in [0, 60].into_iter().enumerate() {
+            d.push(i, &cursored(restart(t, "x.service"), i));
+        }
+        assert!(d.drain(60 * S).is_empty());
+        assert_eq!(d.open_since(), Some(0), "two restarts may still become a loop");
+        d.push(2, &cursored(restart(120, "x.service"), 2));
+        let f = d.drain(120 * S);
+        assert_eq!((f.len(), f[0].count, f[0].first_us), (1, 3, 0));
+        assert_eq!(
+            f[0].cursor.as_deref(),
+            Some("c0"),
+            "keyed by its first entry, read before the drain"
+        );
+        d.push(3, &cursored(restart(180, "x.service"), 3));
+        let grown = d.drain(180 * S);
+        assert_eq!(
+            (grown.len(), grown[0].count),
+            (1, 4),
+            "the same episode, grown, not a second one"
+        );
+        assert_eq!(
+            (grown[0].first_us, grown[0].cursor.clone()),
+            (f[0].first_us, f[0].cursor.clone())
+        );
+
+        assert!(d.drain(1000 * S).is_empty());
+        assert_eq!(d.open_since(), None, "the window has closed");
+        d.push(4, &cursored(restart(1000, "x.service"), 4));
+        assert!(
+            d.drain(1000 * S).is_empty(),
+            "a restart after the loop ended starts over"
+        );
+    }
+
+    #[test]
+    fn rereading_from_open_since_rebuilds_the_open_episode_with_the_same_first_entry() {
+        let es: Vec<_> = [0, 400, 450, 500, 550]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| cursored(restart(*t, "x.service"), i))
+            .collect();
+        let mut first = Detector::new();
+        for (i, e) in es[..4].iter().enumerate() {
+            first.push(i, e);
+        }
+        let loop_start = first.drain(500 * S);
+        let since = first.open_since().unwrap();
+        assert_eq!(
+            since,
+            400 * S,
+            "the restart at 0 fell out of the window and need not be read again"
+        );
+
+        let mut resumed = Detector::new();
+        for (i, e) in es.iter().enumerate().filter(|(_, e)| e.t_us >= since) {
+            resumed.push(i, e);
+        }
+        let again = resumed.drain(550 * S);
+        assert_eq!(again.len(), 1);
+        assert_eq!(
+            (again[0].first_us, &again[0].cursor),
+            (loop_start[0].first_us, &loop_start[0].cursor)
+        );
+        assert_eq!(again[0].count, 4, "grown by the entry read after the resume");
+    }
+
+    #[test]
+    fn a_units_first_failure_is_drained_at_once_and_repeats_in_its_boot_grow_it() {
+        let mut d = Detector::new();
+        d.push(0, &cursored(unit_failed(10, BOOT_A), 0));
+        let f = d.drain(10 * S);
+        assert_eq!(
+            (f.len(), f[0].count),
+            (1, 1),
+            "folding must not hold the first failure back"
+        );
+        d.push(1, &cursored(unit_failed(5000, BOOT_A), 1));
+        let f = d.drain(9000 * S);
+        assert_eq!((f.len(), f[0].count, f[0].cursor.as_deref()), (1, 2, Some("c0")));
+        assert_eq!(d.open_since(), Some(10 * S), "the fold stays open for the whole boot");
+
+        d.push(2, &cursored(unit_failed(20000, BOOT_B), 2));
+        let f = d.drain(20000 * S);
+        assert_eq!(
+            (f.len(), f[0].count, f[0].boot_id.as_str()),
+            (1, 1, BOOT_B),
+            "a new boot starts over"
+        );
+        assert_eq!(d.out.len(), 1, "the old boot's fold is closed");
+    }
+
+    #[test]
+    fn an_oom_kill_is_held_open_only_for_the_merge_window() {
+        let mut d = Detector::new();
+        d.push(
+            0,
+            &kernel(100, BOOT_A, "Out of memory: Killed process 1 (a) total-vm:1kB"),
+        );
+        assert_eq!(d.drain(100 * S).len(), 1);
+        assert_eq!(d.open_since(), Some(100 * S), "the unit's report may still follow");
+        assert!(d.drain(110 * S).is_empty());
+        assert_eq!(d.open_since(), None);
     }
 
     #[test]

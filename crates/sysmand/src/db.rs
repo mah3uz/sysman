@@ -13,6 +13,7 @@ use serde_json::Value;
 use schema::series::{escape, flatten};
 
 use crate::config::Retention;
+use crate::events::Event;
 
 const ENVELOPE: [&str; 5] = ["type", "schema", "t", "time", "errors"];
 
@@ -172,6 +173,20 @@ impl Db {
         })
     }
 
+    #[cfg(test)]
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// The events thread's resume point, as it last wrote it.
+    pub fn events_state(&self) -> Result<HashMap<String, String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT name, value FROM events_state")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn write(&mut self, record: &Value) -> Result<()> {
         let t = record["t"].as_f64().context("record has no t")?.round() as i64;
         let tx = self.conn.transaction()?;
@@ -203,6 +218,7 @@ impl Db {
                     )?;
                 }
             }
+            Some("events") => write_events(&tx, t, record)?,
             other => anyhow::bail!("unknown record type {other:?}"),
         }
         if t - self.last_prune >= 3600 {
@@ -237,14 +253,7 @@ fn write_sample(
             )?;
         }
     }
-    if let Some(errors) = record.get("errors").and_then(Value::as_object) {
-        for (module, message) in errors {
-            tx.execute(
-                "INSERT OR REPLACE INTO errors (t, module, message) VALUES (?1, ?2, ?3)",
-                params![t, module, message.as_str().unwrap_or_default()],
-            )?;
-        }
-    }
+    write_errors(tx, t, record)?;
 
     let mut insert = tx.prepare_cached("INSERT OR REPLACE INTO points (series_id, t, value) VALUES (?1, ?2, ?3)")?;
     for (path, v) in points {
@@ -261,6 +270,44 @@ fn write_sample(
         add_point(minute, id, t, v);
     }
     Ok(())
+}
+
+fn write_errors(tx: &Transaction, t: i64, record: &Value) -> Result<()> {
+    if let Some(errors) = record.get("errors").and_then(Value::as_object) {
+        for (module, message) in errors {
+            tx.execute(
+                "INSERT OR REPLACE INTO errors (t, module, message) VALUES (?1, ?2, ?3)",
+                params![t, module, message.as_str().unwrap_or_default()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Events and the resume point they were read up to commit together, so a crash between them cannot skip events.
+fn write_events(tx: &Transaction, t: i64, record: &Value) -> Result<()> {
+    // A fold read again as it grows (a unit failing again, a loop's next restart, a transaction still running)
+    // refines its row; a plain re-read writes the same values.
+    let mut insert = tx.prepare_cached(
+        "INSERT INTO events (t, kind, key, boot_id, summary, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (t, kind, key) DO UPDATE SET
+           boot_id = excluded.boot_id, summary = excluded.summary, data = excluded.data",
+    )?;
+    for e in Vec::<Event>::deserialize(&record["events"])? {
+        insert.execute(params![e.t, e.kind, e.key, e.boot_id, e.summary, e.data.to_string()])?;
+    }
+    if let Some(state) = record.get("state").and_then(Value::as_object) {
+        for (name, value) in state {
+            match value.as_str() {
+                Some(v) => tx.execute(
+                    "INSERT OR REPLACE INTO events_state (name, value) VALUES (?1, ?2)",
+                    params![name, v],
+                )?,
+                None => tx.execute("DELETE FROM events_state WHERE name = ?1", params![name])?,
+            };
+        }
+    }
+    write_errors(tx, t, record)
 }
 
 /// `table` feeds the process history; left in, every snapshot row would carry the whole process list.
@@ -469,6 +516,10 @@ fn prune(tx: &Transaction, r: &Retention, now: i64) -> Result<()> {
         )?;
     }
     tx.execute("DELETE FROM errors WHERE t < ?1", params![raw])?;
+    tx.execute(
+        "DELETE FROM events WHERE t < ?1",
+        params![now - i64::from(r.events_days) * 86400],
+    )?;
     prune_procs(tx, r, now)
 }
 
@@ -511,6 +562,11 @@ impl Writer {
             .spawn(move || serve(db, rx))
             .expect("spawning the db thread");
         Self { tx, dropped: 0 }
+    }
+
+    /// For a producer that may wait for room in the queue rather than drop.
+    pub fn sender(&self) -> SyncSender<Value> {
+        self.tx.clone()
     }
 
     pub fn send(&mut self, record: Value) {
@@ -756,6 +812,29 @@ mod tests {
             (1, 1, 1)
         );
         assert_eq!(db.procs.len(), 1, "the in-memory map is bounded too");
+    }
+
+    #[test]
+    fn an_events_record_writes_its_events_resume_point_and_errors_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        let rec = json!({"type": "events", "t": 100.0,
+                         "events": [{"t": 90, "kind": "crash", "key": "c1", "boot_id": "b", "summary": "x crashed (SIGSEGV)",
+                                     "data": {"pid": 7}}],
+                         "state": {"cursor": "c1", "since_us": null},
+                         "errors": {"events": "journal went away"}});
+        db.write(&rec).unwrap();
+        assert_eq!(count(&db, "events"), 1);
+        assert_eq!(
+            db.events_state().unwrap(),
+            HashMap::from([("cursor".into(), "c1".into())])
+        );
+        let msg: String = db
+            .conn
+            .query_row("SELECT message FROM errors WHERE module = 'events'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg, "journal went away");
+        assert_eq!(count(&db, "points"), 0, "an events record is not a sample");
     }
 
     #[test]

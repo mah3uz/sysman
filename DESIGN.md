@@ -128,6 +128,8 @@ meta       (t, data)
 procs      (id, pid, start_time, comm, cmdline, user, first_t, last_t)  UNIQUE (pid, start_time)
 proc_points    (proc_id, t, cpu_pct, rss_bytes, threads, fds, read_bps, write_bps)
 proc_rollup_1m (proc_id, t, cpu_avg, cpu_max, rss_avg, rss_max, threads_max, fds_max, read_bps_avg, write_bps_avg, count)
+events     (t, kind, key, boot_id, summary, data)        PK (t, kind, key)
+events_state (name PRIMARY KEY, value)
 ```
 
 - `t` is integer Unix seconds.
@@ -151,7 +153,7 @@ proc_rollup_1m (proc_id, t, cpu_avg, cpu_max, rss_avg, rss_max, threads_max, fds
 | `proc_rollup_1m`, `procs` | 7 days | `proc_rollup_days` |
 | `events` | 90 days | `events_days` |
 | JSONL | 2 days | `log_days` |
-| `meta` | forever | |
+| `meta`, `events_state` | forever | |
 
 ### Socket
 
@@ -297,20 +299,36 @@ An `events` thread follows the journal and writes notable entries to
 was closed.
 
 ```sql
-events (t, kind, key, boot_id, summary, data)            PK (t, kind, key)
+events       (t, kind, key, boot_id, summary, data)      PK (t, kind, key)
+events_state (name PRIMARY KEY, value)
 ```
 
 - `kind`: `crash`, `oom`, `unit_failed`, `restart_loop`, `boot`,
   `boot_end` (`data.clean` true or false), `suspend`, `resume`, `packages`.
-  `key` makes a re-read idempotent (the journal cursor for journal events,
-  the transaction's start time for packages). `data` holds the fields the app
-  shows (pid, comm, signal, unit, result, package list).
-- The thread starts with the daemon, resumes from the last cursor it wrote
-  (in `meta`), and on first run reads back `retention.events_days`. A boot
-  that ended without shutdown is decided once the next boot's events thread
-  starts. The thread never blocks the scheduler or the JSONL writer; it
-  queues to the SQLite writer like a module, and a failure is listed in
-  `errors` as `events`.
+  `key` makes a re-read idempotent: the cursor of the event's first journal
+  entry, the boot id for `boot` and `boot_end`, the transaction's start (µs)
+  for packages. `t` is that first entry's time (a boot's last entry for
+  `boot_end`). `data` holds the fields the app shows (pid, comm, signal,
+  unit, result, count, n_restarts, command and changes); `boot_id` is null
+  for packages.
+- A row is written as soon as its rule fires and updated in place as it
+  grows: a unit's failures fold per boot (`data.count`), a restart loop
+  counts its restarts, an OOM kill merges the lines within 5 s, a package
+  transaction still running gains changes.
+- The thread reads `MESSAGE_ID`s for crashes, OOM, failures, restarts and
+  sleep plus kernel lines of priority 0-3, with only the fields the rules
+  use. It starts with the daemon and resumes from `events_state`: from the
+  earliest entry a still-open rule depends on (so a restart loop is neither
+  split nor counted twice across a restart), else just after the last cursor
+  read; on first run from `retention.events_days` back. Boots come from the
+  journal's boot list; a boot's `boot_end` is decided once a later boot
+  runs, clean when that boot logged a shutdown or the journal stopping.
+  Package logs are re-read when one's mtime changes, checked every 60 s.
+- The thread never blocks the scheduler or the JSONL writer: it sends
+  `{"type": "events", "events": [...], "state": {...}}` records to the
+  SQLite writer's queue (waiting for room rather than dropping), and each
+  record's events and resume point commit in one transaction. A failure is
+  listed in `errors` as `events` and retried with backoff up to 5 minutes.
 - Retention: `retention.events_days`, default 90.
 - Without journal access the thread records only what the user's journal
   holds, and says so once in `errors`.

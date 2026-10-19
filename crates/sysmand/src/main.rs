@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod db;
 mod deltas;
+mod events;
 mod helper;
 mod jsonl;
 mod pool;
@@ -87,7 +88,10 @@ fn run() -> Result<()> {
         .filter(|s| s.snapshot)
         .map(|s| s.name.to_string())
         .collect();
-    let mut history = db::Writer::spawn(db::Db::open(&data.join("history.db"), retention, snapshots)?);
+    let events_days = retention.events_days;
+    let db = db::Db::open(&data.join("history.db"), retention, snapshots)?;
+    let events_state = events::State::from_rows(&db.events_state()?);
+    let mut history = db::Writer::spawn(db);
     let hub = Arc::new(socket::Hub::default());
     match config::socket_path() {
         // two daemons would interleave writes to the same log and database
@@ -99,6 +103,7 @@ fn run() -> Result<()> {
         }
         None => eprintln!("XDG_RUNTIME_DIR is not set; running without the socket"),
     }
+    events::spawn(history.sender(), events_state, events_days);
     // every module on the first tick, so slow ones are not missing for up to a minute after a start
     let mut first = true;
     loop {

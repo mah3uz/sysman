@@ -293,7 +293,8 @@ pub fn read_history(since_us: u64) -> Result<Vec<Transaction>> {
     Ok(read_history_in(Path::new("/var/log"), since_us, &TimeZone::system()))
 }
 
-fn read_history_in(log_dir: &Path, since_us: u64, tz: &TimeZone) -> Vec<Transaction> {
+/// [`read_history`] from the logs under `log_dir`, with dpkg and apt times read in `tz`.
+pub fn read_history_in(log_dir: &Path, since_us: u64, tz: &TimeZone) -> Vec<Transaction> {
     let mut all = Vec::new();
     if let Some(text) = read_text(&log_dir.join("pacman.log")) {
         all.extend(parse_pacman(&text));

@@ -42,6 +42,7 @@ pub struct Retention {
     pub rollup_1m_days: u32,
     pub rollup_15m_days: u32,
     pub proc_rollup_days: u32,
+    pub events_days: u32,
 }
 
 impl Default for Retention {
@@ -52,6 +53,7 @@ impl Default for Retention {
             rollup_1m_days: 90,
             rollup_15m_days: 730,
             proc_rollup_days: 7,
+            events_days: 90,
         }
     }
 }
@@ -91,8 +93,15 @@ impl Config {
             bail!("[retention] log_days must be at least 1 (today's file)");
         }
         let r = &file.retention;
-        if r.raw_hours == 0 || r.rollup_1m_days == 0 || r.rollup_15m_days == 0 || r.proc_rollup_days == 0 {
-            bail!("[retention] raw_hours, rollup_1m_days, rollup_15m_days and proc_rollup_days must be at least 1");
+        if r.raw_hours == 0
+            || r.rollup_1m_days == 0
+            || r.rollup_15m_days == 0
+            || r.proc_rollup_days == 0
+            || r.events_days == 0
+        {
+            bail!(
+                "[retention] raw_hours, rollup_1m_days, rollup_15m_days, proc_rollup_days and events_days must be at least 1"
+            );
         }
         let mut modules = BTreeMap::new();
         for (name, mut table) in file.modules {
@@ -178,6 +187,21 @@ mod tests {
         assert!(Config::parse("[general]\nintervall = 5").is_err());
         assert!(Config::parse("[genral]\ninterval = 5").is_err());
         assert!(Config::parse("[retention]\nlog_day = 5").is_err());
+    }
+
+    #[test]
+    fn events_are_kept_90_days_unless_set_and_never_zero() {
+        assert_eq!(Config::parse("").unwrap().retention.events_days, 90);
+        assert_eq!(
+            Config::parse("[retention]\nevents_days = 30")
+                .unwrap()
+                .retention
+                .events_days,
+            30
+        );
+        // 0 would delete every event the hour it was written
+        assert!(Config::parse("[retention]\nevents_days = 0").is_err());
+        assert!(Config::parse("[retention]\nevent_days = 30").is_err());
     }
 
     #[test]
