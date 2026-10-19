@@ -6,6 +6,7 @@ pub mod helper;
 pub mod history;
 pub mod insights;
 pub mod live;
+pub mod logs;
 pub mod net;
 pub mod prefs;
 pub mod pressure;
