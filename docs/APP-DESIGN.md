@@ -254,7 +254,7 @@ what sysman recorded at the same moment. Reading and the index live in
   (current boot on top; each boot with start → end, duration, suspended spans,
   "Clean shutdown" or "Ended without shutdown" in red, a one-line tally of
   crashes, failed units and OOM kills; the off time between boots drawn as a
-  gap, "Power lost · off for 93 s"); saved filters (a name plus a query
+  gap, "Ended without shutdown · next boot 93 s later"); saved filters (a name plus a query
   string, stored in `ui.toml`).
 - *Main column*, top to bottom:
   1. Toolbar: search field (free text plus tokens, below), priority
@@ -271,7 +271,7 @@ what sysman recorded at the same moment. Reading and the index live in
      double-click to clear. Its expand arrow opens the **lanes view** in
      place: one lane per category with event marks, CPU use and CPU
      temperature from history drawn behind the lanes, boot starts and ends as
-     rules (power losses in red). Marks are at least 3 px wide and the
+     rules (boots that ended without shutdown in red). Marks are at least 3 px wide and the
      nearest mark within 6 px is the one hovered.
   4. **Log list**: virtualised, one dense row per entry (time, priority mark,
      source, message in monospace, ellipsised). Identical consecutive
@@ -300,10 +300,18 @@ against the message. Tokens AND together; a token's repeated values OR.
 **Findings** (rules in `crates/journal`, not guesses): crash (coredump entry;
 "Second Hyprland crash this boot" when repeated), OOM kill (kernel or
 systemd-oomd), failed unit, restart loop (≥3 restarts of a unit within
-5 min), boot ended without shutdown (no shutdown message and no
-journal-stopped entry in that boot; evidence: the last readings from the
-JSONL crash log), thermal throttling (kernel throttle lines, counted),
-hardware errors (MCE, PCIe AER, I/O errors, USB disconnect storms), repeated
+5 min), boot ended without shutdown (no logind shutdown message and no PID 1
+"multi-user.target stopped" in the boot's final stretch; "confirmed" when
+the next boot finds the journal uncleanly closed or the CPU reports a reset
+reason, "ended while suspended" when the last event was a suspend; never
+judged from the user's own journal alone, nor for boots whose start was
+vacuumed; never called a power loss unless a reset reason says so; evidence:
+sysman's last readings before the end), thermal throttling (kernel throttle
+lines, counted; AMD CPUs log none), hardware errors (warning or worse: MCE,
+PCIe AER, EDAC, GPU faults such as NVIDIA Xid, amdgpu ring timeouts and
+i915/xe hangs, NVMe, ATA and block I/O errors, USB disconnect storms;
+corrected errors rank below uncorrected ones), crashes also from kernel
+segfault lines where systemd-coredump isn't installed, repeated
 failed sign-ins, package changes (a transaction's upgraded packages; flagged
 when a finding follows within the same boot).
 
