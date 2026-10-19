@@ -96,7 +96,7 @@ function onKey(e, i) {
         <h2 v-reveal="60" class="mt-3 text-3xl font-semibold tracking-tight text-balance sm:text-5xl">Eleven screens, one native app.</h2>
         <p v-reveal="120" class="mt-5 text-lg leading-relaxed text-muted">
           A native Linux app built with GPUI and drawn on the GPU. Every image here is a real screenshot
-          of sysman reading a live collector.
+          of sysman reading a live collector; Logs shows a sample week, so no one’s own logs are on the page.
         </p>
       </div>
 

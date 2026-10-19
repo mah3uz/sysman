@@ -7,7 +7,7 @@ const props = defineProps({ id: { type: String, required: true }, sizes: { type:
 
 // Ids whose -light files are in public/shots. A listed id gets its light pair in the light
 // theme; any other shows its dark shot in both themes, so a missing file never breaks an image.
-const lightShots = new Set([])
+const lightShots = new Set(['dashboard', 'processes', 'gpu', 'energy', 'network', 'diskmap', 'hardware', 'explorer', 'insights', 'logs'])
 
 const theme = useTheme()
 const srcset = (name) => `/shots/${name}-640.webp 640w, /shots/${name}.webp 1280w`
