@@ -494,8 +494,9 @@ fn follow(out: &mut Out, events_days: u32, log_dir: &Path) -> Result<Infallible>
         }
         out.send(events, &rec.state, None)?;
         if end {
-            if !caught_up && rec.index > CHUNK {
-                // catching up mapped every journal file it read, hundreds of MB; a new handle maps what following needs
+            if !caught_up {
+                // listing boots and catching up mapped every journal file, hundreds of MB; a new handle maps only
+                // what following needs
                 src = Live::open()?;
                 rec.continue_on(&mut src)?;
             }
