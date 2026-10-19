@@ -1077,7 +1077,7 @@ impl Render for Logs {
         let header = self.header(cx).into_any_element();
         let findings = self.findings(window, cx);
         let strip = if self.lanes_open {
-            self.lanes(cx).into_any_element()
+            self.lanes(window, cx).into_any_element()
         } else {
             self.strip(cx).into_any_element()
         };

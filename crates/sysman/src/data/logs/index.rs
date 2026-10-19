@@ -668,6 +668,7 @@ pub(super) mod tests {
             count: 2,
             entries: vec![2, 0],
             boot_id: String::new(),
+            cursor: None,
             data: Default::default(),
         };
         idx.set_findings(vec![f.clone()]);

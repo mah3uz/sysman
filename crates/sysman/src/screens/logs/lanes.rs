@@ -23,6 +23,8 @@ use crate::ui::theme::{rem_px, theme};
 const LANE: f32 = 17.;
 const LABELS: f32 = 128.;
 const FLAGS: f32 = 15.;
+/// Between a boot rule and its label.
+const FLAG_MARGIN: f32 = 4.;
 /// The nearest mark within this many pixels of the pointer is the hovered one.
 const REACH: f32 = 6.;
 const MARK_MIN: f32 = 3.;
@@ -196,7 +198,7 @@ impl Logs {
 
     /// The strip opened out: a lane per category with its marks, what sysman recorded behind them and the boots as
     /// rules.
-    pub(super) fn lanes(&self, cx: &Context<Self>) -> impl IntoElement {
+    pub(super) fn lanes(&self, window: &mut Window, cx: &Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let (from, to) = self.view.range;
         let frac = |us: u64| {
@@ -211,10 +213,16 @@ impl Logs {
         let boots = &self.view.boots;
         let mut rules = Vec::new();
         let mut flags = Vec::new();
-        for (i, boot) in boots.iter().enumerate() {
+        for (i, boot) in boots.iter().enumerate().rev() {
             if inside(boot.first_us) {
                 rules.push((frac(boot.first_us), t.green.opacity(0.7)));
-                flags.push((frac(boot.first_us), model::boot_label(i, boots), t.green, false));
+                let full = model::boot_label(i, boots);
+                let short = if boot.current {
+                    "Current".to_string()
+                } else {
+                    full.trim_start_matches("Boot ").to_string()
+                };
+                flags.push((frac(boot.first_us), [full, short], t.green, false, u8::from(!boot.current)));
             }
             if inside(boot.last_us) && !boot.current && boot.end != BootEnd::Running {
                 let lost = boot.end == BootEnd::Abrupt;
@@ -224,25 +232,39 @@ impl Logs {
                 ));
                 if lost {
                     let label = format!("Power lost {}", model::clock(boot.last_us, "%H:%M:%S", &self.tz));
-                    flags.push((frac(boot.last_us), label, t.red, true));
+                    flags.push((frac(boot.last_us), [label, "Power lost".into()], t.red, true, 0));
                 }
             }
         }
+        flags.sort_by_key(|f| f.4);
         let width = f32::from(self.strip.get().size.width);
-        if width > 0. {
-            let char_w = f32::from(t.small_caption) * 0.62 / width;
-            flags.sort_by_key(|f| !f.3);
-            let mut taken: Vec<(f32, f32)> = Vec::new();
-            flags.retain(|(f, text, _, right)| {
-                let w = text.chars().count() as f32 * char_w + 8. / width;
-                let span = if *right { (f - w, *f) } else { (*f, f + w) };
-                let free = taken.iter().all(|&(a, b)| span.1 <= a || span.0 >= b);
-                if free {
-                    taken.push(span);
+        let mut style = window.text_style();
+        style.font_family = t.font.clone();
+        style.font_weight = t.weight_medium;
+        style.font_features = t.numbers.clone();
+        let margin = f32::from(rem_px(FLAG_MARGIN).to_pixels(window.rem_size()));
+        let measured: Vec<Placed> = flags
+            .iter()
+            .map(|(f, texts, _, right, _)| {
+                let w = texts.clone().map(|text| {
+                    let run = style.to_run(text.len());
+                    f32::from(window.text_system().shape_line(text.into(), t.small_caption, &[run], None).width)
+                });
+                Placed {
+                    at: f * width,
+                    widths: w.map(|w| w + margin),
+                    right: *right,
                 }
-                free
-            });
-        }
+            })
+            .collect();
+        let chosen = place(&measured, margin * 1.5);
+        let flags: Vec<_> = flags
+            .into_iter()
+            .zip(chosen)
+            .filter_map(|((f, [full, short], colour, right, _), c)| {
+                c.map(|c| (f, if c == 0 { full } else { short }, colour, right))
+            })
+            .collect();
         let data = self.lanes_rec.as_ref().and_then(|r| r.data());
         let recorded = data.filter(|d| !d.is_empty());
         let span_s = self
@@ -302,9 +324,9 @@ impl Logs {
                 .top_0()
                 .map(|d| {
                     if right {
-                        d.right(relative(1. - f)).mr(rem_px(4.))
+                        d.right(relative(1. - f)).mr(rem_px(FLAG_MARGIN))
                     } else {
-                        d.left(relative(f)).ml(rem_px(4.))
+                        d.left(relative(f)).ml(rem_px(FLAG_MARGIN))
                     }
                 })
                 .text_size(t.small_caption)
@@ -530,6 +552,33 @@ impl Logs {
     }
 }
 
+/// A label above the lanes, in pixels: the rule it hangs from, its widths (full then short, margin included) and
+/// whether it reads leftwards from the rule.
+struct Placed {
+    at: f32,
+    widths: [f32; 2],
+    right: bool,
+}
+
+/// Which form of each label fits (0 full, 1 short) or `None` where neither does, placing them in order so the
+/// earlier ones win; `gap` is the least space kept between two labels.
+fn place(labels: &[Placed], gap: f32) -> Vec<Option<usize>> {
+    let mut taken: Vec<(f32, f32)> = Vec::new();
+    labels
+        .iter()
+        .map(|l| {
+            let form = (0..2).find(|&i| {
+                let w = l.widths[i];
+                let span = if l.right { (l.at - w, l.at) } else { (l.at, l.at + w) };
+                taken.iter().all(|&(a, b)| span.1 + gap <= a || span.0 >= b + gap)
+            })?;
+            let w = l.widths[form];
+            taken.push(if l.right { (l.at - w, l.at) } else { (l.at, l.at + w) });
+            Some(form)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +592,44 @@ mod tests {
         // 10.5 px past bucket 1's edge and far from bucket 7: nothing
         assert_eq!(nearest(&counts, 29.5, 100.), None);
         assert_eq!(nearest(&counts, 81., 100.), Some(8));
+    }
+
+    #[test]
+    fn crowded_boot_labels_shorten_or_drop_rather_than_overlap() {
+        let label = |at: f32, right: bool| Placed {
+            at,
+            widths: [50., 20.],
+            right,
+        };
+        // a power loss and the current boot first, then older boots newest first, 25 px apart
+        let labels = [
+            label(100., true),
+            label(200., false),
+            label(175., false),
+            label(150., false),
+            label(125., false),
+            label(20., false),
+        ];
+        let placed = place(&labels, 6.);
+        assert_eq!(placed[0], Some(0), "the power loss keeps its full label");
+        assert_eq!(placed[1], Some(0), "so does the current boot");
+        assert_eq!(placed[2], None, "too close to the current boot even for the short form");
+        assert_eq!(placed[3], Some(1), "room for the short form only");
+        assert_eq!(placed[4], None, "its short form would touch the one before it");
+        assert_eq!(placed[5], Some(1), "the power loss's label reaches back to 50");
+        let spans: Vec<(f32, f32)> = labels
+            .iter()
+            .zip(&placed)
+            .filter_map(|(l, p)| {
+                let w = l.widths[(*p)?];
+                Some(if l.right { (l.at - w, l.at) } else { (l.at, l.at + w) })
+            })
+            .collect();
+        for (i, a) in spans.iter().enumerate() {
+            for b in &spans[i + 1..] {
+                assert!(a.1 + 6. <= b.0 || b.1 + 6. <= a.0, "{a:?} and {b:?} overlap");
+            }
+        }
     }
 
     #[test]
