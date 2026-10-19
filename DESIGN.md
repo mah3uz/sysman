@@ -34,6 +34,7 @@ GPUI app (`sysman`) that shows them live and as history.
 ```
 Cargo.toml                 workspace
 crates/schema              record types (serde), shared by daemon and app
+crates/journal             systemd journal reader, log categories and findings, package history parsers
 crates/sysmand             daemon: config, collectors, scheduler, JSONL, SQLite, socket
 crates/sysman-helper       optional privileged helper: RAPL, /proc I/O, SMART, eBPF network
 crates/sysman              GPUI app (not started)
@@ -148,6 +149,7 @@ proc_rollup_1m (proc_id, t, cpu_avg, cpu_max, rss_avg, rss_max, threads_max, fds
 | `rollup_1m` | 90 days | `rollup_1m_days` |
 | `rollup_15m` | 730 days | `rollup_15m_days` |
 | `proc_rollup_1m`, `procs` | 7 days | `proc_rollup_days` |
+| `events` | 90 days | `events_days` |
 | JSONL | 2 days | `log_days` |
 | `meta` | forever | |
 
@@ -252,6 +254,67 @@ these and nothing else.
   this data shows one line saying so and an "Enable…" button that opens
   Settings.
 
+## Logs and events
+
+### `crates/journal`
+
+Shared by the app's Logs screen and the daemon's event recorder.
+
+- **Reader.** `libsystemd.so.0` is loaded at runtime (`libloading`) with a
+  hand-written table of the `sd_journal_*` functions used, so neither the
+  build nor the app's start needs libsystemd. When it does not load, the
+  reader runs `journalctl -o json` with the same filters (fields can arrive
+  as byte arrays). An `sd_journal` handle is used by one thread at a time,
+  never after a fork. API: open (system + user files), match/OR/AND, seek to
+  head, tail, a time or a cursor, step, read fields (with a data threshold),
+  unique values of a field, follow (`get_fd` + `process`), boots (from
+  `_BOOT_ID` values, each with first and last entry).
+- **Categories** are field rules: Kernel `_TRANSPORT=kernel`; Hardware kernel
+  entries with `_KERNEL_SUBSYSTEM` (usb, pci, drm, nvme, scsi, ata, thermal,
+  hid, …), MCE/EDAC/AER messages, and udev; Services `_SYSTEMD_UNIT`/`UNIT`;
+  Apps `_SYSTEMD_USER_UNIT`/`USER_UNIT` and user-session processes;
+  Scheduled cron identifiers (`crond`, `CROND`, `CRON`, `cron`, `anacron`,
+  `atd`, `crontab`) and units started by a `.timer`; Sign-ins
+  `SYSLOG_FACILITY` 4 or 10 plus logind session messages; Boot & power
+  shutdown, sleep and boot messages; Crashes the coredump `MESSAGE_ID`.
+  An entry may be in several. A missing `PRIORITY` counts as info.
+- **Findings** are rules over entries (APP-DESIGN.md §6.11), each with the
+  entries that make it up. MESSAGE_IDs and text patterns live in one table
+  in the crate, each with a test built from a real entry.
+- **Package history**: `/var/log/pacman.log` (ALPM installed, upgraded,
+  removed, downgraded, reinstalled, grouped into transactions by
+  `transaction started/completed`), `/var/log/dpkg.log*` and
+  `/var/log/apt/history.log*`, rotated `.gz` files included. Each package
+  change becomes an entry in the Packages category.
+- **Access check**: opening `system.journal` under `/var/log/journal/<machine-id>`
+  (or `/run/log/journal`) and getting EACCES means only the user's own entries
+  are visible.
+
+### Events in `sysmand`
+
+An `events` thread follows the journal and writes notable entries to
+`history.db`, so the app can mark them on every chart even for times the app
+was closed.
+
+```sql
+events (t, kind, key, boot_id, summary, data)            PK (t, kind, key)
+```
+
+- `kind`: `crash`, `oom`, `unit_failed`, `restart_loop`, `boot`,
+  `boot_end` (`data.clean` true or false), `suspend`, `resume`, `packages`.
+  `key` makes a re-read idempotent (the journal cursor for journal events,
+  the transaction's start time for packages). `data` holds the fields the app
+  shows (pid, comm, signal, unit, result, package list).
+- The thread starts with the daemon, resumes from the last cursor it wrote
+  (in `meta`), and on first run reads back `retention.events_days`. A boot
+  that ended without shutdown is decided once the next boot's events thread
+  starts. The thread never blocks the scheduler or the JSONL writer; it
+  queues to the SQLite writer like a module, and a failure is listed in
+  `errors` as `events`.
+- Retention: `retention.events_days`, default 90.
+- Without journal access the thread records only what the user's journal
+  holds, and says so once in `errors`.
+
 ## Record format (schema 3)
 
 Every record has `type` (`meta` or `sample`), `schema`, `t` (Unix seconds) and
@@ -287,6 +350,7 @@ raw_hours = 48
 rollup_1m_days = 90
 rollup_15m_days = 730
 proc_rollup_days = 7
+events_days = 90
 
 [modules.<name>]      # every module: enabled, interval; plus its own options
 ```
@@ -303,5 +367,5 @@ daemon at startup with a message naming them.
 
 ## Not in scope yet
 
-Clean-shutdown marker, Docker container names, ARM CPUs, systemd service and
+Docker container names, ARM CPUs, systemd service and
 mdraid collectors.

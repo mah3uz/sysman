@@ -51,13 +51,13 @@ crates/sysman/src/
   title bar still drags floating windows and shows no shadow or inset when tiled.
 - Settings opens as a modal dialog over the window (collector and helper
   services, refresh interval), never as a tab.
-- Side panes (Explorer, Hardware, Groups, Disk Map rail, the process inspector)
+- Side panes (Explorer, Hardware, Groups, Logs, Disk Map rail, the process inspector)
   are resizable by dragging their edge and collapsible; widths and collapsed
   state are remembered.
 - Tabs and Lucide icons: Dashboard `gauge`, Processes `list`, GPU `monitor`,
   Energy `zap`, Network `network`, Disk `hard-drive`, Hardware `cpu`, Explorer
-  `activity`, Insights `lightbulb`, Groups `layers`. Disk Map is a sub-tab of
-  Disk.
+  `activity`, Insights `lightbulb`, Logs `file-text`, Groups `layers`. Disk Map
+  is a sub-tab of Disk.
 - When the window is narrower than the strip, labels collapse to icons with
   tooltips.
 - Default 1280×720, minimum 860×520.
@@ -232,6 +232,88 @@ CPU over time from `proc_points`. Suggested groups from systemd cgroups
 (app-*.scope, services) shown as one-click presets. Stored in
 `$XDG_CONFIG_HOME/sysman/groups.toml`.
 
+### 6.11 Logs
+One place to read, filter and diagnose what the system logged: the systemd
+journal (kernel, hardware, services, apps, scheduled jobs, sign-ins, boot and
+power, crashes) and the package manager's history, on one timeline, next to
+what sysman recorded at the same moment. Reading and the index live in
+`crates/journal` (DESIGN.md, "Logs and events"); the screen is
+`screens/logs/`, its index `data/logs.rs`.
+
+**Layout** (left to right): sources sidebar, main column, inspector.
+
+- *Sources sidebar* (resizable, collapsible): categories with entry counts for
+  the current scope (All, Kernel, Hardware, Services, Apps, Scheduled,
+  Sign-ins & privileges, Boot & power, Crashes, Packages); a **boot timeline**
+  (current boot on top; each boot with start → end, duration, suspended spans,
+  "Clean shutdown" or "Ended without shutdown" in red, a one-line tally of
+  crashes, failed units and OOM kills; the off time between boots drawn as a
+  gap, "Power lost · off for 93 s"); saved filters (a name plus a query
+  string, stored in `ui.toml`).
+- *Main column*, top to bottom:
+  1. Toolbar: search field (free text plus tokens, below), priority
+     segmented control (All, Notice+, Warning+, Errors), range picker
+     (5 min … 7 day, "This boot", or the boot picked in the sidebar), Follow
+     toggle (live tail, on only when the scope reaches now).
+  2. **Worth a look**: one row of finding cards for the scope (below), most
+     severe first, at most two rows; each card is a title, one line of
+     evidence and a count. Clicking one narrows the list to its entries,
+     grouped under the finding, with "what sysman recorded" charts above the
+     group. Collapsible; remembered.
+  3. **Timeline strip**: entries per bucket stacked by priority, the same
+     buckets as the list's scope; drag across it to narrow the range,
+     double-click to clear. Its expand arrow opens the **lanes view** in
+     place: one lane per category with event marks, CPU use and CPU
+     temperature from history drawn behind the lanes, boot starts and ends as
+     rules (power losses in red). Marks are at least 3 px wide and the
+     nearest mark within 6 px is the one hovered.
+  4. **Log list**: virtualised, one dense row per entry (time, priority mark,
+     source, message in monospace, ellipsised). Identical consecutive
+     messages from the same source fold into one row with a "×N" pill. A
+     boot boundary is a full-width divider row; a boot that ended without
+     shutdown says so on its divider in red.
+- *Inspector* (resizable, collapsible, shown only for a selection, like the
+  process inspector): priority, source and time; the full message
+  (multi-line, selectable); the finding the entry belongs to, if any;
+  **What sysman recorded** — CPU, memory and CPU temperature around the entry
+  from history (±10 min, the entry's time as a rule), plus the process's own
+  memory history when the entry names a pid sysman recorded (crashes, OOM
+  victims); "Open in Explorer at HH:MM"; **Around this entry** — the 6 entries
+  before and after it with no filter applied; every journal field as a
+  key/value list. Actions: Copy (entry as text), Copy fields (JSON), Show
+  backtrace (crashes: the stack trace from the coredump's MESSAGE, else
+  `coredumpctl info <pid>` output, in a sheet), Restart unit (failed units,
+  through the same systemctl runner Settings uses, confirmed first).
+
+**Query tokens** (also what saved filters store): `unit:`, `prio:` (a level
+name or number, meaning that level and more severe), `boot:` (`0`, `-1`, …),
+`source:` (syslog identifier), `cat:` (a category key), `pid:`, `since:` /
+`until:` (`1h`, `2026-10-15 20:00`), free text matched case-insensitively
+against the message. Tokens AND together; a token's repeated values OR.
+
+**Findings** (rules in `crates/journal`, not guesses): crash (coredump entry;
+"Second Hyprland crash this boot" when repeated), OOM kill (kernel or
+systemd-oomd), failed unit, restart loop (≥3 restarts of a unit within
+5 min), boot ended without shutdown (no shutdown message and no
+journal-stopped entry in that boot; evidence: the last readings from the
+JSONL crash log), thermal throttling (kernel throttle lines, counted),
+hardware errors (MCE, PCIe AER, I/O errors, USB disconnect storms), repeated
+failed sign-ins, package changes (a transaction's upgraded packages; flagged
+when a finding follows within the same boot).
+
+**Scale.** A scan builds a compact index of the scope (time, priority,
+category bits, interned source; about 16 bytes an entry) on the background
+executor, showing progress; filters, counts and the strip are computed from
+the index, messages are read only for visible rows (by seeking), and free-text
+search streams matches as it scans. The default scope is This boot (about
+100 k entries here); 7 days is about 1 M. A new scope cancels the running
+scan.
+
+**Access.** Without read access to the system journal (not in
+`systemd-journal`, `adm` or, on Arch, `wheel`), a banner says only this user's
+entries are shown and gives `sudo usermod -aG systemd-journal $USER`. Without
+libsystemd the page falls back to `journalctl`; without either, it says so.
+
 ## 7. Memory pressure index
 
 Index (0–100) from PSI `pressure.memory.some.avg10`, piecewise linear:
@@ -253,5 +335,11 @@ Each milestone ends with the screen running against the real daemon and
 checked by screenshot.
 
 ## 9. Collector changes the app needs
+
+- Events (DESIGN.md, "Logs and events"): Dashboard and Explorer charts mark
+  crashes, OOM kills, failed units, boot starts and ends, and package
+  changes from the `events` table — a thin rule with a small glyph at the
+  top, a tooltip with the event's summary, and a click that opens Logs at
+  that time.
 
 - `power`: add `energy_full_design` / `charge_full_design` (battery health).
