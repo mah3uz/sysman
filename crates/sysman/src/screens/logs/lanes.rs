@@ -258,9 +258,14 @@ impl Logs {
             })
             .collect();
         let chosen = place(&measured, margin * 1.5);
+        if width <= 0. {
+            // the strip's width is known only once it has painted
+            window.request_animation_frame();
+        }
         let flags: Vec<_> = flags
             .into_iter()
             .zip(chosen)
+            .filter(|_| width > 0.)
             .filter_map(|((f, [full, short], colour, right, _), c)| {
                 c.map(|c| (f, if c == 0 { full } else { short }, colour, right))
             })

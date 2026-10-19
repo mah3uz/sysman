@@ -12,7 +12,7 @@ use gpui_component::Icon;
 use super::findings::kind_icon;
 use super::list::{mono, priority_colour, priority_label, priority_mark};
 use super::toolbar::severity_colour;
-use super::{Inspected, Logs, model};
+use super::{Inspected, Logs, actions, model};
 use crate::ui::theme::{Theme, rem_px, theme};
 
 const KEY_WIDTH: f32 = 140.;
@@ -33,6 +33,16 @@ pub(super) fn full_message(i: &Inspected) -> String {
         (Some(e), _) => model::plain(e.message().trim()),
         (None, Some(err)) => format!("Could not read this entry: {err}"),
         (None, None) => "This entry is no longer in the journal.".into(),
+    }
+}
+
+/// What the inspector's message field holds: a crash shows only its first line, its trace being a click away, so what
+/// sysman recorded stays in view.
+pub(super) fn shown_message(i: &Inspected) -> String {
+    let text = full_message(i);
+    match i.entry.as_deref() {
+        Some(e) if actions::is_crash(e) => text.lines().next().unwrap_or_default().to_string(),
+        _ => text,
     }
 }
 
@@ -116,6 +126,9 @@ impl Logs {
                 .child(div().w(rem_px(180.)).h(rem_px(10.)).rounded(rem_px(4.)).bg(t.card))
                 .into_any_element(),
         };
+        let actions = inspected
+            .filter(|_| self.message.is_some())
+            .map(|i| self.actions(i, cx).into_any_element());
         let finding = inspected.and_then(|i| self.member_card(i, cx));
         let recorded = self.recorded_section(cx);
         let around = inspected
@@ -128,7 +141,15 @@ impl Logs {
         frame
             .child(
                 body.children(finding)
-                    .child(div().flex().flex_col().gap(rem_px(8.)).child(header).child(message))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(rem_px(8.))
+                            .child(header)
+                            .child(message)
+                            .children(actions),
+                    )
                     .children(recorded)
                     .children(around)
                     .children(fields),

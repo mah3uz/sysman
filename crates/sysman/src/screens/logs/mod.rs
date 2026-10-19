@@ -1,3 +1,4 @@
+mod actions;
 mod findings;
 mod inspector;
 mod lanes;
@@ -112,6 +113,8 @@ struct Dev {
     finding: Option<usize>,
     own_only: bool,
     hover: Option<usize>,
+    /// `backtrace` opens the selected crash's sheet; `restart` shows the restart confirmation, never running it.
+    action: Option<String>,
 }
 
 /// A row to select once the scan reaches it, asked for by another screen.
@@ -174,6 +177,9 @@ pub struct Logs {
     finding_rec: Option<Recorded>,
     lanes_rec: Option<Recorded>,
     pending: Option<Pending>,
+    /// The copy button showing its feedback, by row.
+    copied: Option<(u32, &'static str)>,
+    restart: Option<(u32, actions::Restart)>,
     tz: TimeZone,
     #[cfg(debug_assertions)]
     dev: Dev,
@@ -261,6 +267,8 @@ impl Logs {
             finding_rec: None,
             lanes_rec: None,
             pending: None,
+            copied: None,
+            restart: None,
             tz: TimeZone::system(),
             #[cfg(debug_assertions)]
             dev: Dev::default(),
@@ -278,7 +286,7 @@ impl Logs {
     /// Screenshot aids: `SYSMAN_DEV_LOGS_QUERY` (search text), `_RANGE` (`5min` … `7day`), `_BOOT` (`-1`, …),
     /// `_FINDING` (the nth card, once the scan ends), `_SELECT` (`error`, or rows back from the newest),
     /// `_ACCESS=own` (the own-entries banner), `_AT` (open at the entry this many seconds ago) and `_HOVER` (hover the
-    /// busiest mark of this lane).
+    /// busiest mark of this lane) and `_ACTION` (see [`Dev::action`]).
     #[cfg(debug_assertions)]
     fn dev_setup(&mut self, cx: &mut Context<Self>) {
         use crate::ui::widgets::range::Range;
@@ -312,6 +320,7 @@ impl Logs {
         self.dev.finding = var("FINDING").and_then(|f| f.parse().ok());
         self.dev.own_only = var("ACCESS").as_deref() == Some("own");
         self.dev.hover = var("HOVER").and_then(|l| l.parse().ok());
+        self.dev.action = var("ACTION");
         if let Some(ago) = var("AT").and_then(|s| s.parse::<u64>().ok()) {
             self.open_at(now_us().saturating_sub(ago * 1_000_000), cx);
         }
@@ -360,6 +369,22 @@ impl Logs {
         }
     }
 
+    #[cfg(debug_assertions)]
+    fn dev_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(i) = self.inspected.as_ref().filter(|i| Some(i.row) == self.selected) else {
+            return;
+        };
+        match self.dev.action.take().as_deref() {
+            Some("backtrace") => {
+                if let Some(e) = i.entry.as_deref().filter(|e| actions::is_crash(e)) {
+                    actions::open_backtrace(e, window, cx);
+                }
+            }
+            Some("restart") => self.restart = Some((i.row, actions::Restart::Confirm)),
+            _ => {}
+        }
+    }
+
     fn ensure_widgets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.input.is_none() {
             let text = self.text.clone();
@@ -403,7 +428,7 @@ impl Logs {
             && let Some(message) = &self.message
         {
             self.message_row = shown;
-            let text = self.inspected.as_ref().map(inspector::full_message).unwrap_or_default();
+            let text = self.inspected.as_ref().map(inspector::shown_message).unwrap_or_default();
             message.update(cx, |s, cx| s.set_value(text, window, cx));
         }
     }
@@ -734,6 +759,7 @@ impl Logs {
         }
         self.selected = row;
         self.inspected = None;
+        self.restart = None;
         self.entry_rec = None;
         if row.is_some() {
             self.stick = false;
@@ -1070,6 +1096,8 @@ fn read_entry(scan: Arc<Scan>, fetcher: &Mutex<Option<Fetcher>>, row: u32) -> In
 impl Render for Logs {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_widgets(window, cx);
+        #[cfg(debug_assertions)]
+        self.dev_action(window, cx);
         let toolbar = self.toolbar(cx).into_any_element();
         let banner = self.banner(cx);
         let sources = sidebar::showing(&self.left, cx).then(|| self.sources(cx).into_any_element());
