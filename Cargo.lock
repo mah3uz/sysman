@@ -7014,6 +7014,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sysman-journal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "jiff",
+ "tempfile",
+]
+
+[[package]]
 name = "sysman-schema"
 version = "0.1.0"
 dependencies = [

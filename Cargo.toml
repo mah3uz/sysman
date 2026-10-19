@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/config", "crates/schema", "crates/sysman", "crates/sysman-helper", "crates/sysmand"]
+members = ["crates/config", "crates/journal", "crates/schema", "crates/sysman", "crates/sysman-helper", "crates/sysmand"]
 
 [workspace.package]
 edition = "2024"
@@ -11,8 +11,10 @@ license = "MIT"
 [workspace.dependencies]
 schema = { path = "crates/schema", package = "sysman-schema" }
 sysman-config = { path = "crates/config" }
+journal = { path = "crates/journal", package = "sysman-journal" }
 anyhow = "1"
 jiff = "0.2"
+flate2 = "1"
 # gpui-component pins gpui-pre exactly; any other version here would put two gpui copies in the graph.
 gpui = { package = "gpui-pre", version = "=0.3.7" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit", "wayland", "x11", "runtime_shaders"] }
