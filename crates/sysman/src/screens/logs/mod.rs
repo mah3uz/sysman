@@ -143,6 +143,8 @@ pub struct Logs {
     scan: Arc<Scan>,
     search: Option<Arc<Search>>,
     next: Option<Next>,
+    /// Until the first scan has been read, which is shown whole and at its newest entries.
+    first: bool,
     /// The replaced scan's cards, kept until the scan on screen has its own.
     held: Option<Vec<Card>>,
     /// The latest scan started, which [`Logs::next`] holds until it is on screen.
@@ -249,6 +251,7 @@ impl Logs {
             scan,
             search: None,
             next: None,
+            first: true,
             held: None,
             scan_gen: 0,
             query_gen: 0,
@@ -747,14 +750,15 @@ impl Logs {
     /// The newer scan's view replaces the older one when it is complete, or once it has read for a while and
     /// has rows enough to fill the list, including the selected entry.
     fn ready(&self, view: &View, next: &Next) -> bool {
-        if view.key.settled || self.view.items.is_empty() {
+        if view.key.settled || self.view.items.is_empty() || self.first {
             return true;
         }
         if next.since.elapsed() < SWAP {
             return false;
         }
         let height = f32::from(self.list.0.borrow().base_handle.bounds().size.height);
-        let rows = (height / list::ROW).ceil() as usize;
+        // twice over, so the list can scroll and is not taken for scrolled to its end, which would follow
+        let rows = 2 * (height / list::ROW).ceil() as usize;
         view.items.len() >= rows && self.selected.is_none_or(|r| carry(&self.scan, &next.scan, r).is_some())
     }
 
@@ -927,6 +931,7 @@ impl Logs {
         let at_end = self.list.is_scrolled_to_end().unwrap_or(true);
         let fresh_query = view.key.query != self.view.key.query;
         self.view = view;
+        self.first &= !self.view.key.settled;
         if self.view.scanned {
             self.held = None;
             if self.controls.finding.is_some() && self.shown_card().is_none() {

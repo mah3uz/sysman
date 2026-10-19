@@ -104,8 +104,8 @@ impl Logs {
             );
         }
         let items = self.view.items.clone();
-        if items.is_empty() {
-            if !self.view.key.settled {
+        if items.is_empty() || self.first {
+            if !self.view.key.settled || self.first {
                 return div()
                     .flex_1()
                     .min_h_0()
