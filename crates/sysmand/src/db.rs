@@ -4,7 +4,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use schema::db::SCHEMA;
 use schema::processes::Process;
 use serde::Deserialize;
@@ -13,7 +13,7 @@ use serde_json::Value;
 use schema::series::{escape, flatten};
 
 use crate::config::Retention;
-use crate::events::Event;
+use crate::events::{Event, crash_summary};
 
 const ENVELOPE: [&str; 5] = ["type", "schema", "t", "time", "errors"];
 
@@ -138,6 +138,13 @@ impl Db {
     pub fn open(path: &Path, retention: Retention, snapshot_modules: HashSet<String>) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        // it holds what other users' programs and units did; SQLite gives -wal and -shm the database's mode
+        owner_only(path, true).with_context(|| format!("restricting {}", path.display()))?;
+        for suffix in ["-wal", "-shm"] {
+            let mut side = path.as_os_str().to_owned();
+            side.push(suffix);
+            owner_only(Path::new(&side), false)?;
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         // crash evidence lives in the fsync'd JSONL; the database may lose its last commits on power loss
@@ -294,7 +301,11 @@ fn write_events(tx: &Transaction, t: i64, record: &Value) -> Result<()> {
            boot_id = excluded.boot_id, summary = excluded.summary, data = excluded.data",
     )?;
     for e in Vec::<Event>::deserialize(&record["events"])? {
-        insert.execute(params![e.t, e.kind, e.key, e.boot_id, e.summary, e.data.to_string()])?;
+        if e.kind == "crash" {
+            fold_crash(tx, &e)?;
+        } else {
+            insert.execute(params![e.t, e.kind, e.key, e.boot_id, e.summary, e.data.to_string()])?;
+        }
     }
     if let Some(state) = record.get("state").and_then(Value::as_object) {
         for (name, value) in state {
@@ -311,6 +322,55 @@ fn write_events(tx: &Transaction, t: i64, record: &Value) -> Result<()> {
 }
 
 /// `table` feeds the process history; left in, every snapshot row would carry the whole process list.
+/// A program's crashes in one boot share a row, so a crash loop is one row whose `count` grows. A crash no later than
+/// the newest one counted was read before (a resume from earlier) and is not counted again.
+fn fold_crash(tx: &Transaction, e: &Event) -> Result<()> {
+    let row: Option<(i64, String)> = tx
+        .prepare_cached("SELECT t, data FROM events WHERE kind = 'crash' AND key = ?1 AND boot_id IS ?2")?
+        .query_row(params![e.key, e.boot_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((t, old)) = row else {
+        tx.prepare_cached("INSERT INTO events (t, kind, key, boot_id, summary, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?
+            .execute(params![e.t, e.kind, e.key, e.boot_id, e.summary, e.data.to_string()])?;
+        return Ok(());
+    };
+    let old: Value = serde_json::from_str(&old).unwrap_or_default();
+    let seen = old["last_us"].as_u64().unwrap_or(0);
+    if e.data["last_us"].as_u64().is_none_or(|us| us <= seen) {
+        return Ok(());
+    }
+    let count = old["count"].as_u64().unwrap_or(1) + 1;
+    let mut data = e.data.clone();
+    data["count"] = count.into();
+    let signal = data["signal"].as_str().unwrap_or("unknown signal");
+    let summary = crash_summary(&e.key, signal, count);
+    tx.prepare_cached(
+        "UPDATE events SET summary = ?1, data = ?2 WHERE t = ?3 AND kind = 'crash' AND key = ?4 AND boot_id IS ?5",
+    )?
+    .execute(params![summary, data.to_string(), t, e.key, e.boot_id])?;
+    Ok(())
+}
+
+/// Creates `path` (when `create`) or narrows an existing one to mode 0600.
+fn owner_only(path: &Path, create: bool) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if create {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+    }
+    match std::fs::metadata(path) {
+        Ok(m) if m.permissions().mode() & 0o077 != 0 => {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    Ok(())
+}
+
 fn snapshot_json(module: &str, value: &Value) -> String {
     match value.as_object() {
         Some(fields) if module == "processes" && fields.contains_key("table") => {
@@ -614,6 +674,36 @@ mod tests {
     fn open(dir: &tempfile::TempDir) -> Db {
         let snapshots = HashSet::from(["processes".to_string()]);
         Db::open(&dir.path().join("h.db"), Retention::default(), snapshots).unwrap()
+    }
+
+    #[test]
+    fn the_database_and_its_wal_are_readable_by_the_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = |suffix: &str| dir.path().join(format!("h.db{suffix}"));
+        let mode = |suffix: &str| std::fs::metadata(path(suffix)).unwrap().permissions().mode() & 0o777;
+        let mut db = open(&dir);
+        db.write(&sample(60, 40.0)).unwrap();
+        assert_eq!(
+            [mode(""), mode("-wal"), mode("-shm")],
+            [0o600; 3],
+            "it names other users' crashing programs, failed units and package commands"
+        );
+        drop(db);
+
+        // as an older daemon, killed while running, left them
+        for suffix in ["", "-wal", "-shm"] {
+            if !path(suffix).exists() {
+                std::fs::write(path(suffix), "").unwrap();
+            }
+            std::fs::set_permissions(path(suffix), std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let _db = open(&dir);
+        assert_eq!(
+            [mode(""), mode("-wal"), mode("-shm")],
+            [0o600; 3],
+            "world-readable files are narrowed on open"
+        );
     }
 
     fn sample(t: i64, temp: f64) -> Value {

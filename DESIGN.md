@@ -304,25 +304,39 @@ events_state (name PRIMARY KEY, value)
 ```
 
 - `kind`: `crash`, `oom`, `unit_failed`, `restart_loop`, `boot`,
-  `boot_end` (`data.clean` true or false), `suspend`, `resume`, `packages`.
+  `boot_end`, `suspend`, `resume`, `packages`. `boot_end` data: `clean`
+  (true only for a clean end), `certainty` (`clean`, `confirmed`,
+  `ended_while_suspended`, `unconfirmed`), `reset_reason` (the next boot's
+  AMD reset reason, named, or null) and `suspended`. A boot whose start was
+  vacuumed is unknown and gets no `boot_end`, as with no journal access.
   `key` makes a re-read idempotent: the cursor of the event's first journal
-  entry, the boot id for `boot` and `boot_end`, the transaction's start (µs)
-  for packages. `t` is that first entry's time (a boot's last entry for
+  entry, the comm for `crash`, the boot id for `boot` and `boot_end`, the
+  transaction's start (µs) for packages. `t` is that first entry's time (a boot's last entry for
   `boot_end`). `data` holds the fields the app shows (pid, comm, signal,
   unit, result, count, n_restarts, command and changes); `boot_id` is null
   for packages.
 - A row is written as soon as its rule fires and updated in place as it
-  grows: a unit's failures fold per boot (`data.count`), a restart loop
+  grows: a program's crashes fold per boot (`data.count`, counting only
+  crashes newer than `data.last_us`, so a re-read adds nothing), a unit's
+  failures fold per boot (`data.count`), a restart loop
   counts its restarts, an OOM kill merges the lines within 5 s, a package
   transaction still running gains changes.
 - The thread reads `MESSAGE_ID`s for crashes, OOM, failures, restarts and
-  sleep plus kernel lines of priority 0-3, with only the fields the rules
-  use. It starts with the daemon and resumes from `events_state`: from the
+  sleep plus kernel lines of priority 0-6 (Xid, GPU hangs and segfaults are
+  warning to info), with only the fields the rules use. Unit failures,
+  restarts and unit OOM kills count only from PID 1 or the daemon's own
+  user manager, and sleep only from root, judged by journald's `_PID` and
+  `_UID`. It starts with the daemon and resumes from `events_state`: from the
   earliest entry a still-open rule depends on (so a restart loop is neither
   split nor counted twice across a restart), else just after the last cursor
   read; on first run from `retention.events_days` back. Boots come from the
   journal's boot list; a boot's `boot_end` is decided once a later boot
-  runs, clean when that boot logged a shutdown or the journal stopping.
+  runs, from filtered reads: its logind shutdown or PID 1 stopping
+  `multi-user.target` within its last 30 minutes and after its last resume
+  (or journald stopping in its last minute) is clean; otherwise the next
+  boot's journald "uncleanly shut down" line
+  or a non-orderly reset reason confirms the abrupt end. A failure reading
+  boots is listed in `errors` and the rest of the thread runs on.
   Package logs are re-read when one's mtime changes, checked every 60 s.
 - Catching up uses a handle on every journal file; once caught up it
   follows on one opened on just the files written since shortly before the
@@ -336,6 +350,9 @@ events_state (name PRIMARY KEY, value)
   record's events and resume point commit in one transaction. A failure is
   listed in `errors` as `events` and retried with backoff up to 5 minutes.
 - Retention: `retention.events_days`, default 90.
+- `history.db` (with `-wal` and `-shm`) is mode 0600 and the log directory
+  0700, narrowed on start if an older daemon left them readable: they name
+  other users' programs, units and package commands.
 - Without journal access the thread records only what the user's journal
   holds, and says so once in `errors`.
 
