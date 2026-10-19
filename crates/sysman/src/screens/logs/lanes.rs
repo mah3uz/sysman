@@ -222,7 +222,13 @@ impl Logs {
                 } else {
                     full.trim_start_matches("Boot ").to_string()
                 };
-                flags.push((frac(boot.first_us), [full, short], t.green, false, u8::from(!boot.current)));
+                flags.push((
+                    frac(boot.first_us),
+                    [full, short],
+                    t.green,
+                    false,
+                    u8::from(!boot.current),
+                ));
             }
             if inside(boot.last_us) && !boot.current && boot.end != BootEnd::Running {
                 let lost = boot.end == BootEnd::Abrupt;
@@ -231,8 +237,11 @@ impl Logs {
                     if lost { t.red } else { t.text_tertiary.opacity(0.6) },
                 ));
                 if lost {
-                    let label = format!("Power lost {}", model::clock(boot.last_us, "%H:%M:%S", &self.tz));
-                    flags.push((frac(boot.last_us), [label, "Power lost".into()], t.red, true, 0));
+                    let label = format!(
+                        "Ended without shutdown {}",
+                        model::clock(boot.last_us, "%H:%M:%S", &self.tz)
+                    );
+                    flags.push((frac(boot.last_us), [label, "No shutdown".into()], t.red, true, 0));
                 }
             }
         }
@@ -248,7 +257,12 @@ impl Logs {
             .map(|(f, texts, _, right, _)| {
                 let w = texts.clone().map(|text| {
                     let run = style.to_run(text.len());
-                    f32::from(window.text_system().shape_line(text.into(), t.small_caption, &[run], None).width)
+                    f32::from(
+                        window
+                            .text_system()
+                            .shape_line(text.into(), t.small_caption, &[run], None)
+                            .width,
+                    )
                 });
                 Placed {
                     at: f * width,

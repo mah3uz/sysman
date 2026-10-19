@@ -9,7 +9,7 @@ use journal::Entry;
 use journal::categories::{Categories, Category, INDEX_FIELDS, categorize, source};
 use journal::findings::{Detector, FindingKind};
 use journal::packages::{self, Manager, Transaction};
-use journal::reader::{Backend, Boot, Change, Fields, Filter, Journal, Seek};
+use journal::reader::{Access, Backend, Boot, Change, Fields, Filter, Journal, Seek};
 
 use super::index::{Batch, Coverage, Index, Row};
 use super::query::{Query, SearchSpec};
@@ -17,8 +17,9 @@ use super::query::{Query, SearchSpec};
 const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 const CHECK_EVERY: u64 = 512;
 const FOLLOW_WAIT: Duration = Duration::from_millis(250);
-/// Following stops once the index holds this many rows, so a journal left open for days cannot grow without bound.
-pub const FOLLOW_ROW_CAP: usize = 2_000_000;
+/// The index keeps at most this many rows: the first pass keeps the newest, and following stops on reaching it, so
+/// a huge journal or one followed for days cannot grow memory without bound.
+pub const ROW_CAP: usize = 2_000_000;
 const FIELD_LIMIT: usize = 2048;
 const HASH_BYTES: usize = 1024;
 const LOCATE_WINDOW: usize = 64;
@@ -134,6 +135,14 @@ impl Scope {
     }
 }
 
+fn row_cap() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(n) = std::env::var("SYSMAN_DEV_LOGS_CAP").ok().and_then(|n| n.parse().ok()) {
+        return n;
+    }
+    ROW_CAP
+}
+
 pub fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -169,7 +178,7 @@ pub enum ScanState {
     /// The scope is open-ended and the initial scan is over: new entries are appended as they arrive unless
     /// [`Scan::set_follow`] turned that off. The index is complete up to the last batch published.
     Following,
-    /// Following stopped because the index reached [`FOLLOW_ROW_CAP`] rows; what is there stays usable.
+    /// Following stopped because the index reached [`Scan::row_cap`] rows; what is there stays usable.
     FollowCapped,
     Done,
     Cancelled,
@@ -329,6 +338,7 @@ pub struct Scan {
     follow: AtomicBool,
     started: Instant,
     elapsed_ms: AtomicU64,
+    cap: usize,
 }
 
 impl Scan {
@@ -345,6 +355,7 @@ impl Scan {
             follow: AtomicBool::new(true),
             started: Instant::now(),
             elapsed_ms: AtomicU64::new(0),
+            cap: row_cap(),
         });
         let worker = scan.clone();
         let spawned = thread::Builder::new().name("logs-scan".into()).spawn(move || {
@@ -417,6 +428,11 @@ impl Scan {
         self.follow.store(on, Ordering::Relaxed);
     }
 
+    /// The most rows the index keeps; [`ROW_CAP`] unless `SYSMAN_DEV_LOGS_CAP` lowers it.
+    pub fn row_cap(&self) -> usize {
+        self.cap
+    }
+
     pub fn follow(&self) -> bool {
         self.follow.load(Ordering::Relaxed)
     }
@@ -462,7 +478,7 @@ impl Scan {
             self.at_us.fetch_max(resume.t_us, Ordering::Relaxed);
             self.publish(&mut b);
             last = Instant::now();
-            if self.index().len() >= FOLLOW_ROW_CAP {
+            if self.index().len() >= self.cap {
                 return Ok(ScanState::FollowCapped);
             }
         }
@@ -496,11 +512,14 @@ impl Scan {
     fn run(&self) -> Result<ScanState> {
         let (mut j, boots, seek) = self.open()?;
         let current = current_boot_id();
-        let (pkg_from, pkg_to, coverage) = self.bounds(&boots, &current);
-        self.index
-            .write()
-            .unwrap()
-            .begin(boots.clone(), current.clone(), coverage);
+        let own_only = super::access() == Access::OwnOnly;
+        let (pkg_from, pkg_to, mut coverage) = self.bounds(&boots, &current);
+        coverage.own_only = own_only;
+        {
+            let mut index = self.index.write().unwrap();
+            index.begin(boots.clone(), current.clone(), coverage);
+            index.set_cap(Some(self.cap));
+        }
         let mut packages = if self.scope.narrow.is_empty() {
             let mut t = packages::read_history(pkg_from).unwrap_or_default();
             t.retain(|t| t.start_us >= pkg_from && t.start_us <= pkg_to);
@@ -546,7 +565,22 @@ impl Scan {
             b.add_package(t, &boots);
         }
         self.publish(&mut b);
+        let dropped = {
+            let mut index = self.index.write().unwrap();
+            index.set_cap(None);
+            index.dropped()
+        };
         let mut findings = detector.finish(Some(&current));
+        if dropped > 0 {
+            findings.retain_mut(|f| {
+                f.entries.retain(|&i| i >= dropped);
+                f.entries.iter_mut().for_each(|i| *i -= dropped);
+                !f.entries.is_empty()
+            });
+        }
+        if own_only {
+            findings.retain(|f| f.kind != FindingKind::BootWithoutShutdown);
+        }
         if let Some(to) = to {
             findings.retain(|f| {
                 f.kind != FindingKind::BootWithoutShutdown
@@ -580,6 +614,7 @@ impl Scan {
                 from_us,
                 to_us,
                 unfiltered,
+                own_only: false,
             },
         )
     }
@@ -673,7 +708,11 @@ impl Search {
 
     fn run(&self, scan: &Scan, spec: &SearchSpec) -> Result<()> {
         let (mut j, _, seek) = scan.open()?;
-        j.seek(seek)?;
+        let mut base = scan.index().dropped();
+        match scan.index().rows().first() {
+            Some(r) if base > 0 => j.seek(Seek::Realtime(r.t_us))?,
+            _ => j.seek(seek)?,
+        }
         let to = scan.upper_bound();
         let mut fields: Vec<&str> = SOURCE_FIELDS.to_vec();
         if !spec.pids.is_empty() {
@@ -688,6 +727,16 @@ impl Search {
                 break;
             }
             let hash = entry_hash(&e);
+            let dropped = scan.index().dropped();
+            if dropped > base {
+                let shift = dropped - base;
+                at = at.saturating_sub(shift);
+                for hits in [&mut pending, &mut *self.hits.write().unwrap()] {
+                    hits.retain(|&i| i as usize >= shift);
+                    hits.iter_mut().for_each(|i| *i -= shift as u32);
+                }
+                base = dropped;
+            }
             let row = loop {
                 let finished = !scan.state().is_running();
                 let found = locate(scan.index().rows(), at, e.t_us, hash);

@@ -135,13 +135,17 @@ pub fn boot_label(i: usize, boots: &[BootSummary]) -> String {
     }
 }
 
-/// The time between one boot's last entry and the next one's first.
+/// The time between one boot's last entry and the next one's first. After an end without shutdown the machine may
+/// have hung with the power on, so that gap is not called time off.
 pub fn off_time(older: &BootSummary, newer: &BootSummary) -> String {
-    let gap = span(newer.first_us.saturating_sub(older.last_us));
     match older.end {
-        BootEnd::Abrupt => format!("Power lost · off for {gap}"),
-        _ => format!("Off for {gap}"),
+        BootEnd::Abrupt => format!("Ended without shutdown · {}", next_boot(older, newer)),
+        _ => format!("Off for {}", span(newer.first_us.saturating_sub(older.last_us))),
     }
+}
+
+pub fn next_boot(older: &BootSummary, newer: &BootSummary) -> String {
+    format!("next boot {} later", span(newer.first_us.saturating_sub(older.last_us)))
 }
 
 /// A duration in microseconds, in seconds while under two minutes.
@@ -150,7 +154,7 @@ pub fn span(us: u64) -> String {
     if s < 120 { format!("{s} s") } else { format::duration(s) }
 }
 
-/// A lost boot can explain everything after it, so it leads; the nagging kinds come last.
+/// A boot that ended without shutdown can explain everything after it, so it leads; the nagging kinds come last.
 fn rank(kind: FindingKind) -> u8 {
     match kind {
         FindingKind::BootWithoutShutdown => 0,
@@ -186,12 +190,40 @@ fn subject(f: &Finding) -> Option<String> {
     }
 }
 
+/// A unit's failure with result `core-dump` this close to a crash of its process is that same crash.
+const CRASH_FAILURE_US: u64 = 10_000_000;
+
+/// A crash in a user service names only the user manager as its unit, so there the program's name must appear in
+/// the failed unit's.
+fn same_crash(failed: &Finding, crash: &Finding) -> bool {
+    let get = |f: &Finding, k: &str| f.data.get(k).filter(|v| !v.is_empty()).map(|v| v.to_lowercase());
+    let (Some(unit), Some(crashed_in)) = (get(failed, "unit"), get(crash, "unit")) else {
+        return false;
+    };
+    let ours = unit == crashed_in
+        || (crashed_in.starts_with("user@") && get(crash, "comm").is_some_and(|c| unit.contains(&c)));
+    failed.kind == FindingKind::FailedUnit
+        && crash.kind == FindingKind::Crash
+        && failed.count <= 1
+        && failed.data.get("result").map(String::as_str) == Some("core-dump")
+        && failed.boot_id == crash.boot_id
+        && ours
+        && failed.first_us.abs_diff(crash.first_us) <= CRASH_FAILURE_US
+}
+
 /// The cards: [`ordered`] findings with the same kind and [`subject`] folded into the first of them, each
-/// card's members newest first.
+/// card's members newest first. A unit failure that is a crash's own goes into that crash's card.
 pub fn grouped(findings: &[Finding]) -> Vec<Vec<usize>> {
     let mut out: Vec<Vec<usize>> = vec![];
     let mut by_subject: HashMap<(FindingKind, String), usize> = HashMap::new();
     for i in ordered(findings) {
+        if let Some(card) = out
+            .iter_mut()
+            .find(|c| c.iter().any(|&m| same_crash(&findings[i], &findings[m])))
+        {
+            card.push(i);
+            continue;
+        }
         match subject(&findings[i]) {
             Some(s) => match by_subject.entry((findings[i].kind, s)) {
                 Entry::Occupied(e) => out[*e.get()].push(i),
@@ -222,28 +254,42 @@ pub fn folded_title(f: &Finding, members: usize, events: usize) -> String {
 }
 
 /// How many of each kind, most severe first: crashes, OOM kills and failed units by event (as the boot tallies
-/// count them), the rest by finding.
-pub fn tallies(findings: &[Finding]) -> Vec<(FindingKind, usize)> {
-    let mut out: Vec<(FindingKind, usize)> = vec![];
+/// count them), the rest by finding. The third number is how many units the failures are of.
+pub fn tallies(findings: &[Finding]) -> Vec<(FindingKind, usize, usize)> {
+    let mut out: Vec<(FindingKind, usize, usize)> = vec![];
+    let mut units: HashSet<&str> = HashSet::new();
     for i in ordered(findings) {
         let f = &findings[i];
         let n = match f.kind {
             FindingKind::Crash | FindingKind::OomKill | FindingKind::FailedUnit => f.count.max(1),
             _ => 1,
         };
-        match out.iter_mut().find(|(k, _)| *k == f.kind) {
-            Some((_, total)) => *total += n,
-            None => out.push((f.kind, n)),
+        if f.kind == FindingKind::FailedUnit {
+            units.insert(f.data.get("unit").map_or("", String::as_str));
+        }
+        match out.iter_mut().find(|(k, _, _)| *k == f.kind) {
+            Some((_, total, _)) => *total += n,
+            None => out.push((f.kind, n, 0)),
+        }
+    }
+    for (k, _, u) in &mut out {
+        if *k == FindingKind::FailedUnit {
+            *u = units.len();
         }
     }
     out
 }
 
-pub fn tally_label(kind: FindingKind, n: usize) -> String {
+/// `units` matters only for failures: "63 unit failures (11 units)" when they are not one each.
+pub fn tally_label(kind: FindingKind, n: usize, units: usize) -> String {
+    if kind == FindingKind::FailedUnit && units > 1 && units < n {
+        return format!("{n} unit failures ({units} units)");
+    }
     let (one, many) = match kind {
         FindingKind::Crash => ("crash", "crashes"),
         FindingKind::OomKill => ("OOM kill", "OOM kills"),
-        FindingKind::FailedUnit => ("failed unit", "failed units"),
+        FindingKind::FailedUnit if units == 1 && n > 1 => ("unit failure", "failures of one unit"),
+        FindingKind::FailedUnit => ("unit failure", "unit failures"),
         FindingKind::RestartLoop => ("restart loop", "restart loops"),
         FindingKind::BootWithoutShutdown if n == 1 => return "Ended without shutdown".into(),
         FindingKind::BootWithoutShutdown => ("boot without shutdown", "boots without shutdown"),
@@ -410,6 +456,7 @@ mod tests {
             crashes: 0,
             failed_units: 0,
             oom_kills: 0,
+            note: None,
         }
     }
 
@@ -486,10 +533,14 @@ mod tests {
     }
 
     #[test]
-    fn the_gap_after_a_boot_that_lost_power_says_so() {
+    fn the_gap_after_a_boot_without_shutdown_does_not_claim_the_machine_was_off() {
         let lost = boot(0, 100, false, BootEnd::Abrupt);
         let next = boot(193, 300, true, BootEnd::Running);
-        assert_eq!(off_time(&lost, &next), "Power lost · off for 93 s");
+        assert_eq!(
+            off_time(&lost, &next),
+            "Ended without shutdown · next boot 93 s later",
+            "a hang before a reset leaves the same gap with the power on"
+        );
         let clean = boot(0, 100, false, BootEnd::Clean);
         let morning = boot(100 + 9 * 3600 + 360, 99_999, true, BootEnd::Running);
         assert_eq!(off_time(&clean, &morning), "Off for 9h 6m");
@@ -613,9 +664,76 @@ mod tests {
             finding(FindingKind::RestartLoop, 300, 5),
         ];
         let t = tallies(&f);
-        assert_eq!(t, vec![(FindingKind::Crash, 3), (FindingKind::RestartLoop, 1)]);
-        assert_eq!(tally_label(FindingKind::Crash, 3), "3 crashes");
-        assert_eq!(tally_label(FindingKind::RestartLoop, 1), "1 restart loop");
+        assert_eq!(t, vec![(FindingKind::Crash, 3, 0), (FindingKind::RestartLoop, 1, 0)]);
+        assert_eq!(tally_label(FindingKind::Crash, 3, 0), "3 crashes");
+        assert_eq!(tally_label(FindingKind::RestartLoop, 1, 0), "1 restart loop");
+    }
+
+    #[test]
+    fn failures_are_counted_as_failures_not_as_failed_units() {
+        let mut f: Vec<Finding> = (0..3)
+            .map(|i| {
+                let mut f = about(FindingKind::FailedUnit, 100 + i, &[("unit", "pcr.service")]);
+                f.count = 9;
+                f
+            })
+            .collect();
+        f.push(about(FindingKind::FailedUnit, 500, &[("unit", "keyd.service")]));
+        let t = tallies(&f);
+        assert_eq!(t, vec![(FindingKind::FailedUnit, 28, 2)]);
+        assert_eq!(
+            tally_label(FindingKind::FailedUnit, 28, 2),
+            "28 unit failures (2 units)",
+            "one unit failing every boot is not 28 failed units"
+        );
+        assert_eq!(tally_label(FindingKind::FailedUnit, 1, 1), "1 unit failure");
+        assert_eq!(tally_label(FindingKind::FailedUnit, 4, 1), "4 failures of one unit");
+        assert_eq!(tally_label(FindingKind::FailedUnit, 2, 2), "2 unit failures");
+    }
+
+    #[test]
+    fn a_service_crash_and_the_failure_it_caused_are_one_card() {
+        let mut crash = about(
+            FindingKind::Crash,
+            1_000_000_000,
+            &[
+                ("comm", "nautilus"),
+                ("signal", "SIGSEGV"),
+                ("unit", "nautilus.service"),
+            ],
+        );
+        crash.first_us = crash.last_us;
+        let failed = |at: u64, unit: &str, result: &str| {
+            about(FindingKind::FailedUnit, at, &[("unit", unit), ("result", result)])
+        };
+        let f = [
+            crash,
+            failed(1_002_000_000, "nautilus.service", "core-dump"),
+            failed(1_002_000_000, "other.service", "core-dump"),
+            failed(1_002_000_000, "nautilus.service", "exit-code"),
+            failed(1_900_000_000, "nautilus.service", "core-dump"),
+        ];
+        assert_eq!(
+            grouped(&f),
+            vec![vec![0, 1], vec![4, 3], vec![2]],
+            "the unit failed because its process dumped core: one event, seen once; a later failure, another \
+             result or another unit stays a failure"
+        );
+        let in_user_manager = about(
+            FindingKind::Crash,
+            1_000_000_000,
+            &[("comm", "nautilus"), ("unit", "user@1000.service")],
+        );
+        let f = [
+            in_user_manager,
+            failed(1_000_045_000, "dbus-:1.2-org.gnome.Nautilus@0.service", "core-dump"),
+            failed(1_000_045_000, "pipewire.service", "core-dump"),
+        ];
+        assert_eq!(
+            grouped(&f),
+            vec![vec![0, 1], vec![2]],
+            "a user service's crash names the user manager, so the program's name ties it to its unit"
+        );
     }
 
     #[test]

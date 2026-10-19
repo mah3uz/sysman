@@ -79,12 +79,24 @@ impl Logs {
                 .font_features(t.numbers.clone())
                 .child(thousands(n))
         };
+        let status = self.status;
+        let note = |c: Option<Category>, n: u64| -> Option<String> {
+            match (c?, status?) {
+                (Category::Crashes, s) if !s.crash_reports && n == 0 => {
+                    Some("Crash reports need systemd-coredump".into())
+                }
+                (Category::Packages, s) if n == 0 => s
+                    .unread_packages
+                    .map(|m| format!("Package history from {m} isn't read yet")),
+                _ => None,
+            }
+        };
         let categories = std::iter::once(None).chain(Category::ALL.map(Some)).map(|c| {
             let (label, icon, n) = match c {
                 None => ("All sources", IconName::List, counts.all),
                 Some(c) => (model::category_label(c), category_icon(c), counts.get(c)),
             };
-            item(
+            let row = item(
                 format!("logs-cat-{label}"),
                 icon,
                 label.into(),
@@ -92,7 +104,16 @@ impl Logs {
                 t,
             )
             .child(count(n))
-            .on_click(cx.listener(move |this, _, _, cx| this.set_controls(|ctl| ctl.category = c, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_controls(|ctl| ctl.category = c, cx)));
+            div().flex().flex_col().child(row).children(note(c, n).map(|text| {
+                div()
+                    .pl(rem_px(29.))
+                    .pr(rem_px(8.))
+                    .pb(rem_px(3.))
+                    .text_size(t.small_caption)
+                    .text_color(t.text_tertiary)
+                    .child(text)
+            }))
         });
         div()
             .id("logs-sources")
@@ -220,7 +241,8 @@ impl Logs {
             BootEnd::Abrupt => (Some("Ended without shutdown"), t.red),
             BootEnd::Unknown => (None, t.text_secondary),
         };
-        let tally = in_scope.then(|| tally(b)).flatten();
+        let own_only = self.own_only();
+        let tally = in_scope.then(|| tally(b, own_only)).flatten();
         let target = if b.current {
             Span::ThisBoot
         } else {
@@ -422,20 +444,22 @@ impl Logs {
     }
 }
 
-fn tally(b: &BootSummary) -> Option<String> {
+fn tally(b: &BootSummary, own_only: bool) -> Option<String> {
     if matches!(b.end, BootEnd::Unknown) {
         return None;
     }
     let parts: Vec<String> = [
         (b.crashes, "crash", "crashes"),
-        (b.failed_units, "failed unit", "failed units"),
+        (b.failed_units, "unit failure", "unit failures"),
         (b.oom_kills, "OOM kill", "OOM kills"),
     ]
     .into_iter()
     .filter(|(n, _, _)| *n > 0)
     .map(|(n, one, many)| format!("{n} {}", if n == 1 { one } else { many }))
     .collect();
-    Some(if parts.is_empty() {
+    Some(if parts.is_empty() && own_only {
+        "No problems found among your own entries".into()
+    } else if parts.is_empty() {
         "No problems found".into()
     } else {
         parts.join(" · ")
@@ -454,7 +478,7 @@ fn gap_row(older: &BootSummary, newer: &BootSummary, t: &Theme) -> impl IntoElem
         .py(px(1.))
         .child(
             div().w(rem_px(RAIL)).flex_shrink_0().flex().justify_center().child(
-                Icon::new(if lost { IconName::Zap } else { IconName::Pause })
+                Icon::new(if lost { IconName::TriangleAlert } else { IconName::Pause })
                     .xsmall()
                     .text_color(colour),
             ),
