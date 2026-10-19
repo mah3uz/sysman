@@ -8,7 +8,7 @@ use gpui_kit_assets::IconName;
 
 use super::model::{self, Span, thousands};
 use super::toolbar::hair_b;
-use super::{Item, Logs};
+use super::{Item, Logs, list};
 use crate::data::logs::now_us;
 use crate::ui::theme::{rem_px, theme};
 use crate::ui::widgets::range::Range;
@@ -47,16 +47,19 @@ impl Logs {
             options.push((self.span.clone(), self.boot_name(id)));
         }
         let this = cx.entity().downgrade();
-        let state = self.scan.state();
-        let progress = state.is_running().then(|| {
-            let (from, now) = (self.view.range.0, now_us());
-            let at = self.scan.position_us();
-            if from == 0 || at < from || now <= from {
+        let reading = self.reading().state().is_running();
+        let progress = if reading {
+            let (from, to) = self.reading_range();
+            let at = self.reading().position_us();
+            Some(if from == 0 || at < from || to <= from {
                 0.
             } else {
-                ((at - from) as f32 / (now - from) as f32).clamp(0., 1.)
-            }
-        });
+                ((at - from) as f32 / (to - from) as f32).clamp(0., 1.)
+            })
+        } else {
+            self.searching()
+                .map(|s| (s.rows_done() as f32 / self.view.key.rows.max(1) as f32).min(1.))
+        };
         div()
             .relative()
             .flex()
@@ -75,6 +78,7 @@ impl Logs {
                 },
                 cx,
             ))
+            .children(progress.map(|_| list::spinner(cx)))
             .child(
                 div()
                     .flex_1()
@@ -97,11 +101,28 @@ impl Logs {
             }))
     }
 
+    /// The span the scan being read covers, for its progress.
+    fn reading_range(&self) -> (u64, u64) {
+        if !self.stale() {
+            return self.view.range;
+        }
+        let now = now_us();
+        let boots = &self.view.boots;
+        match &self.span {
+            Span::Last(_) => (self.from_us, now),
+            Span::ThisBoot => (boots.iter().find(|b| b.current).map_or(0, |b| b.first_us), now),
+            Span::Boot(id) => boots
+                .iter()
+                .find(|b| &b.id == id)
+                .map_or((0, now), |b| (b.first_us, b.last_us + 1)),
+        }
+    }
+
     fn summary(&self) -> String {
-        let state = self.scan.state();
-        let mut out = if state.is_running() {
-            let at = self.scan.position_us();
-            let mut s = format!("Reading the journal · {} entries", thousands(self.scan.entries_read()));
+        let reading = self.reading();
+        let mut out = if reading.state().is_running() {
+            let at = reading.position_us();
+            let mut s = format!("Reading the journal · {} entries", thousands(reading.entries_read()));
             if at > 0 {
                 s.push_str(&format!(" · at {}", model::clock(at, "%b %-d %H:%M:%S", &self.tz)));
             }
@@ -138,7 +159,7 @@ impl Logs {
             }
             s
         };
-        if let Some(search) = self.search.as_ref().filter(|s| s.state().is_running()) {
+        if let Some(search) = self.searching() {
             let of = self.view.key.rows.max(1) as f64;
             out.push_str(&format!(
                 " · searching messages {:.0}%",

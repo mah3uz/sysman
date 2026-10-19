@@ -263,7 +263,7 @@ impl Logs {
     pub(super) fn status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let state = self.scan.state();
-        let (colour, summary) = if state.is_running() {
+        let (colour, summary) = if self.reading().state().is_running() {
             (t.blue, "Reading the journal".to_string())
         } else if let Some(e) = super::scan_failed(&state) {
             (t.red, format!("Could not read the journal: {e}"))

@@ -1,20 +1,26 @@
 use std::ops::Range;
+use std::time::Duration;
 
 use gpui::{
-    AnyElement, Context, Div, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px, uniform_list,
+    AnyElement, App, Context, Div, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, uniform_list,
 };
 use gpui_component::button::Button;
 use gpui_component::scroll::ScrollableElement;
+use gpui_component::spinner::Spinner;
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 
 use super::model::{self, Item};
-use super::{Logs, scan_failed};
+use super::{Logs, line_key, scan_failed};
 use crate::data::logs::{BootEnd, BootSummary};
+use crate::ui::shell::paused;
 use crate::ui::theme::{Theme, rem_px, theme};
 
-const ROW: f32 = 22.;
+pub(super) const ROW: f32 = 22.;
+/// What is on screen while a newer scan reads, see [`Logs::stale`].
+pub(super) const STALE: f32 = 0.6;
+const FADE: Duration = Duration::from_millis(160);
 
 type Action = Box<dyn Fn(&mut Logs, &mut Context<Logs>)>;
 const TIME_WIDTH: f32 = 56.;
@@ -59,9 +65,23 @@ pub(super) fn mono(text: impl Into<SharedString>, t: &Theme) -> Div {
         .child(text.into())
 }
 
+/// Turning, unless live work is paused.
+pub(super) fn spinner(cx: &App) -> AnyElement {
+    let t = theme(cx);
+    if paused(cx) {
+        Icon::new(gpui_component::IconName::Loader)
+            .small()
+            .text_color(t.text_tertiary)
+            .into_any_element()
+    } else {
+        Spinner::new().small().color(t.text_tertiary).into_any_element()
+    }
+}
+
 /// What one list row needs from the index, read while its lock is held only briefly.
 struct Line {
     item: Item,
+    key: (u64, u64),
     t_us: u64,
     priority: u8,
     source: SharedString,
@@ -86,13 +106,19 @@ impl Logs {
         let items = self.view.items.clone();
         if items.is_empty() {
             if !self.view.key.settled {
-                return self.empty(
-                    IconName::FileText,
-                    "Reading the journal…".into(),
-                    String::new(),
-                    None,
-                    cx,
-                );
+                return div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap(rem_px(8.))
+                    .text_size(t.caption)
+                    .text_color(t.text_secondary)
+                    .child(spinner(cx))
+                    .child("Reading the journal…")
+                    .into_any_element();
             }
             let filtered = !self.query.is_empty();
             let no_journal = self.status.is_some_and(|s| s.no_journal);
@@ -130,7 +156,7 @@ impl Logs {
         let list = uniform_list(
             "logs-list",
             items.len(),
-            cx.processor(move |this, range: Range<usize>, _, cx| this.rows(&items, range, dated, cx)),
+            cx.processor(move |this, range: Range<usize>, window, cx| this.rows(&items, range, dated, window, cx)),
         )
         .track_scroll(&self.list)
         .size_full()
@@ -142,6 +168,7 @@ impl Logs {
             .min_h_0()
             .text_size(t.caption)
             .font_features(t.numbers.clone())
+            .when(self.stale(), |d| d.opacity(STALE))
             .child(list)
             .vertical_scrollbar(&self.list)
             .into_any_element()
@@ -155,7 +182,14 @@ impl Logs {
         self.refilter(cx);
     }
 
-    fn rows(&mut self, items: &[Item], range: Range<usize>, dated: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn rows(
+        &mut self,
+        items: &[Item],
+        range: Range<usize>,
+        dated: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let lines: Vec<Line> = {
             let index = self.scan.index();
             items[range.start.min(items.len())..range.end.min(items.len())]
@@ -167,6 +201,7 @@ impl Logs {
                     };
                     Line {
                         item,
+                        key: row.as_ref().map_or((0, 0), line_key),
                         t_us: row.map_or(0, |r| r.t_us),
                         priority: row.map_or(6, |r| r.priority),
                         source: row.map_or_else(SharedString::default, |r| index.name(r.source).to_string().into()),
@@ -177,11 +212,17 @@ impl Logs {
         let wanted = lines
             .iter()
             .filter_map(|l| match l.item {
-                Item::Entry(v) => Some(v.row),
+                Item::Entry(v) => Some((v.row, l.key)),
                 Item::BootEnd(_) => None,
             })
             .collect();
         self.want_lines(wanted, cx);
+        let fading = lines
+            .iter()
+            .any(|l| self.lines.get(&l.key).is_some_and(|(_, at)| at.elapsed() < FADE));
+        if fading && !paused(cx) {
+            window.request_animation_frame();
+        }
         lines
             .into_iter()
             .enumerate()
@@ -198,7 +239,14 @@ impl Logs {
             unreachable!("called for entries")
         };
         let selected = self.selected == Some(v.row);
-        let message = self.lines.get(&v.row).cloned();
+        let message = self.lines.get(&line.key).map(|(m, at)| {
+            let shown = if paused(cx) {
+                1.
+            } else {
+                (at.elapsed().as_secs_f32() / FADE.as_secs_f32()).min(1.)
+            };
+            (m.clone(), shown)
+        });
         let row = v.row;
         let time = model::clock(line.t_us, if dated { "%b %-d %H:%M:%S" } else { "%H:%M:%S" }, &self.tz);
         div()
@@ -231,19 +279,19 @@ impl Logs {
                     .child(line.source),
             )
             .child(match message {
-                Some(m) => mono(m, t)
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(if line.priority >= 6 {
-                        t.text.opacity(0.72)
-                    } else {
-                        t.text
-                    }),
-                None => div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().w(rem_px(180.)).h(rem_px(8.)).rounded(rem_px(4.)).bg(t.card)),
+                Some((m, shown)) => {
+                    mono(m, t)
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .opacity(shown)
+                        .text_color(if line.priority >= 6 {
+                            t.text.opacity(0.72)
+                        } else {
+                            t.text
+                        })
+                }
+                None => div().flex_1().min_w_0(),
             })
             .when(v.count > 1, |d| {
                 d.child(
