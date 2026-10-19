@@ -13,6 +13,7 @@ use crate::ui::widgets::range::Range;
 
 pub const SAVED_KEY: &str = "logs.saved";
 pub const FINDINGS_KEY: &str = "logs.findings";
+pub const LANES_KEY: &str = "logs.lanes";
 
 /// What the scan covers, as the range control and the boot list pick it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +325,11 @@ pub struct Saved {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FindingsPref {
     pub collapsed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanesPref {
+    pub open: bool,
 }
 
 #[cfg(test)]

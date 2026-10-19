@@ -1,7 +1,9 @@
 mod findings;
 mod inspector;
+mod lanes;
 mod list;
 mod model;
+mod recorded;
 mod sources;
 mod strip;
 mod toolbar;
@@ -24,17 +26,20 @@ use journal::findings::{FindingKind, Severity};
 use journal::packages::{Manager, Transaction};
 
 use crate::data::logs::{
-    self as data, Around, BootEnd, BootSummary, Bucket, CategoryCounts, Fetcher, Query, Scan, ScanState, Search,
+    self as data, Around, BootEnd, BootSummary, Bucket, CategoryCounts, Fetcher, Lane, Query, Scan, ScanState, Search,
     Status, now_us,
 };
 use crate::data::prefs::prefs;
+use crate::ui::shell::{Focus, take_focus};
 use crate::ui::theme::theme;
 use crate::ui::widgets::sidebar::{self, Side, Sidebar, Toggled, Widths};
-use model::{Controls, FINDINGS_KEY, FindingsPref, Item, SAVED_KEY, Saved, SavedFilter, Span};
+use model::{Controls, FINDINGS_KEY, FindingsPref, Item, LANES_KEY, LanesPref, SAVED_KEY, Saved, SavedFilter, Span};
+use recorded::{Ask, Recorded};
 
 const SIDEBAR: Widths = Widths::new(224., 184., 340.);
 const INSPECTOR: Widths = Widths::new(352., 280., 600.);
 const BUCKETS: usize = 120;
+const LANE_BUCKETS: usize = 240;
 const POLL: Duration = Duration::from_millis(200);
 const DEBOUNCE: Duration = Duration::from_millis(250);
 const AROUND: usize = 6;
@@ -51,6 +56,10 @@ struct Card {
     title: String,
     evidence: String,
     count: usize,
+    first_us: u64,
+    last_us: u64,
+    /// The process it is about, for crashes and OOM kills.
+    pid: Option<u32>,
 }
 
 /// What a computed [`View`] was computed from; a different key means it is out of date.
@@ -61,6 +70,7 @@ struct Key {
     rows: usize,
     hits: usize,
     settled: bool,
+    lanes: bool,
 }
 
 /// The query's results over the index, computed on the background executor whenever the query changes or the
@@ -72,6 +82,8 @@ struct View {
     entries: u64,
     counts: CategoryCounts,
     buckets: Vec<Bucket>,
+    /// Filled only while the lanes view is open.
+    lanes: Arc<Vec<Lane>>,
     range: (u64, u64),
     boots: Vec<BootSummary>,
     cards: Vec<Card>,
@@ -87,6 +99,10 @@ struct Inspected {
     transaction: Option<Transaction>,
     around: Around,
     error: Option<String>,
+    /// The finding this entry is part of, by its place in [`data::Index::findings`].
+    finding: Option<usize>,
+    /// The process the entry is about: a crash's pid, or an OOM kill's victim.
+    pid: Option<u32>,
 }
 
 #[cfg(debug_assertions)]
@@ -95,6 +111,15 @@ struct Dev {
     select: Option<String>,
     finding: Option<usize>,
     own_only: bool,
+    hover: Option<usize>,
+}
+
+/// A row to select once the scan reaches it, asked for by another screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    /// Waiting for the boot list to pick the scope.
+    Scope(u64),
+    Row(u64),
 }
 
 pub struct Logs {
@@ -142,6 +167,13 @@ pub struct Logs {
     keys: FocusHandle,
     strip: Rc<Cell<Bounds<Pixels>>>,
     drag: Option<(f32, f32)>,
+    lanes_open: bool,
+    /// The lane and bucket of the mark under the pointer.
+    lane_hover: Option<(usize, usize)>,
+    entry_rec: Option<Recorded>,
+    finding_rec: Option<Recorded>,
+    lanes_rec: Option<Recorded>,
+    pending: Option<Pending>,
     tz: TimeZone,
     #[cfg(debug_assertions)]
     dev: Dev,
@@ -160,11 +192,12 @@ impl Logs {
             }
         })
         .detach();
-        let (saved, findings) = {
+        let (saved, findings, lanes) = {
             let p = prefs().lock().unwrap_or_else(PoisonError::into_inner);
             (
                 p.get::<Saved>(SAVED_KEY).unwrap_or_default().filters,
                 p.get::<FindingsPref>(FINDINGS_KEY).unwrap_or_default(),
+                p.get::<LanesPref>(LANES_KEY).unwrap_or_default(),
             )
         };
         let status = cx.background_executor().spawn(async { data::status() });
@@ -222,20 +255,30 @@ impl Logs {
             keys: cx.focus_handle(),
             strip: Rc::default(),
             drag: None,
+            lanes_open: lanes.open,
+            lane_hover: None,
+            entry_rec: None,
+            finding_rec: None,
+            lanes_rec: None,
+            pending: None,
             tz: TimeZone::system(),
             #[cfg(debug_assertions)]
             dev: Dev::default(),
         };
         #[cfg(debug_assertions)]
         this.dev_setup(cx);
+        if let Some(Focus::LogEntry { t_us }) = take_focus(cx) {
+            this.open_at(t_us, cx);
+        }
         this.recompute(cx);
         this.watch(cx);
         this
     }
 
     /// Screenshot aids: `SYSMAN_DEV_LOGS_QUERY` (search text), `_RANGE` (`5min` … `7day`), `_BOOT` (`-1`, …),
-    /// `_FINDING` (the nth card, once the scan ends), `_SELECT` (`error`, or rows back from the newest) and
-    /// `_ACCESS=own` (the own-entries banner).
+    /// `_FINDING` (the nth card, once the scan ends), `_SELECT` (`error`, or rows back from the newest),
+    /// `_ACCESS=own` (the own-entries banner), `_AT` (open at the entry this many seconds ago) and `_HOVER` (hover the
+    /// busiest mark of this lane).
     #[cfg(debug_assertions)]
     fn dev_setup(&mut self, cx: &mut Context<Self>) {
         use crate::ui::widgets::range::Range;
@@ -268,12 +311,22 @@ impl Logs {
         self.dev.select = var("SELECT");
         self.dev.finding = var("FINDING").and_then(|f| f.parse().ok());
         self.dev.own_only = var("ACCESS").as_deref() == Some("own");
+        self.dev.hover = var("HOVER").and_then(|l| l.parse().ok());
+        if let Some(ago) = var("AT").and_then(|s| s.parse::<u64>().ok()) {
+            self.open_at(now_us().saturating_sub(ago * 1_000_000), cx);
+        }
     }
 
     #[cfg(debug_assertions)]
     fn dev_apply(&mut self, cx: &mut Context<Self>) {
         if !self.view.key.settled {
             return;
+        }
+        if let Some(li) = self.dev.hover
+            && let Some(lane) = self.view.lanes.get(li)
+        {
+            let busiest = lane.counts.iter().enumerate().max_by_key(|(_, c)| **c).map(|(b, _)| b);
+            self.lane_hover = busiest.map(|b| (li, b));
         }
         if let Some(n) = self.dev.finding.take()
             && let Some(card) = self.view.cards.get(n)
@@ -405,6 +458,104 @@ impl Logs {
 
     fn set_finding(&mut self, finding: Option<usize>, cx: &mut Context<Self>) {
         self.set_controls(|c| c.finding = finding, cx);
+        let card = finding.and_then(|f| self.view.cards.iter().find(|c| c.index == f));
+        match card.map(|c| Ask::over(secs(c.first_us), secs(c.last_us), c.pid)) {
+            Some(ask) => self.record(ask, |l| &mut l.finding_rec, cx),
+            None => self.finding_rec = None,
+        }
+    }
+
+    /// Picks the scope holding `t_us` and selects the row nearest it once the scan gets there.
+    fn open_at(&mut self, t_us: u64, cx: &mut Context<Self>) {
+        self.pending = Some(Pending::Scope(t_us));
+        let boots = cx.background_executor().spawn(async {
+            journal::reader::Journal::open()
+                .and_then(|mut j| j.boots())
+                .unwrap_or_default()
+        });
+        cx.spawn(async move |this, cx| {
+            let boots = boots.await;
+            this.update(cx, |this, cx| {
+                if this.pending != Some(Pending::Scope(t_us)) {
+                    return;
+                }
+                let at = boots.iter().position(|b| b.first_us <= t_us && t_us <= b.last_us);
+                let span = match at {
+                    Some(i) if i + 1 < boots.len() => Span::Boot(boots[i].id.clone()),
+                    // the running boot, or a time no boot covers, which the running boot is the best guess for
+                    _ => Span::ThisBoot,
+                };
+                this.pending = Some(Pending::Row(t_us));
+                this.set_follow(false, cx);
+                this.set_span(span, cx);
+                this.settle_pending(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Selects the row nearest the asked-for time once the scan has read past it.
+    fn settle_pending(&mut self, cx: &mut Context<Self>) {
+        let Some(Pending::Row(t_us)) = self.pending else { return };
+        let running = self.scan.state().is_running();
+        if self.view.key.scan != self.scan_gen {
+            return;
+        }
+        let nearest = {
+            let index = self.scan.index();
+            let reached = self
+                .entry_rows()
+                .last()
+                .and_then(|(_, r)| index.row(r))
+                .is_some_and(|r| r.t_us >= t_us);
+            if running && !reached {
+                return;
+            }
+            self.entry_rows()
+                .filter_map(|(_, r)| index.row(r).map(|row| (r, row.t_us.abs_diff(t_us))))
+                .min_by_key(|(_, d)| *d)
+                .map(|(r, _)| r)
+        };
+        if let Some(row) = nearest {
+            self.pending = None;
+            self.select(Some(row), cx);
+            self.reveal(row);
+        } else if !running {
+            self.pending = None;
+        }
+    }
+
+    fn set_lanes_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.lanes_open = open;
+        self.lane_hover = None;
+        prefs()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set(LANES_KEY, &LanesPref { open });
+        self.recompute(cx);
+        cx.notify();
+    }
+
+    /// CPU and temperature behind the lanes, re-read only when the scope has moved by more than a sliver.
+    fn record_lanes(&mut self, cx: &mut Context<Self>) {
+        let (from, to) = (secs(self.view.range.0), secs(self.view.range.1));
+        if to <= from {
+            return;
+        }
+        let fresh = self.lanes_rec.as_ref().is_some_and(|r| {
+            let (a, b) = r.ask.span;
+            a == from && (b - to).abs() <= (to - from) / 100
+        });
+        if !fresh {
+            let ask = Ask {
+                span: (from, to),
+                marks: vec![],
+                pid: None,
+                points: LANE_BUCKETS as u32,
+            };
+            self.record(ask, |l| &mut l.lanes_rec, cx);
+        }
     }
 
     fn set_span(&mut self, span: Span, cx: &mut Context<Self>) {
@@ -432,6 +583,8 @@ impl Logs {
         self.select(None, cx);
         // finding indexes and the strip's slice belong to the old index
         self.controls.finding = None;
+        self.finding_rec = None;
+        self.lane_hover = None;
         self.controls.window = None;
         self.query = self.controls.apply(self.parsed.clone());
         self.search = self.logs.search(&self.query);
@@ -474,6 +627,7 @@ impl Logs {
             rows: self.scan.index().len(),
             hits: self.search.as_ref().map_or(0, |s| s.hits().len()),
             settled: !state.is_running() && !searching,
+            lanes: self.lanes_open,
         }
     }
 
@@ -501,7 +655,7 @@ impl Logs {
                     this.recompute(cx);
                     return;
                 }
-                let requery = view.key.query != this.query_gen;
+                let requery = view.key.query != this.query_gen || view.key.lanes != this.lanes_open;
                 this.apply_view(view, cx);
                 // growth is picked up by the poll at its own pace; a new query should not wait for it
                 if requery {
@@ -530,6 +684,10 @@ impl Logs {
             _ if self.stick || (at_end && self.following()) => self.list.scroll_to_bottom(),
             _ => {}
         }
+        if self.lanes_open && !self.view.lanes.is_empty() {
+            self.record_lanes(cx);
+        }
+        self.settle_pending(cx);
         #[cfg(debug_assertions)]
         self.dev_apply(cx);
         cx.notify();
@@ -576,6 +734,7 @@ impl Logs {
         }
         self.selected = row;
         self.inspected = None;
+        self.entry_rec = None;
         if row.is_some() {
             self.stick = false;
         }
@@ -610,6 +769,10 @@ impl Logs {
             let inspected = task.await;
             this.update(cx, |this, cx| {
                 if this.scan_gen == scan_gen && this.selected == Some(row) {
+                    let t = this.scan.index().row(row).map(|r| secs(r.t_us));
+                    if let Some(t) = t.filter(|_| inspected.transaction.is_none()) {
+                        this.record(Ask::around(t, inspected.pid), |l| &mut l.entry_rec, cx);
+                    }
                     this.inspected = Some(inspected);
                     cx.notify();
                 }
@@ -742,6 +905,11 @@ fn compute(scan: &Scan, search: Option<&Search>, q: &Query, span: &Span, from_us
             .map_or((first, now), |b| (b.first_us, b.last_us + 1)),
     };
     let buckets = index.histogram(q, hits, range.0, range.1.max(range.0 + 1), BUCKETS);
+    let lanes = if key.lanes {
+        Arc::new(index.lanes(q, hits, range.0, range.1.max(range.0 + 1), LANE_BUCKETS))
+    } else {
+        Arc::default()
+    };
     let by_id: HashMap<&str, usize> = boots.iter().enumerate().map(|(i, b)| (b.id.as_str(), i)).collect();
     let items = model::items(
         &matches.rows,
@@ -760,6 +928,9 @@ fn compute(scan: &Scan, search: Option<&Search>, q: &Query, span: &Span, from_us
                 title: f.title.clone(),
                 evidence: f.evidence.clone(),
                 count: f.count,
+                first_us: f.first_us,
+                last_us: f.last_us,
+                pid: victim(f),
             }
         })
         .collect();
@@ -774,6 +945,7 @@ fn compute(scan: &Scan, search: Option<&Search>, q: &Query, span: &Span, from_us
         entries: matches.entries,
         counts,
         buckets,
+        lanes,
         range,
         tallies: model::tallies(findings),
         boots,
@@ -781,6 +953,16 @@ fn compute(scan: &Scan, search: Option<&Search>, q: &Query, span: &Span, from_us
         packages,
         scanned,
     }
+}
+
+fn secs(us: u64) -> i64 {
+    (us / 1_000_000) as i64
+}
+
+fn victim(f: &journal::findings::Finding) -> Option<u32> {
+    matches!(f.kind, FindingKind::Crash | FindingKind::OomKill)
+        .then(|| f.data.get("pid")?.parse().ok())
+        .flatten()
 }
 
 fn with_fetcher<T>(
@@ -848,9 +1030,15 @@ fn first_line(message: &str) -> String {
 }
 
 fn read_entry(scan: Arc<Scan>, fetcher: &Mutex<Option<Fetcher>>, row: u32) -> Inspected {
-    let transaction = {
+    let (transaction, finding, victim) = {
         let index = scan.index();
-        index.row(row).and_then(|r| index.transaction(r)).cloned()
+        let findings = index.findings();
+        let finding = findings.iter().position(|f| f.entries.contains(&(row as usize)));
+        (
+            index.row(row).and_then(|r| index.transaction(r)).cloned(),
+            finding,
+            finding.and_then(|f| victim(&findings[f])),
+        )
     };
     let mut out = Inspected {
         row,
@@ -858,6 +1046,8 @@ fn read_entry(scan: Arc<Scan>, fetcher: &Mutex<Option<Fetcher>>, row: u32) -> In
         transaction,
         around: Around::default(),
         error: None,
+        finding,
+        pid: victim,
     };
     if out.transaction.is_some() {
         return out;
@@ -867,6 +1057,8 @@ fn read_entry(scan: Arc<Scan>, fetcher: &Mutex<Option<Fetcher>>, row: u32) -> In
     });
     match read.and_then(|r| r) {
         Ok((entry, around)) => {
+            let pid = entry.as_ref().and_then(|e| e.get("COREDUMP_PID")?.parse().ok());
+            out.pid = pid.or(out.pid);
             out.entry = entry;
             out.around = around;
         }
@@ -884,7 +1076,12 @@ impl Render for Logs {
         let sources = sidebar::sidebar(&self.left, sources, window, cx);
         let header = self.header(cx).into_any_element();
         let findings = self.findings(window, cx);
-        let strip = self.strip(cx).into_any_element();
+        let strip = if self.lanes_open {
+            self.lanes(cx).into_any_element()
+        } else {
+            self.strip(cx).into_any_element()
+        };
+        let group = self.finding_header(cx);
         let list = self.list(cx);
         let inspector = sidebar::showing(&self.right, cx).then(|| self.inspector(cx));
         let inspector = sidebar::sidebar(&self.right, inspector, window, cx);
@@ -930,6 +1127,7 @@ impl Render for Logs {
                             .child(header)
                             .children(findings)
                             .child(strip)
+                            .children(group)
                             .child(list),
                     )
                     .child(inspector),

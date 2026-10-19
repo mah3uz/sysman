@@ -16,7 +16,7 @@ use crate::ui::theme::{Theme, rem_px, theme};
 const RECENT_BOOTS: usize = 5;
 const RAIL: f32 = 16.;
 
-fn category_icon(c: Category) -> IconName {
+pub(super) fn category_icon(c: Category) -> IconName {
     match c {
         Category::Kernel => IconName::Cpu,
         Category::Hardware => IconName::CircuitBoard,
