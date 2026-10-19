@@ -45,12 +45,13 @@ use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
 use crate::ui::widgets::hairline;
 use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::panel::caption_label;
-use crate::ui::widgets::range::{Range, range_picker, remember, remembered};
+use crate::ui::widgets::range::{Range, range_picker, remember_in, remembered, remembered_in};
 use crate::ui::widgets::sidebar::{self, Side, Sidebar, Toggled, Widths};
 use crate::ui::widgets::text::caption;
 
 const BUCKETS: u32 = 120;
 const RELOAD_S: f64 = 60.;
+const INSPECTOR_RANGE: &str = "inspector";
 const INSPECTOR: Widths = Widths::new(420., 320., 640.);
 const COLUMNS_KEY: &str = "processes.columns";
 const SORT_KEY: &str = "processes.sort";
@@ -934,13 +935,18 @@ fn memory_share(pct: f64) -> String {
     }
 }
 
+/// The cards' history read for one range.
+struct StoredCards {
+    range: Range,
+    cards: HashMap<Card, Vec<Bucket>>,
+}
+
 /// History read for one range and one selected process.
 struct Stored {
     range: Range,
-    key: Option<Key>,
+    key: Key,
     /// `None` when the daemon has not recorded the process yet.
     proc_id: Option<i64>,
-    cards: HashMap<Card, Vec<Bucket>>,
     fields: HashMap<ProcField, Vec<Bucket>>,
     /// Earlier runs of the same program in the range, summed, and how many there were.
     earlier: HashMap<ProcField, Vec<Bucket>>,
@@ -970,27 +976,28 @@ fn earlier_runs(
         .collect())
 }
 
-fn load(range: Range, to: i64, selected: Option<Key>, name: Option<(String, String)>) -> Result<Stored> {
+fn load_cards(range: Range, to: i64) -> Result<StoredCards> {
     let history = History::open(&db_path())?;
     let from = to - range.span_s();
     let mut cards = HashMap::new();
     for card in Card::ALL {
         cards.insert(card, card.source().query(&history, from, to, BUCKETS)?);
     }
-    let proc_id = match selected {
-        Some((pid, start)) => history.proc_id(pid, start)?,
-        None => None,
-    };
+    Ok(StoredCards { range, cards })
+}
+
+fn load(range: Range, to: i64, selected: Key, name: (String, String)) -> Result<Stored> {
+    let history = History::open(&db_path())?;
+    let from = to - range.span_s();
+    let (pid, start) = selected;
+    let proc_id = history.proc_id(pid, start)?;
     let mut fields = HashMap::new();
     if let Some(id) = proc_id {
         for field in FIELDS {
             fields.insert(field, history.proc_series(id, field, from, to, BUCKETS)?);
         }
     }
-    let ids = match (selected, &name) {
-        (Some((_, start)), Some(name)) => earlier_runs(&history, name, start, from, proc_id)?,
-        _ => Vec::new(),
-    };
+    let ids = earlier_runs(&history, &name, start, from, proc_id)?;
     let mut earlier = HashMap::new();
     if !ids.is_empty() {
         for field in [ProcField::Rss, ProcField::Cpu, ProcField::Fds] {
@@ -1001,7 +1008,6 @@ fn load(range: Range, to: i64, selected: Option<Key>, name: Option<(String, Stri
         range,
         key: selected,
         proc_id,
-        cards,
         fields,
         earlier,
         earlier_runs: ids.len(),
@@ -1033,10 +1039,16 @@ pub struct Processes {
     /// The delegate until the first render, which has the window the table and search field need.
     pending: Option<ProcessTable>,
     search: Option<Entity<InputState>>,
+    /// The cards' range.
     range: Range,
+    cards_stored: Option<StoredCards>,
+    cards_loading: bool,
+    cards_attempt: Option<(Range, f64)>,
+    /// The inspector's range, chosen apart from the cards'.
+    proc_range: Range,
     stored: Option<Stored>,
     loading: bool,
-    attempt: Option<(Range, Option<Key>, f64)>,
+    attempt: Option<(Range, Key, f64)>,
     error: Option<SharedString>,
     /// The selected process as last scanned; kept after it exits.
     inspected: Option<Process>,
@@ -1046,6 +1058,8 @@ pub struct Processes {
     fields: HashMap<ProcField, Rc<[Bucket]>>,
     span: (f64, f64),
     width_s: i64,
+    proc_span: (f64, f64),
+    proc_width_s: i64,
     version: u64,
     charts: [Rc<RefCell<ChartState>>; 4],
     cpu_meta: Option<CpuMeta>,
@@ -1126,6 +1140,10 @@ impl Processes {
             keys: cx.focus_handle(),
             search: None,
             range: remembered(Tab::Processes, cx),
+            cards_stored: None,
+            cards_loading: false,
+            cards_attempt: None,
+            proc_range: remembered_in(Tab::Processes, INSPECTOR_RANGE, cx),
             stored: None,
             loading: false,
             attempt: None,
@@ -1136,6 +1154,8 @@ impl Processes {
             fields: HashMap::new(),
             span: (0., 0.),
             width_s: 1,
+            proc_span: (0., 0.),
+            proc_width_s: 1,
             version: 0,
             charts: std::array::from_fn(|_| ChartState::with_cursor(cursor.clone())),
             cpu_meta: None,
@@ -1161,6 +1181,13 @@ impl Processes {
         if std::env::var_os("SYSMAN_DEV_INSPECTOR_COLLAPSED").is_some() {
             this.panel.collapsed = true;
         }
+        #[cfg(debug_assertions)]
+        if let Ok(name) = std::env::var("SYSMAN_DEV_INSPECTOR_RANGE") {
+            this.proc_range = Range::ALL
+                .into_iter()
+                .find(|r| r.label().eq_ignore_ascii_case(&name))
+                .unwrap_or(this.proc_range);
+        }
         this.on_feed(cx);
         this
     }
@@ -1172,10 +1199,13 @@ impl Processes {
         self.feed.read(cx).latest.is_some()
             && self.live.read(cx).latest.is_some()
             && self.dev_select.is_none()
+            && !self.cards_loading
             && !self.loading
-            && self
-                .attempt
-                .is_some_and(|(range, key, _)| range == self.range && key == selected)
+            && self.cards_attempt.is_some_and(|(range, _)| range == self.range)
+            && selected.is_none_or(|selected| {
+                self.attempt
+                    .is_some_and(|(range, key, _)| range == self.proc_range && key == selected)
+            })
     }
 
     fn delegate<'a>(&'a self, cx: &'a App) -> &'a ProcessTable {
@@ -1286,10 +1316,10 @@ impl Processes {
         self.sync_selection(cx);
     }
 
-    fn set_range(&mut self, range: Range, cx: &mut Context<Self>) {
-        if range != self.range {
-            self.range = range;
-            remember(Tab::Processes, range, cx);
+    fn set_proc_range(&mut self, range: Range, cx: &mut Context<Self>) {
+        if range != self.proc_range {
+            self.proc_range = range;
+            remember_in(Tab::Processes, INSPECTOR_RANGE, range, cx);
             self.refresh(cx);
         }
     }
@@ -1330,31 +1360,60 @@ impl Processes {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let now = self.now(cx);
-        let selected = self.inspected.as_ref().map(key);
-        let stale = self.attempt.is_none_or(|(range, key, at)| {
+        let cards_stale = self.cards_attempt.is_none_or(|(range, at)| {
             range != self.range
-                || key != selected
-                || match selected {
-                    // The inspected process's series have no live rings to fill a pause.
-                    Some(_) => now - at > RELOAD_S,
-                    None => self
-                        .live
-                        .read(cx)
-                        .reload_due(at, now, self.range.span_s() as f64, RELOAD_S),
-                }
+                || self
+                    .live
+                    .read(cx)
+                    .reload_due(at, now, self.range.span_s() as f64, RELOAD_S)
         });
-        if stale && !self.loading {
-            self.load(now, selected, cx);
+        if cards_stale && !self.cards_loading {
+            self.load_cards(now, cx);
+        }
+        if let Some(p) = &self.inspected {
+            let selected = key(p);
+            // The inspected process's series have no live rings to fill a pause.
+            let stale = self
+                .attempt
+                .is_none_or(|(range, key, at)| range != self.proc_range || key != selected || now - at > RELOAD_S);
+            if stale && !self.loading {
+                let name = (p.comm.clone(), p.cmdline.clone());
+                self.load(now, selected, name, cx);
+            }
         }
         self.merge(now, cx);
         cx.notify();
     }
 
-    fn load(&mut self, now: f64, selected: Option<Key>, cx: &mut Context<Self>) {
-        self.loading = true;
-        self.attempt = Some((self.range, selected, now));
+    fn load_cards(&mut self, now: f64, cx: &mut Context<Self>) {
+        self.cards_loading = true;
+        self.cards_attempt = Some((self.range, now));
         let range = self.range;
-        let name = self.inspected.as_ref().map(|p| (p.comm.clone(), p.cmdline.clone()));
+        let task = cx
+            .background_executor()
+            .spawn(async move { load_cards(range, now as i64) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.cards_loading = false;
+                match result {
+                    Ok(stored) => {
+                        this.error = None;
+                        this.cards_stored = Some(stored);
+                    }
+                    Err(e) => this.error = Some(format!("History unavailable: {e}").into()),
+                }
+                this.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn load(&mut self, now: f64, selected: Key, name: (String, String), cx: &mut Context<Self>) {
+        self.loading = true;
+        self.attempt = Some((self.proc_range, selected, now));
+        let range = self.proc_range;
         let task = cx
             .background_executor()
             .spawn(async move { load(range, now as i64, selected, name) });
@@ -1388,14 +1447,20 @@ impl Processes {
         let to = now as i64;
         let from = to - self.range.span_s();
         self.width_s = bucket_width(from, to, BUCKETS);
-        let stored = self.stored.as_ref().filter(|s| s.range == self.range);
+        let stored = self.cards_stored.as_ref().filter(|s| s.range == self.range);
         for card in Card::ALL {
             let history = stored.and_then(|s| s.cards.get(&card)).map_or(&[][..], Vec::as_slice);
             let merged = card.source().top_up(history, live, from, self.width_s);
             self.cards.insert(card, merged.into());
         }
+        self.span = (from as f64, now);
+        let from = to - self.proc_range.span_s();
+        self.proc_width_s = bucket_width(from, to, BUCKETS);
         let selected = self.inspected.as_ref().map(key);
-        let stored = stored.filter(|s| s.key == selected);
+        let stored = self
+            .stored
+            .as_ref()
+            .filter(|s| s.range == self.proc_range && Some(s.key) == selected);
         let start = self.trail.first().map_or(f64::INFINITY, |(t, _)| *t);
         for field in FIELDS {
             let history = stored.and_then(|s| s.fields.get(&field)).map_or(&[][..], Vec::as_slice);
@@ -1403,10 +1468,10 @@ impl Processes {
                 .trail
                 .iter()
                 .filter_map(|(t, p)| Some(((t * 1000.).round() as i64, field_value(p, field)?)));
-            let merged = top_up(history, start, points, from, self.width_s);
+            let merged = top_up(history, start, points, from, self.proc_width_s);
             self.fields.insert(field, merged.into());
         }
-        self.span = (from as f64, now);
+        self.proc_span = (from as f64, now);
         self.version += 1;
     }
 
@@ -1797,12 +1862,12 @@ impl Processes {
     }
 
     fn chart(&self, i: usize) -> TrendChart {
-        let gap = (self.width_s as f64 * 1.5).max(RECORD_INTERVAL_S * 2.5);
+        let gap = (self.proc_width_s as f64 * 1.5).max(RECORD_INTERVAL_S * 2.5);
         TrendChart::new(
             self.charts[i].clone(),
             self.version,
-            self.span,
-            self.width_s as f64,
+            self.proc_span,
+            self.proc_width_s as f64,
             gap,
         )
         .relative_axis()
@@ -1825,7 +1890,7 @@ impl Processes {
         let stored = self
             .stored
             .as_ref()
-            .filter(|s| s.range == self.range && s.key == Some(key(p)));
+            .filter(|s| s.range == self.proc_range && s.key == key(p));
         let status = if !running {
             Some("This process has exited; its last values are shown.")
         } else if stored.is_some_and(|s| s.proc_id.is_none()) {
@@ -1907,7 +1972,7 @@ impl Processes {
         let earlier_of = self
             .stored
             .as_ref()
-            .filter(|s| s.range == self.range && s.key == Some(key(p)) && s.earlier_runs > 0);
+            .filter(|s| s.range == self.proc_range && s.key == key(p) && s.earlier_runs > 0);
         let earlier = |f: ProcField| -> Rc<[Bucket]> {
             earlier_of
                 .and_then(|s| s.earlier.get(&f))
@@ -1962,9 +2027,9 @@ impl Processes {
         .child(details)
         .when_some(status, |d, s| d.child(caption(s, cx).text_color(t.orange)))
         .child(range_picker(
-            self.range,
+            self.proc_range,
             move |range, _, cx| {
-                this.update(cx, |p, cx| p.set_range(range, cx)).ok();
+                this.update(cx, |p, cx| p.set_proc_range(range, cx)).ok();
             },
             cx,
         ))
