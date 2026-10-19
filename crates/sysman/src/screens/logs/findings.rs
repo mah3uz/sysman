@@ -2,13 +2,14 @@ use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, Window,
     div, prelude::FluentBuilder, px,
 };
-use gpui_component::Icon;
-use gpui_component::Sizable;
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 use journal::findings::FindingKind;
 
-use super::Logs;
+use super::inspector::heading;
 use super::toolbar::{hair_b, severity_colour};
+use super::{Logs, model, recorded};
 use crate::ui::theme::{rem_px, theme};
 use crate::ui::widgets::hairline;
 
@@ -213,6 +214,113 @@ impl Logs {
                     .children(more),
             )
             .children(grid)
+            .into_any_element(),
+        )
+    }
+
+    /// Above the list while a finding narrows it: what it is, when, and what sysman recorded over its span.
+    pub(super) fn finding_header(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let t = theme(cx);
+        let index = self.controls.finding?;
+        let card = self.view.cards.iter().find(|c| c.index == index)?;
+        let colour = severity_colour(card.severity, t);
+        let pattern = if model::same_day(card.first_us, card.last_us, &self.tz) {
+            "%H:%M:%S"
+        } else {
+            "%b %-d %H:%M"
+        };
+        let when = if card.last_us > card.first_us {
+            format!(
+                "{} – {}",
+                model::clock(card.first_us, pattern, &self.tz),
+                model::clock(card.last_us, pattern, &self.tz)
+            )
+        } else {
+            model::clock(card.first_us, "%b %-d %H:%M:%S", &self.tz)
+        };
+        let entries = match card.count {
+            1 => "1 entry".to_string(),
+            n => format!("{n} entries"),
+        };
+        let recorded = self.finding_rec.as_ref().map(|r| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(rem_px(6.))
+                .child(heading("What sysman recorded", t))
+                .child(recorded::charts("logs-finding-chart", r, 3, 28., t))
+        });
+        Some(
+            hair_b(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap(rem_px(10.))
+                    .px(rem_px(14.))
+                    .pt(rem_px(10.))
+                    .pb(rem_px(12.)),
+                t,
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(rem_px(10.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(rem_px(7.))
+                                    .child(Icon::new(kind_icon(card.kind)).small().text_color(colour))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(t.panel_title)
+                                            .font_weight(t.weight_semibold)
+                                            .child(card.title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(t.caption)
+                                            .text_color(t.text_secondary)
+                                            .font_features(t.numbers.clone())
+                                            .child(format!("· {entries} · {when}")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(t.caption)
+                                    .text_color(t.text_secondary)
+                                    .child(card.evidence.clone()),
+                            ),
+                    )
+                    .child(recorded::open_in_explorer(
+                        "logs-finding-explorer",
+                        (card.last_us / 1_000_000) as i64,
+                        self,
+                    ))
+                    .child(
+                        Button::new("logs-finding-close")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::X))
+                            .tooltip("Show all entries")
+                            .on_click(cx.listener(|this, _, _, cx| this.set_finding(None, cx))),
+                    ),
+            )
+            .children(recorded)
             .into_any_element(),
         )
     }

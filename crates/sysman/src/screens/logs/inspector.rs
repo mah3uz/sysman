@@ -7,7 +7,11 @@ use gpui_component::input::Textarea;
 use journal::Entry;
 use journal::categories::source;
 
+use gpui_component::Icon;
+
+use super::findings::kind_icon;
 use super::list::{mono, priority_colour, priority_label, priority_mark};
+use super::toolbar::severity_colour;
 use super::{Inspected, Logs, model};
 use crate::ui::theme::{Theme, rem_px, theme};
 
@@ -32,7 +36,7 @@ pub(super) fn full_message(i: &Inspected) -> String {
     }
 }
 
-fn heading(text: &'static str, t: &Theme) -> Div {
+pub(super) fn heading(text: &'static str, t: &Theme) -> Div {
     div()
         .text_size(t.small_caption)
         .font_weight(t.weight_semibold)
@@ -112,6 +116,8 @@ impl Logs {
                 .child(div().w(rem_px(180.)).h(rem_px(10.)).rounded(rem_px(4.)).bg(t.card))
                 .into_any_element(),
         };
+        let finding = inspected.and_then(|i| self.member_card(i, cx));
+        let recorded = self.recorded_section(cx);
         let around = inspected
             .filter(|i| i.entry.is_some())
             .map(|i| self.around(i, t))
@@ -122,10 +128,85 @@ impl Logs {
         frame
             .child(
                 body.child(div().flex().flex_col().gap(rem_px(8.)).child(header).child(message))
+                    .children(finding)
+                    .children(recorded)
                     .children(around)
                     .children(fields),
             )
             .into_any_element()
+    }
+
+    /// The finding the entry is part of; clicking it narrows the list to that finding.
+    fn member_card(&self, i: &Inspected, cx: &Context<Self>) -> Option<AnyElement> {
+        let t = theme(cx);
+        let card = self.view.cards.iter().find(|c| Some(c.index) == i.finding)?;
+        let colour = severity_colour(card.severity, t);
+        let index = card.index;
+        let shown = self.controls.finding == Some(index);
+        Some(
+            div()
+                .id("logs-member")
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(rem_px(9.))
+                .px(rem_px(10.))
+                .py(rem_px(9.))
+                .rounded(t.card_radius)
+                .border_1()
+                .border_color(colour.opacity(0.35))
+                .bg(colour.opacity(0.08))
+                .cursor_pointer()
+                .hover(|d| d.bg(colour.opacity(0.13)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_finding(if shown { None } else { Some(index) }, cx);
+                }))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .size(rem_px(22.))
+                        .rounded(rem_px(6.))
+                        .bg(colour)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(kind_icon(card.kind)).xsmall().text_color(gpui::white())),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(t.caption)
+                                .font_weight(t.weight_semibold)
+                                .child(card.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(t.small_caption)
+                                .text_color(t.text_secondary)
+                                .child(card.evidence.clone()),
+                        )
+                        .child(
+                            div()
+                                .pt(px(2.))
+                                .text_size(t.small_caption)
+                                .text_color(t.blue)
+                                .child(if shown {
+                                    "Showing its entries · click to show all".to_string()
+                                } else if card.count > 1 {
+                                    format!("Show its {} entries", card.count)
+                                } else {
+                                    "Show it on its own".to_string()
+                                }),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The entries just before and after, unfiltered, with this one in its place.

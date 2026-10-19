@@ -30,6 +30,7 @@ use crate::charts::trend::{ChartState, GUTTER, TrendChart, clock};
 use crate::data::history::{Bucket, History, Proc, ProcPoint, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::source::Source;
+use crate::ui::shell::{Focus, take_focus};
 use crate::ui::theme::{Theme, rem_px, theme};
 use crate::ui::widgets::hint::helper_hint;
 use crate::ui::widgets::segmented::segmented_full;
@@ -287,6 +288,14 @@ impl Explorer {
             if let Some(span) = dev("SPAN").and_then(|s| s.parse().ok()) {
                 this.view.span = span;
             }
+            if let Some(ago) = dev("AT").and_then(|s| s.parse::<i64>().ok()) {
+                let now = this.now(cx);
+                this.open_at(now - ago as f64, now);
+            }
+        }
+        if let Some(Focus::Time { t }) = take_focus(cx) {
+            let now = this.now(cx);
+            this.open_at(t as f64, now);
         }
         this.refresh(cx);
         this
@@ -556,6 +565,12 @@ impl Explorer {
         self.grid = true;
         self.right.update(cx, |s, cx| s.set_collapsed(false, cx));
         self.apply_preset(Preset::Overview, cx);
+    }
+
+    /// The window centred on `t` with the time pinned there, for a link from another screen.
+    fn open_at(&mut self, t: f64, now: f64) {
+        self.view.centre_on(t, now);
+        self.pin.set(Some(t.min(now)));
     }
 
     fn pin_at(&mut self, t: f64, cx: &mut Context<Self>) {

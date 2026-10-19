@@ -3,7 +3,7 @@ use gpui::{
     Point, StatefulInteractiveElement, Styled, canvas, div, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{Disableable, Icon, Sizable};
+use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 
 use super::model::{self, Span, thousands};
@@ -148,7 +148,7 @@ impl Logs {
         out
     }
 
-    fn strip_fraction(&self, at: Point<Pixels>) -> f32 {
+    pub(super) fn strip_fraction(&self, at: Point<Pixels>) -> f32 {
         let b = self.strip.get();
         if b.size.width <= px(0.) {
             return 0.;
@@ -156,15 +156,32 @@ impl Logs {
         (f32::from(at.x - b.origin.x) / f32::from(b.size.width)).clamp(0., 1.)
     }
 
-    fn end_drag(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn end_drag(&mut self, cx: &mut Context<Self>) {
         let Some((a, b)) = self.drag.take() else { return };
         let (a, b) = (a.min(b), a.max(b));
         let (from, to) = self.view.range;
         if b - a >= MIN_SLICE && to > from {
             let at = |f: f32| from + ((to - from) as f64 * f as f64) as u64;
             self.set_controls(|c| c.window = Some((at(a), at(b))), cx);
+        } else if self.lanes_open
+            && let Some(mark) = self.lane_hover
+        {
+            self.narrow_to_mark(mark, cx);
         }
         cx.notify();
+    }
+
+    /// The dragged-out or applied slice as fractions of the scope.
+    pub(super) fn slice(&self) -> Option<(f32, f32)> {
+        let (from, to) = self.view.range;
+        match (self.drag, self.controls.window) {
+            (Some((a, b)), _) => Some((a.min(b), a.max(b))),
+            (None, Some((a, b))) if to > from => {
+                let f = |x: u64| (x.saturating_sub(from) as f32 / (to - from) as f32).clamp(0., 1.);
+                Some((f(a), f(b)))
+            }
+            _ => None,
+        }
     }
 
     /// Entries per bucket over the scope, stacked by priority, with the dragged slice outlined.
@@ -174,14 +191,7 @@ impl Logs {
         let max = buckets.iter().map(|b| b.total()).max().unwrap_or(0).max(1) as f32;
         let colours = [t.text_tertiary.opacity(0.35), t.blue, t.orange, t.red];
         let (from, to) = self.view.range;
-        let slice = match (self.drag, self.controls.window) {
-            (Some((a, b)), _) => Some((a.min(b), a.max(b))),
-            (None, Some((a, b))) if to > from => {
-                let f = |x: u64| (x.saturating_sub(from) as f32 / (to - from) as f32).clamp(0., 1.);
-                Some((f(a), f(b)))
-            }
-            _ => None,
-        };
+        let slice = self.slice();
         let ticks = model::ticks(from, to, &self.tz).into_iter().map(|(f, label)| {
             div()
                 .absolute()
@@ -296,8 +306,8 @@ impl Logs {
                     .ghost()
                     .xsmall()
                     .icon(Icon::new(IconName::ChevronDown))
-                    .disabled(true)
-                    .tooltip("Lanes by category, with what sysman recorded: not available yet"),
+                    .tooltip("Lanes by category, with what sysman recorded")
+                    .on_click(cx.listener(|this, _, _, cx| this.set_lanes_open(true, cx))),
             ),
         )
         .child(div().relative().h(rem_px(11.)).mr(rem_px(30.)).children(ticks))

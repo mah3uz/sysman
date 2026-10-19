@@ -117,6 +117,10 @@ pub enum Focus {
     Process { comm: String, instance: Option<(u32, u64)> },
     /// The disk that holds this mount point.
     Mount(String),
+    /// A moment in history, in Unix seconds.
+    Time { t: i64 },
+    /// The log entry nearest this time, in microseconds since the epoch.
+    LogEntry { t_us: u64 },
 }
 
 struct Navigator(WeakEntity<Shell>);
