@@ -8,6 +8,16 @@ const tiers = [
   { label: '15-minute min / avg / max', detail: 'rollups', span: '2 years', width: '100%', color: 'bg-accent' },
 ]
 
+const sources = ['Kernel', 'Hardware', 'Services', 'Apps', 'Scheduled jobs', 'Sign-ins', 'Boot and power', 'Crashes', 'Packages']
+
+const findings = [
+  { text: 'Crashes, folded per program, and OOM kills', dot: 'bg-hot' },
+  { text: 'Failed units and restart loops', dot: 'bg-warn' },
+  { text: 'Boots that ended without a shutdown, with the last readings', dot: 'bg-violet' },
+  { text: 'GPU faults, disk and NVMe errors, throttling', dot: 'bg-cool' },
+  { text: 'Failed sign-ins', dot: 'bg-accent' },
+]
+
 const crashLog = `f=~/.local/share/sysman/log/$(date +%F).jsonl
 tail -1 "$f" | jq .  # the latest sample
 jq -c 'select(.type=="sample") | [.time, .cpu.temp_c, .gpu.devices[]?.temp_c]' "$f"
@@ -67,6 +77,31 @@ jq -c 'select(.errors) | [.time, .errors]' "$f"  # collector failures`
             </li>
           </ul>
           <p class="mt-4 text-xs text-subtle">Default retention; each tier is configurable.</p>
+        </article>
+
+        <!-- logs -->
+        <article v-reveal class="card relative overflow-hidden p-6 sm:p-7 md:col-span-6">
+          <div class="grid gap-x-10 gap-y-6 lg:grid-cols-[1.1fr_1fr]">
+            <div>
+              <div class="flex h-10 w-10 items-center justify-center rounded-xl bg-cool/12 text-cool"><Icon name="list" /></div>
+              <h3 class="mt-5 text-lg font-semibold">Logs beside the metrics</h3>
+              <p class="mt-2 leading-relaxed text-muted">
+                The Logs screen reads the system’s logs where they are and puts them on one timeline, and
+                fixed rules pick out what is worth a look. Open any entry to see what the machine was doing at that
+                moment: CPU, memory and temperature, and the crashed process’s own memory, with a jump to
+                Explorer at that minute.
+              </p>
+            </div>
+            <div class="lg:self-end">
+              <p class="text-xs font-medium tracking-wide text-subtle uppercase">Worth a look</p>
+              <ul class="mt-3 space-y-2.5 text-sm text-muted">
+                <li v-for="f in findings" :key="f.text" class="flex gap-2.5"><span class="mt-2 h-1.5 w-1.5 shrink-0 rounded-full" :class="f.dot" />{{ f.text }}</li>
+              </ul>
+            </div>
+          </div>
+          <ul class="mt-6 flex flex-wrap gap-1.5" aria-label="Log sources">
+            <li v-for="s in sources" :key="s" class="rounded-md border border-line bg-canvas-2/70 px-2.5 py-1 text-xs text-muted">{{ s }}</li>
+          </ul>
         </article>
 
         <!-- crash log -->

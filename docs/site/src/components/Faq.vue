@@ -9,6 +9,7 @@ fsync = true            # force each crash-log line to disk
 raw_hours = 48          # full-resolution history
 rollup_1m_days = 90     # 1-minute min/avg/max
 rollup_15m_days = 730   # 15-minute min/avg/max
+events_days = 90        # recorded events
 
 [modules.processes]     # every module also accepts enabled and interval
 top_n = 20`
@@ -43,7 +44,9 @@ const paths = [
               No. The collector runs as a systemd user service and the app runs as you. A few readings are
               root-only in Linux (SMART health, CPU package power on most systems, other users’ disk I/O and
               open files, per-process network traffic); the app shows them as “not permitted” until you turn
-              on the optional helper.
+              on the optional helper. The Logs screen reads the whole system journal if you are in the
+              <span class="inline-code">systemd-journal</span> group (or <span class="inline-code">adm</span>,
+              or <span class="inline-code">wheel</span> on Arch); otherwise it shows only your own entries.
             </p>
           </div>
         </details>
@@ -54,7 +57,9 @@ const paths = [
             <p>
               No. There is no telemetry, no update check and no account. The app talks to the collector
               over a Unix socket and reads history from a local SQLite file; the helper runs with no network
-              access at all.
+              access at all. Logs are read where they are: only a short summary of each notable event, such
+              as a crash or a reboot, goes into history, never the message text. The history database and
+              the crash log are readable only by you.
             </p>
           </div>
         </details>
@@ -84,9 +89,14 @@ const paths = [
           <summary>My machine froze or lost power. How do I find out why?</summary>
           <div class="answer">
             <p>
-              Open that day’s crash log and read the last lines before the gap. Climbing temperatures or
-              falling fan speeds point at cooling; readings flat and normal to the very end point at the
-              power supply or cabling; a burst of GPU errors first points at the GPU or its driver. Every
+              Open Logs. A boot that ended without a shutdown is listed under Worth a look, with the reset
+              reason when an AMD processor reports one, sysman’s last readings before the end and that
+              boot’s last log entries. Climbing temperatures or falling fan speeds point at cooling;
+              readings flat and normal to the very end point at the power supply or cabling; a burst of
+              GPU errors first points at the GPU or its driver.
+            </p>
+            <p class="mt-3">
+              To read it by hand, open that day’s crash log and read the last lines before the gap. Every
               start writes a record with the boot id, so a new id after a gap marks the reboot.
             </p>
           </div>
@@ -99,6 +109,11 @@ const paths = [
               Linux on x86-64 with systemd, on AMD or Intel processors and NVIDIA, AMD or Intel graphics.
               The app needs a Wayland or X11 session with Vulkan. There are packages for Arch, Debian 12 or
               newer and Ubuntu 22.04 or newer, and an install script for other distributions.
+            </p>
+            <p class="mt-3">
+              Crash reports come from systemd-coredump, which Debian and Ubuntu do not install by default;
+              without it, crashes still show up from the kernel’s segfault lines. Package history is read
+              from pacman and apt/dpkg; dnf and zypper are not read yet.
             </p>
           </div>
         </details>

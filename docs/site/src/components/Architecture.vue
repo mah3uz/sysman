@@ -3,7 +3,7 @@ import Icon from './Icon.vue'
 
 const stores = [
   { name: 'Crash log', path: '~/.local/share/sysman/log/', note: 'JSON Lines, synced every tick, today and yesterday', dot: 'bg-warn' },
-  { name: 'History', path: '~/.local/share/sysman/history.db', note: 'SQLite with rollups, opened read-only by readers', dot: 'bg-accent' },
+  { name: 'History', path: '~/.local/share/sysman/history.db', note: 'SQLite with rollups and recorded events, opened read-only by readers', dot: 'bg-accent' },
   { name: 'Live socket', path: '$XDG_RUNTIME_DIR/sysman.sock', note: 'line-delimited JSON: meta, latest, subscribe, processes', dot: 'bg-ok' },
 ]
 
@@ -11,7 +11,7 @@ const facts = [
   {
     icon: 'home',
     title: 'Nothing leaves the machine',
-    text: 'Live data travels over a Unix socket and history sits in a local file. No account, no telemetry, no network connections.',
+    text: 'Live data travels over a Unix socket, history sits in a local file and logs are read where they are. No account, no telemetry, no network connections.',
   },
   {
     icon: 'lock',

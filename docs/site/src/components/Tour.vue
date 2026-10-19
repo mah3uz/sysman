@@ -6,7 +6,7 @@ const screens = [
     id: 'dashboard',
     label: 'Dashboard',
     title: 'The whole machine at a glance',
-    text: 'CPU, memory pressure, memory composition, swap, thermals, network and disk on one page, each with its history. Every card and chart opens a detail sheet that explains what the number means and how it is calculated.',
+    text: 'CPU, memory pressure, memory composition, swap, thermals, network and disk on one page, each with its history. Every card and chart opens a detail sheet that explains what the number means and how it is calculated. Crashes, OOM kills, failed services, reboots and package changes are marked on the charts, and the rail lists the recent ones.',
     alt: 'The Dashboard: CPU model and uptime, memory cards for pressure, available, app, cached, compressed and swap, a memory pressure chart, a processor chart, and a rail with per-core CPU bars and memory composition.',
   },
   {
@@ -55,7 +55,7 @@ const screens = [
     id: 'explorer',
     label: 'Explorer',
     title: 'Any metric, any time range',
-    text: 'Pick recorded metrics and processes, including ones that have exited, and chart them side by side with one shared cursor. Step back in time, zoom, jump to a date, follow live, and export what you see as CSV.',
+    text: 'Pick recorded metrics and processes, including ones that have exited, and chart them side by side with one shared cursor and recorded events marked. Step back in time, zoom, jump to a date, follow live, and export what you see as CSV.',
     alt: 'Explorer: a metric list on the left, a grid of charts for total CPU, pressure, memory composition and network throughput, and values at the cursor on the right.',
   },
   {
@@ -64,6 +64,13 @@ const screens = [
     title: 'What needs attention',
     text: 'Plain-language callouts from recent history: swap climbing, a process hogging the CPU, memory growing steadily, OOM kills, GPU throttling, disks filling up. Plus memory pressure events and the top consumers over a day or a week.',
     alt: 'Insights: a “Nothing needs attention” callout, a pressure events chart for the last two hours, and a memory growth card for a process.',
+  },
+  {
+    id: 'logs',
+    label: 'Logs',
+    title: 'What happened, and what the machine was doing',
+    text: 'Kernel, hardware, services, apps, scheduled jobs, sign-ins, boot and power, crashes and package history on one timeline, with search, filters and live follow. Worth a look picks out crashes, OOM kills, failed units, GPU and disk errors and boots that ended without a shutdown. Open any entry to see the lines around it and what sysman recorded at that moment.',
+    alt: 'The Logs screen: a sidebar of log sources, a boot timeline across the top, Worth a look cards for the findings, and the list of log entries.',
   },
 ]
 
@@ -85,7 +92,7 @@ function onKey(e, i) {
     <div class="wrap">
       <div class="mx-auto max-w-2xl text-center">
         <p v-reveal class="eyebrow">Screen tour</p>
-        <h2 v-reveal="60" class="mt-3 text-3xl font-semibold tracking-tight text-balance sm:text-5xl">Ten screens, one native app.</h2>
+        <h2 v-reveal="60" class="mt-3 text-3xl font-semibold tracking-tight text-balance sm:text-5xl">Eleven screens, one native app.</h2>
         <p v-reveal="120" class="mt-5 text-lg leading-relaxed text-muted">
           A native Linux app built with GPUI and drawn on the GPU. Every image here is a real screenshot
           of sysman reading a live collector.
