@@ -7020,6 +7020,9 @@ dependencies = [
  "anyhow",
  "flate2",
  "jiff",
+ "libc",
+ "libloading",
+ "serde_json",
  "tempfile",
 ]
 
