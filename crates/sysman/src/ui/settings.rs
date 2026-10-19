@@ -758,7 +758,6 @@ impl Render for Settings {
             .size_full()
             .flex()
             .flex_col()
-            .bg(t.window)
             .text_color(t.text)
             .font_family(t.font.clone())
             .font_weight(t.weight_body)
