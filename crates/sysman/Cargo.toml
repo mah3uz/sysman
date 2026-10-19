@@ -9,6 +9,7 @@ license.workspace = true
 schema.workspace = true
 sysman-config.workspace = true
 anyhow.workspace = true
+journal.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true
