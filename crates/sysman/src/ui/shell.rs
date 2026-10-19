@@ -29,6 +29,7 @@ use crate::screens::gpu::Gpu;
 use crate::screens::groups::Groups;
 use crate::screens::hardware::Hardware;
 use crate::screens::insights::Insights;
+use crate::screens::logs::Logs;
 use crate::screens::network::Network;
 use crate::screens::processes::Processes;
 use crate::ui::settings;
@@ -57,11 +58,12 @@ pub enum Tab {
     Hardware,
     Explorer,
     Insights,
+    Logs,
     Groups,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 10] = [
+    pub const ALL: [Tab; 11] = [
         Self::Dashboard,
         Self::Processes,
         Self::Gpu,
@@ -71,6 +73,7 @@ impl Tab {
         Self::Hardware,
         Self::Explorer,
         Self::Insights,
+        Self::Logs,
         Self::Groups,
     ];
 
@@ -85,6 +88,7 @@ impl Tab {
             Self::Hardware => "Hardware",
             Self::Explorer => "Explorer",
             Self::Insights => "Insights",
+            Self::Logs => "Logs",
             Self::Groups => "Groups",
         }
     }
@@ -100,6 +104,7 @@ impl Tab {
             Self::Hardware => IconName::Cpu,
             Self::Explorer => IconName::Activity,
             Self::Insights => IconName::Lightbulb,
+            Self::Logs => IconName::FileText,
             Self::Groups => IconName::Layers,
         }
     }
@@ -809,6 +814,7 @@ fn mount(tab: Tab, live: &Entity<Live>, feed: &Entity<ProcessFeed>, cx: &mut App
         Tab::Explorer => cx.new(|cx| Explorer::new(live, cx)).into(),
         Tab::Hardware => cx.new(|cx| Hardware::new(live, cx)).into(),
         Tab::Insights => cx.new(|cx| Insights::new(live, feed, cx)).into(),
+        Tab::Logs => cx.new(Logs::new).into(),
     }
 }
 
