@@ -324,6 +324,12 @@ events_state (name PRIMARY KEY, value)
   journal's boot list; a boot's `boot_end` is decided once a later boot
   runs, clean when that boot logged a shutdown or the journal stopping.
   Package logs are re-read when one's mtime changes, checked every 60 s.
+- Catching up uses a handle on every journal file; once caught up it
+  follows on one opened on just the files written since shortly before the
+  last entry read (the active ones, and an archive rotated since), because
+  a filtered step maps every open file and that is hundreds of MB of RSS.
+  A rotation (an active file's inode changes) reopens it before reading on,
+  so the rotated file's unread tail is still read.
 - The thread never blocks the scheduler or the JSONL writer: it sends
   `{"type": "events", "events": [...], "state": {...}}` records to the
   SQLite writer's queue (waiting for room rather than dropping), and each

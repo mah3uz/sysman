@@ -14,7 +14,7 @@ use journal::Entry;
 use journal::categories::{INDEX_FIELDS, ids};
 use journal::findings::{Detector, Finding, FindingKind};
 use journal::packages::{self, Transaction};
-use journal::reader::{self, Access, Boot, Fields, Filter, Journal, Seek};
+use journal::reader::{self, Access, Boot, Change, Fields, Filter, Journal, Seek};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -37,6 +37,9 @@ const PACKAGES_EVERY: Duration = Duration::from_secs(60);
 const PACKAGE_LOGS: [&str; 3] = ["pacman.log", "dpkg.log", "apt/history.log"];
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 const DAY_US: u64 = 86_400_000_000;
+const JOURNAL_DIRS: [&str; 2] = ["/var/log/journal", "/run/log/journal"];
+const ROTATED_MARGIN: Duration = Duration::from_secs(600);
+const FILES_EVERY: Duration = Duration::from_secs(60);
 
 /// One row of `events`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,16 +116,89 @@ fn stream_filter() -> Filter {
 struct Live {
     j: Journal,
     fields: Vec<&'static str>,
+    /// The files opened, or none for every file.
+    files: Vec<PathBuf>,
 }
 
 impl Live {
     fn open() -> Result<Live> {
-        let mut j = Journal::open()?;
+        Live::with(Journal::open()?, Vec::new())
+    }
+
+    /// Only the files that can hold entries after `after_us`. A handle on every file maps each one it touches, and
+    /// a filtered step touches them all: hundreds of MB of RSS. Without libsystemd, `journalctl` maps nothing here.
+    fn open_growing(after_us: u64) -> Result<Live> {
+        let files = growing_files(&journal_dirs(), after_us);
+        match Journal::open_files(&files) {
+            Ok(j) if !files.is_empty() => Live::with(j, files),
+            _ => Live::open(),
+        }
+    }
+
+    fn with(mut j: Journal, files: Vec<PathBuf>) -> Result<Live> {
         j.set_filter(&stream_filter())?;
         let mut fields = INDEX_FIELDS.to_vec();
         fields.push("__CURSOR");
-        Ok(Live { j, fields })
+        Ok(Live { j, fields, files })
     }
+}
+
+fn journal_dirs() -> Vec<PathBuf> {
+    let Ok(id) = std::fs::read_to_string("/etc/machine-id") else {
+        return Vec::new();
+    };
+    JOURNAL_DIRS.iter().map(|d| Path::new(d).join(id.trim())).collect()
+}
+
+fn journal_files(dirs: &[PathBuf]) -> Vec<(PathBuf, std::fs::Metadata)> {
+    dirs.iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".journal") || name.ends_with(".journal~")
+        })
+        .filter_map(|e| Some((e.path(), e.metadata().ok()?)))
+        .collect()
+}
+
+/// The files written since shortly before `after_us` and readable: the active ones, and any rotated or renamed
+/// since, whose tail may not have been read yet.
+fn growing_files(dirs: &[PathBuf], after_us: u64) -> Vec<PathBuf> {
+    let after = UNIX_EPOCH + Duration::from_micros(after_us) - ROTATED_MARGIN.min(Duration::from_micros(after_us));
+    let mut files: Vec<_> = journal_files(dirs)
+        .into_iter()
+        .filter(|(_, m)| m.modified().is_ok_and(|t| t >= after))
+        .filter(|(p, _)| std::fs::File::open(p).is_ok())
+        .map(|(p, _)| p)
+        .collect();
+    files.sort();
+    files
+}
+
+/// The files journald writes to now, by inode; a change is a rotation or a new user's journal.
+fn active_files(dirs: &[PathBuf]) -> Vec<(PathBuf, u64)> {
+    let mut files: Vec<_> = journal_files(dirs)
+        .into_iter()
+        .filter(|(p, _)| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            name.ends_with(".journal") && !name.contains('@')
+        })
+        .map(|(p, m)| (p, std::os::unix::fs::MetadataExt::ino(&m)))
+        .collect();
+    files.sort();
+    files
+}
+
+fn rotated(active: &[(PathBuf, u64)]) -> bool {
+    active.iter().any(|(p, ino)| {
+        std::fs::metadata(p)
+            .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
+            .ok()
+            != Some(*ino)
+    })
 }
 
 impl Source for Live {
@@ -156,6 +232,8 @@ struct Recorder {
     detector: Detector,
     state: State,
     index: usize,
+    /// The newest entry's time read so far.
+    read_us: u64,
     /// The cursor seeked to; its entry was read before the restart.
     skip: Option<String>,
 }
@@ -166,6 +244,7 @@ impl Recorder {
             detector: Detector::new(),
             state,
             index: 0,
+            read_us: 0,
             skip: None,
         }
     }
@@ -211,6 +290,7 @@ impl Recorder {
             self.detector.push(self.index, &e);
             self.index += 1;
             last_us = Some(e.t_us);
+            self.read_us = self.read_us.max(e.t_us);
             if cursor.is_some() {
                 self.state.cursor = cursor;
             }
@@ -485,23 +565,49 @@ fn follow(out: &mut Out, events_days: u32, log_dir: &Path) -> Result<Infallible>
     rec.start(&mut src, from_us)?;
     let mut packages = Packages::new(log_dir);
     let mut packages_due = Instant::now();
-    let mut caught_up = false;
+    // Set once caught up and following on a handle restricted to the files that can still grow.
+    let mut following: Option<Vec<(PathBuf, u64)>> = None;
+    let dirs = journal_dirs();
+    let mut files_checked = Instant::now();
+    let mut change = Change::Nothing;
     loop {
+        if let Some(active) = &following {
+            // a rotated file leaves the handle, so reopen before reading on, or its unread tail would be skipped; an
+            // archive read to its end is let go
+            let full_check = change == Change::FilesChanged || files_checked.elapsed() >= FILES_EVERY;
+            let changed = rotated(active)
+                || (full_check
+                    && (*active != active_files(&dirs)
+                        || (!src.files.is_empty() && src.files != growing_files(&dirs, rec.read_us))));
+            if full_check {
+                files_checked = Instant::now();
+            }
+            if changed {
+                following = Some(active_files(&dirs));
+                src = Live::open_growing(rec.read_us)?;
+                rec.continue_on(&mut src)?;
+            }
+        }
         let (mut events, end) = rec.read(&mut src, now_us().saturating_sub(LATE_US))?;
         if Instant::now() >= packages_due {
             events.extend(packages.poll(&mut rec.state, from_us));
             packages_due = Instant::now() + PACKAGES_EVERY;
         }
         out.send(events, &rec.state, None)?;
+        change = Change::Nothing;
         if end {
-            if !caught_up {
-                // listing boots and catching up mapped every journal file, hundreds of MB; a new handle maps only
-                // what following needs
-                src = Live::open()?;
+            if following.is_none() {
+                following = Some(active_files(&dirs));
+                src = Live::open_growing(rec.read_us)?;
                 rec.continue_on(&mut src)?;
+                // the catch-up's freed allocations stay resident in this thread's and the writer's arenas otherwise
+                #[cfg(target_env = "gnu")]
+                // SAFETY: malloc_trim only returns free heap pages to the kernel.
+                unsafe {
+                    libc::malloc_trim(0);
+                }
             }
-            caught_up = true;
-            src.j.wait(POLL)?;
+            change = src.j.wait(POLL)?;
         }
     }
 }
@@ -762,6 +868,49 @@ mod tests {
             events.iter().all(|e| e.kind == "boot"),
             "without the system journal every boot would look abrupt"
         );
+    }
+
+    #[test]
+    fn following_opens_the_files_that_can_still_grow_and_notices_a_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = [dir.path().to_path_buf()];
+        let now = SystemTime::now();
+        let file = |name: &str, age_s: u64| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, "").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(age_s))
+                .unwrap();
+        };
+        file("system.journal", 0);
+        file("user-1000.journal", 5);
+        file("system@a-1-2.journal", 30 * 86400);
+        file("system@b-3-4.journal", 60);
+        file("notes.txt", 0);
+        let read_us = now.duration_since(UNIX_EPOCH).unwrap().as_micros() as u64 - 120 * S;
+        let growing: Vec<_> = growing_files(&dirs, read_us)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            growing,
+            ["system.journal", "system@b-3-4.journal", "user-1000.journal"],
+            "a file rotated after the last read may hold entries not yet read; month-old archives cannot"
+        );
+
+        let active = active_files(&dirs);
+        assert_eq!(active.len(), 2, "archives are not written to");
+        assert!(!rotated(&active));
+        std::fs::rename(
+            dir.path().join("system.journal"),
+            dir.path().join("system@c-5-6.journal"),
+        )
+        .unwrap();
+        file("system.journal", 0);
+        assert!(rotated(&active), "the new system.journal is another file");
     }
 
     const PACMAN: &str = "\
