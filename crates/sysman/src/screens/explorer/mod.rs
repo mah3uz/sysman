@@ -27,6 +27,7 @@ use schema::system::SystemMeta;
 
 use crate::charts::format::bytes;
 use crate::charts::trend::{ChartState, GUTTER, TrendChart, clock};
+use crate::data::events::{self, Event};
 use crate::data::history::{Bucket, History, Proc, ProcPoint, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::source::Source;
@@ -93,6 +94,7 @@ struct Read {
     known: Vec<String>,
     charts: Vec<(&'static str, Vec<RawLine>)>,
     oldest: Option<f64>,
+    events: Vec<Event>,
 }
 
 fn read(req: &Request) -> Result<Read> {
@@ -144,6 +146,7 @@ fn read(req: &Request) -> Result<Read> {
         known,
         charts,
         oldest: oldest.map(|t| t as f64),
+        events: events::between(&history, req.from, req.to + 1)?.unwrap_or_default(),
     })
 }
 
@@ -187,6 +190,7 @@ pub struct Explorer {
     known: Vec<String>,
     selected: Vec<Selected>,
     lines: HashMap<&'static str, Vec<Line>>,
+    events: Rc<[Event]>,
     /// The window and bucket width the loaded lines were read for.
     loaded: Option<(i64, i64, i64)>,
     attempt: Option<(Request, f64)>,
@@ -239,6 +243,7 @@ impl Explorer {
             known: Vec::new(),
             selected: Vec::new(),
             lines: HashMap::new(),
+            events: Rc::default(),
             loaded: None,
             attempt: None,
             loading: false,
@@ -380,6 +385,7 @@ impl Explorer {
                         this.error = None;
                         this.known = read.known;
                         this.oldest = read.oldest;
+                        this.events = read.events.into();
                         this.apply_preset_once();
                         this.lines = read
                             .charts
@@ -1222,7 +1228,8 @@ impl Explorer {
         let mut chart = TrendChart::new(self.state(id), self.version, (from, to), width as f64, gap)
             .unit(def.unit)
             .y(def.y)
-            .height(height);
+            .height(height)
+            .events(self.events.clone());
         let mut legend = Vec::new();
         for line in self.lines.get(id).into_iter().flatten() {
             let color = line.hue.color(t);

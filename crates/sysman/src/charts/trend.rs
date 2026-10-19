@@ -3,22 +3,31 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, AnyView, App, Background, BorderStyle, Bounds, ContentMask, Context, DispatchPhase, ElementId, Font,
-    Hitbox, HitboxBehavior, Hsla, IntoElement, MouseMoveEvent, ParentElement, Path, PathBuilder, Pixels, Point, Render,
-    RenderOnce, SharedString, StyleRefinement, Styled, TextAlign, TextRun, Window, canvas, div, fill,
-    linear_color_stop, linear_gradient, outline, point, px, size,
+    AnyElement, AnyView, App, Background, BorderStyle, Bounds, ContentMask, Context, CursorStyle, DispatchPhase,
+    ElementId, Font, Hitbox, HitboxBehavior, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ParentElement, Path, PathBuilder, Pixels, Point, Render, RenderOnce, SharedString, StyleRefinement, Styled,
+    TextAlign, TextRun, TransformationMatrix, Window, canvas, div, fill, linear_color_stop, linear_gradient, outline,
+    point, px, size,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::charts::format::Unit;
+use crate::data::events::{Event, Kind};
 use crate::data::history::Bucket;
+use crate::ui::shell::{Focus, Tab, navigate};
 use crate::ui::theme::{Theme, theme};
 
 pub const GUTTER: Pixels = px(56.);
 const AXIS_HEIGHT: Pixels = px(16.);
 const TOP_PAD: Pixels = px(6.);
 const LABEL_LINE: Pixels = px(12.);
+/// Events closer than this share one marker.
+const CLUSTER_PX: f32 = 20.;
+/// How near the pointer must come to a marker's rule to pick it.
+const MARK_REACH: Pixels = px(6.);
+const GLYPH: Pixels = px(11.);
+const TIP_EVENTS: usize = 5;
 const TIME_STEPS: [i64; 13] = [
     60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800,
 ];
@@ -229,6 +238,8 @@ pub struct ChartState {
     cursor: Rc<Cell<Option<f64>>>,
     pin: Option<Rc<Cell<Option<f64>>>>,
     hovering: bool,
+    /// The event marker under the pointer, by index into the built marks.
+    mark: Option<usize>,
     /// The version last painted, so an unchanged chart is replayed rather than painted again.
     shown: Option<u64>,
 }
@@ -256,6 +267,12 @@ impl ChartState {
     }
 }
 
+/// The events within a few pixels of each other, most severe first.
+struct Mark {
+    x: Pixels,
+    events: Vec<Event>,
+}
+
 struct Built {
     key: (u64, Bounds<Pixels>),
     plot: Bounds<Pixels>,
@@ -263,6 +280,8 @@ struct Built {
     over: Vec<(Path<Pixels>, Background)>,
     dots: Vec<(Point<Pixels>, Hsla)>,
     markers: Vec<(Point<Pixels>, Hsla)>,
+    marks: Vec<Mark>,
+    sleeps: Vec<(Pixels, Pixels)>,
     rule_labels: Vec<(Pixels, SharedString, Hsla)>,
     y_ticks: Vec<(Pixels, SharedString)>,
     x_ticks: Vec<(Pixels, SharedString)>,
@@ -281,6 +300,7 @@ pub struct TrendChart {
     lines: Vec<Line>,
     rules: Vec<Rule>,
     markers: Vec<(f64, f64, Hsla)>,
+    events: Rc<[Event]>,
     unit: Unit,
     y: YScale,
     ticks: Option<Vec<f64>>,
@@ -304,6 +324,7 @@ impl TrendChart {
             lines: Vec::new(),
             rules: Vec::new(),
             markers: Vec::new(),
+            events: Rc::default(),
             unit: Unit::Percent,
             y: YScale::Zero,
             ticks: None,
@@ -348,6 +369,12 @@ impl TrendChart {
     /// A dot at `(t, value)`, such as a spike worth pointing at.
     pub fn marker(mut self, t: f64, value: f64, color: Hsla) -> Self {
         self.markers.push((t, value, color));
+        self
+    }
+
+    /// Marks these events behind the data; hovering one shows it, clicking opens Logs there.
+    pub fn events(mut self, events: Rc<[Event]>) -> Self {
+        self.events = events;
         self
     }
 
@@ -435,6 +462,8 @@ impl TrendChart {
                 .filter(|m| m.0 >= self.from && m.0 <= self.to)
                 .map(|&(t, v, color)| (point(self.x_of(&plot, t), px(y_of(v))), color))
                 .collect(),
+            marks: Vec::new(),
+            sleeps: Vec::new(),
             rule_labels: Vec::new(),
             y_ticks: ticks
                 .iter()
@@ -529,6 +558,36 @@ impl TrendChart {
             }
         }
 
+        let shown: Vec<&Event> = self
+            .events
+            .iter()
+            .filter(|e| !matches!(e.kind, Kind::Suspend | Kind::Resume))
+            .filter(|e| (self.from..=self.to).contains(&(e.t as f64)))
+            .collect();
+        let xs: Vec<f32> = shown.iter().map(|e| f32::from(self.x_of(&plot, e.t as f64))).collect();
+        for run in clusters(&xs, CLUSTER_PX) {
+            let mut events: Vec<Event> = shown[run.clone()].iter().map(|&e| e.clone()).collect();
+            events.sort_by_key(|e| e.kind);
+            built.marks.push(Mark {
+                x: px((xs[run.start] + xs[run.end - 1]) / 2.),
+                events,
+            });
+        }
+        let mut asleep = None;
+        for e in self.events.iter() {
+            match e.kind {
+                Kind::Suspend => asleep = Some(e.t as f64),
+                Kind::Resume => {
+                    let from = asleep.take().unwrap_or(self.from).max(self.from);
+                    let to = (e.t as f64).min(self.to);
+                    if to > from {
+                        built.sleeps.push((self.x_of(&plot, from), self.x_of(&plot, to)));
+                    }
+                }
+                _ => {}
+            }
+        }
+
         for rule in self.rules.iter().filter(|r| r.value >= lo && r.value <= hi) {
             let y = px(y_of(rule.value));
             let mut dash = PathBuilder::stroke(px(1.)).dash_array(&[px(4.), px(3.)]);
@@ -541,6 +600,18 @@ impl TrendChart {
         }
         built
     }
+}
+
+/// Splits sorted positions into runs no wider than `within`, so a burst of events reads as one marker.
+fn clusters(xs: &[f32], within: f32) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for (i, &x) in xs.iter().enumerate() {
+        match out.last_mut() {
+            Some(run) if x - xs[run.start] < within => run.end = i + 1,
+            _ => out.push(i..i + 1),
+        }
+    }
+    out
 }
 
 fn trace(path: &mut PathBuilder, p: &[(f32, f32)], start: bool) {
@@ -634,7 +705,37 @@ impl TrendChart {
                 ink.grid,
             ));
         }
+        let mark_colors: Vec<Hsla> = built.marks.iter().map(|m| m.events[0].kind.color(theme(cx))).collect();
         window.with_content_mask(Some(ContentMask { bounds: plot }), |window| {
+            // Drawn first and faint, so the data line always reads over them.
+            for &(x0, x1) in &built.sleeps {
+                window.paint_quad(fill(
+                    Bounds::from_corners(point(x0, plot.top()), point(x1, plot.bottom())),
+                    ink.secondary.opacity(0.07),
+                ));
+            }
+            for (mark, &color) in built.marks.iter().zip(&mark_colors) {
+                let below = plot.top() + GLYPH + px(5.);
+                window.paint_quad(fill(
+                    Bounds::new(point(mark.x - px(0.5), below), size(px(1.), plot.bottom() - below)),
+                    color.opacity(0.3),
+                ));
+                let count = (mark.events.len() > 1)
+                    .then(|| shape(window, &ink.font, mark.events.len().to_string().into(), ink.axis, color));
+                let count_w = count.as_ref().map_or(px(1.), |c| c.width + px(3.));
+                // Kept whole at the plot's edges, where the newest events land.
+                let centre = mark
+                    .x
+                    .clamp(plot.left() + GLYPH / 2., plot.right() - GLYPH / 2. - count_w);
+                let glyph = Bounds::centered_at(point(centre, plot.top() + px(3.) + GLYPH / 2.), size(GLYPH, GLYPH));
+                let path = mark.events[0].kind.icon().path();
+                window
+                    .paint_svg(glyph, path, None, TransformationMatrix::unit(), color.opacity(0.85), cx)
+                    .ok();
+                if let Some(count) = count {
+                    paint_text(window, cx, &count, point(glyph.right() + px(1.), glyph.top() - px(1.)));
+                }
+            }
             for (path, bg) in built.under.iter().chain(&built.over) {
                 window.paint_path(path.clone(), *bg);
             }
@@ -670,20 +771,43 @@ impl TrendChart {
         let built = state.built.as_ref().expect("built above");
         let plot = built.plot;
         let pinned = state.pin.as_ref().and_then(|p| p.get());
+        let mark = state.mark.and_then(|i| built.marks.get(i));
+        #[cfg(debug_assertions)]
+        let mark = mark.or_else(|| {
+            std::env::var_os("SYSMAN_DEV_MARK").and_then(|_| built.marks.iter().min_by_key(|m| m.events[0].kind))
+        });
         // A pin marks every chart in the group; only the chart under the pointer adds a tooltip to it.
-        let tooltip = pinned.is_none() || state.hovering;
+        let tooltip = (pinned.is_none() || state.hovering) && mark.is_none();
         if let Some(at) = pinned
             .or(state.cursor.get())
             .filter(|t| *t >= self.from && *t <= self.to)
         {
             self.paint_cursor(at, built, &ink, tooltip, window, cx);
         }
+        if let Some(mark) = mark {
+            self.paint_mark_tip(mark, plot, &ink, window, cx);
+            window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+        }
+        let marks: Vec<(Pixels, u64)> = built.marks.iter().map(|m| (m.x, m.events[0].t_us())).collect();
         drop(state);
 
         let state = self.state.clone();
         let (from, to) = (self.from, self.to);
         // Only the view drawing this chart, and the views around it, redraw; cached charts elsewhere are replayed.
         let owner = window.current_view();
+        if !marks.is_empty() {
+            let (state, hitbox, marks) = (state.clone(), hitbox.clone(), marks.clone());
+            window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble || e.button != MouseButton::Left || !hitbox.is_hovered(window) {
+                    return;
+                }
+                let Some(&(_, t_us)) = state.borrow().mark.and_then(|i| marks.get(i)) else {
+                    return;
+                };
+                cx.stop_propagation();
+                navigate(Tab::Logs, Some(Focus::LogEntry { t_us }), cx);
+            });
+        }
         window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
             if phase != DispatchPhase::Bubble {
                 return;
@@ -693,13 +817,44 @@ impl TrendChart {
                 let f = f64::from((e.position.x - plot.left()) / plot.size.width);
                 state.cursor.set(Some(from + f * (to - from)));
                 state.hovering = true;
+                state.mark = marks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(x, _))| (i, (x - e.position.x).abs()))
+                    .filter(|&(_, d)| d <= MARK_REACH)
+                    .min_by(|a, b| f32::from(a.1).total_cmp(&f32::from(b.1)))
+                    .map(|(i, _)| i);
                 cx.notify(owner);
             } else if state.hovering {
                 state.hovering = false;
+                state.mark = None;
                 state.cursor.set(None);
                 cx.notify(owner);
             }
         });
+    }
+
+    fn paint_mark_tip(&self, mark: &Mark, plot: Bounds<Pixels>, ink: &Ink, window: &mut Window, cx: &mut App) {
+        let pattern = if self.to - self.from > 6. * 3600. {
+            "%a %H:%M"
+        } else {
+            "%H:%M:%S"
+        };
+        let mut rows: Vec<(Option<Hsla>, SharedString, Hsla)> = mark
+            .events
+            .iter()
+            .take(TIP_EVENTS)
+            .map(|e| {
+                let text = format!("{}  {}", clock(e.t as f64, pattern), e.summary);
+                (Some(e.kind.color(theme(cx))), text.into(), ink.text)
+            })
+            .collect();
+        if mark.events.len() > TIP_EVENTS {
+            let more = format!("{} more", mark.events.len() - TIP_EVENTS);
+            rows.push((None, more.into(), ink.secondary));
+        }
+        rows.push((None, "Click to open in Logs".into(), ink.secondary));
+        paint_tip(&rows, mark.x, plot, ink, window, cx);
     }
 
     fn paint_cursor(&self, at: f64, built: &Built, ink: &Ink, tooltip: bool, window: &mut Window, cx: &mut App) {
@@ -714,7 +869,7 @@ impl TrendChart {
         } else {
             "%H:%M:%S"
         };
-        let mut rows = vec![(None, SharedString::from(clock(at, pattern)))];
+        let mut rows = vec![(None, SharedString::from(clock(at, pattern)), ink.secondary)];
         let span = (built.hi - built.lo).max(f64::EPSILON);
         let reach = self.gap_s.max(self.width_s) / 2. + 1.;
         for line in &self.lines {
@@ -735,45 +890,51 @@ impl TrendChart {
             } else {
                 format!("{}  {value}", line.label)
             };
-            rows.push((Some(line.color), label.into()));
+            rows.push((Some(line.color), label.into(), ink.text));
         }
-        if !tooltip {
-            return;
+        if tooltip {
+            paint_tip(&rows, x, plot, ink, window, cx);
         }
+    }
+}
 
-        let shaped: Vec<_> = rows
-            .iter()
-            .enumerate()
-            .map(|(i, (_, text))| {
-                let color = if i == 0 { ink.secondary } else { ink.text };
-                shape(window, &ink.font, text.clone(), ink.caption, color)
-            })
-            .collect();
-        let row_h = px(15.);
-        let pad = px(8.);
-        let text_w = shaped.iter().map(|l| l.width).fold(px(0.), |a, b| a.max(b));
-        let box_size = size(text_w + pad * 2. + px(12.), row_h * shaped.len() as f32 + pad * 2.);
-        let left = if x + px(10.) + box_size.width > plot.right() {
-            x - px(10.) - box_size.width
-        } else {
-            x + px(10.)
-        };
-        let tip = Bounds::new(point(left, plot.top() + px(4.)), box_size);
-        window.paint_quad(
-            fill(tip, ink.tooltip)
-                .corner_radii(px(6.))
-                .border_widths(px(0.5))
-                .border_color(ink.border),
-        );
-        for (i, ((color, _), line)) in rows.iter().zip(&shaped).enumerate() {
-            let y = tip.top() + pad + row_h * i as f32;
-            let mut x = tip.left() + pad;
-            if let Some(color) = color {
-                window.paint_quad(dot(point(x + px(3.), y + row_h / 2.), px(3.), *color));
-                x += px(12.);
-            }
-            line.paint(point(x, y), row_h, TextAlign::Left, None, window, cx).ok();
+/// A tooltip beside `x`: rows of text, each led by a coloured dot when it names a line or an event.
+fn paint_tip(
+    rows: &[(Option<Hsla>, SharedString, Hsla)],
+    x: Pixels,
+    plot: Bounds<Pixels>,
+    ink: &Ink,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let shaped: Vec<_> = rows
+        .iter()
+        .map(|(_, text, color)| shape(window, &ink.font, text.clone(), ink.caption, *color))
+        .collect();
+    let row_h = px(15.);
+    let pad = px(8.);
+    let text_w = shaped.iter().map(|l| l.width).fold(px(0.), |a, b| a.max(b));
+    let box_size = size(text_w + pad * 2. + px(12.), row_h * shaped.len() as f32 + pad * 2.);
+    let left = if x + px(10.) + box_size.width > plot.right() {
+        x - px(10.) - box_size.width
+    } else {
+        x + px(10.)
+    };
+    let tip = Bounds::new(point(left, plot.top() + px(4.)), box_size);
+    window.paint_quad(
+        fill(tip, ink.tooltip)
+            .corner_radii(px(6.))
+            .border_widths(px(0.5))
+            .border_color(ink.border),
+    );
+    for (i, ((color, _, _), line)) in rows.iter().zip(&shaped).enumerate() {
+        let y = tip.top() + pad + row_h * i as f32;
+        let mut x = tip.left() + pad;
+        if let Some(color) = color {
+            window.paint_quad(dot(point(x + px(3.), y + row_h / 2.), px(3.), *color));
+            x += px(12.);
         }
+        line.paint(point(x, y), row_h, TextAlign::Left, None, window, cx).ok();
     }
 }
 
@@ -902,6 +1063,17 @@ mod tests {
         assert_eq!(runs(&[], 15.), Vec::<Range<usize>>::new());
         assert_eq!(runs(&[0, 15, 30], 22.5), [Range { start: 0, end: 3 }]);
         assert_eq!(runs(&[0, 15, 60, 75, 90, 300], 22.5), [0..2, 2..5, 5..6]);
+    }
+
+    #[test]
+    fn events_a_few_pixels_apart_share_a_marker_but_a_steady_stream_does_not_merge_into_one() {
+        assert_eq!(clusters(&[], 8.), Vec::<Range<usize>>::new());
+        assert_eq!(clusters(&[10., 13., 40.], 8.), [0..2, 2..3]);
+        assert_eq!(
+            clusters(&[0., 5., 10., 15., 20.], 8.),
+            [0..2, 2..4, 4..5],
+            "each marker spans under 8 px from its first event, so chained neighbours do not swallow the chart"
+        );
     }
 
     #[test]
