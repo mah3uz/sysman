@@ -4,7 +4,7 @@ use gpui::{
     AnyElement, Context, Div, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px, uniform_list,
 };
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::button::Button;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
@@ -102,6 +102,13 @@ impl Logs {
                 }),
                 cx,
             );
+        }
+        // the list is laid out only after its first frame, so keep asking until it is at the end
+        if self.stick {
+            self.list.scroll_to_bottom();
+            if self.view.scanned && self.list.is_scrolled_to_end() == Some(true) {
+                self.stick = false;
+            }
         }
         let dated = !model::same_day(self.view.range.0, self.view.range.1, &self.tz);
         let list = uniform_list(

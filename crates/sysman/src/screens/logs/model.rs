@@ -233,6 +233,23 @@ pub fn transaction_line(t: &Transaction) -> String {
     line
 }
 
+/// The message without terminal colour codes, which some programs write into the journal.
+pub fn plain(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut chars = message.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while chars.next().is_some_and(|c| !c.is_ascii_alphabetic()) {}
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub fn clock(us: u64, pattern: &str, tz: &TimeZone) -> String {
     Timestamp::from_microsecond(us as i64)
         .map(|t| t.to_zoned(tz.clone()).strftime(pattern).to_string())
@@ -480,6 +497,12 @@ mod tests {
             transaction_line(&t),
             "Upgraded linux (6.11.1 → 6.11.2), installed htop (3.4), removed nano (8.0), 1 more"
         );
+    }
+
+    #[test]
+    fn colour_codes_are_dropped_from_messages() {
+        assert_eq!(plain("\u{1b}[1;32mDEBUG \u{1b}[0m]: ready"), "DEBUG ]: ready");
+        assert_eq!(plain("no codes"), "no codes");
     }
 
     #[test]

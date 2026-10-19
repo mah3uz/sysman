@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use gpui::{
-    AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
     ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, UniformListScrollHandle, Window, div,
 };
 use gpui_component::input::{InputEvent, InputState, TextareaState};
@@ -509,9 +509,6 @@ impl Logs {
             _ if self.stick || (at_end && self.following()) => self.list.scroll_to_bottom(),
             _ => {}
         }
-        if !self.view.items.is_empty() {
-            self.stick = false;
-        }
         #[cfg(debug_assertions)]
         self.dev_apply(cx);
         cx.notify();
@@ -558,6 +555,9 @@ impl Logs {
         }
         self.selected = row;
         self.inspected = None;
+        if row.is_some() {
+            self.stick = false;
+        }
         if let Some(row) = row {
             self.inspect(row, cx);
         }
@@ -581,14 +581,14 @@ impl Logs {
     }
 
     fn inspect(&mut self, row: u32, cx: &mut Context<Self>) {
-        let (scan, fetcher, gen) = (self.scan.clone(), self.fetcher.clone(), self.scan_gen);
+        let (scan, fetcher, scan_gen) = (self.scan.clone(), self.fetcher.clone(), self.scan_gen);
         let task = cx
             .background_executor()
             .spawn(async move { read_entry(scan, &fetcher, row) });
         cx.spawn(async move |this, cx| {
             let inspected = task.await;
             this.update(cx, |this, cx| {
-                if this.scan_gen == gen && this.selected == Some(row) {
+                if this.scan_gen == scan_gen && this.selected == Some(row) {
                     this.inspected = Some(inspected);
                     cx.notify();
                 }
@@ -614,14 +614,14 @@ impl Logs {
         }
         let rows = std::mem::take(&mut self.wanted);
         self.in_flight.extend(rows.iter().copied());
-        let (scan, fetcher, gen) = (self.scan.clone(), self.fetcher.clone(), self.scan_gen);
+        let (scan, fetcher, scan_gen) = (self.scan.clone(), self.fetcher.clone(), self.scan_gen);
         let task = cx
             .background_executor()
             .spawn(async move { read_lines(scan, &fetcher, &rows) });
         cx.spawn(async move |this, cx| {
             let lines = task.await;
             this.update(cx, |this, cx| {
-                if this.scan_gen != gen {
+                if this.scan_gen != scan_gen {
                     return;
                 }
                 this.in_flight.clear();
@@ -800,7 +800,8 @@ fn read_lines(scan: Arc<Scan>, fetcher: &Mutex<Option<Fetcher>>, rows: &[u32]) -
 }
 
 fn first_line(message: &str) -> String {
-    let line = message.lines().next().unwrap_or("").trim_end();
+    let message = model::plain(message);
+    let line = message.trim_start().lines().next().unwrap_or("").trim_end();
     let mut out: String = line.chars().take(LINE_CHARS).collect();
     if out.len() < line.len() || message.contains('\n') {
         out.push('…');

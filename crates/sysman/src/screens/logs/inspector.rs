@@ -2,6 +2,7 @@ use gpui::{
     AnyElement, Context, Div, ElementId, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
     Styled, div, prelude::FluentBuilder, px,
 };
+use gpui_component::Sizable;
 use gpui_component::input::Textarea;
 use journal::Entry;
 use journal::categories::source;
@@ -17,15 +18,15 @@ pub(super) fn full_message(i: &Inspected) -> String {
     if let Some(t) = &i.transaction {
         let mut lines: Vec<String> = t.command.iter().map(|c| format!("$ {c}")).collect();
         lines.extend(t.changes.iter().map(|c| match (&c.old, &c.new) {
-            (Some(old), Some(new)) => format!("{:?} {} {old} → {new}", c.action),
-            (_, Some(v)) | (Some(v), None) => format!("{:?} {} {v}", c.action),
+            (Some(old), Some(new)) => format!("{:?} {} {old} → {new}", c.action, c.name),
+            (_, Some(v)) | (Some(v), None) => format!("{:?} {} {v}", c.action, c.name),
             (None, None) => format!("{:?} {}", c.action, c.name),
         }));
         lines.extend(t.warnings.iter().map(|w| format!("warning: {w}")));
         return lines.join("\n");
     }
     match (&i.entry, &i.error) {
-        (Some(e), _) => e.message().to_string(),
+        (Some(e), _) => model::plain(e.message().trim()),
         (None, Some(err)) => format!("Could not read this entry: {err}"),
         (None, None) => "This entry is no longer in the journal.".into(),
     }
@@ -90,8 +91,13 @@ impl Logs {
         let message = match (inspected, &self.message) {
             (Some(_), Some(state)) => div()
                 .font_family(t.mono.clone())
-                .text_size(rem_px(12.))
-                .child(Textarea::new(state).appearance(false))
+                .child(
+                    Textarea::new(state)
+                        .appearance(false)
+                        .small()
+                        .p_0()
+                        .text_size(rem_px(12.)),
+                )
                 .into_any_element(),
             _ => div()
                 .flex()
@@ -120,7 +126,7 @@ impl Logs {
     /// The entries just before and after, unfiltered, with this one in its place.
     fn around(&self, i: &Inspected, t: &Theme) -> impl IntoElement + use<> {
         let line = |id: ElementId, e: &Entry, me: bool| {
-            let message: String = e.message().lines().next().unwrap_or("").chars().take(200).collect();
+            let message: String = model::plain(e.message()).lines().next().unwrap_or("").chars().take(200).collect();
             div()
                 .id(id)
                 .flex()
