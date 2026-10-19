@@ -203,7 +203,30 @@ impl Cli {
 
     pub(super) fn boots(&mut self) -> Result<Vec<Boot>> {
         self.stream = None;
-        parse_boots(&run(&["--list-boots".into(), "--output=json".into()])?)
+        // before systemd 251 --list-boots prints a table whatever --output says
+        match run(&["--list-boots".into(), "--output=json".into()]).and_then(|out| parse_boots(&out)) {
+            Ok(boots) => Ok(boots),
+            Err(_) => self.boots_by_id(),
+        }
+    }
+
+    /// Each `_BOOT_ID` with its first and last entry, read one boot at a time.
+    fn boots_by_id(&mut self) -> Result<Vec<Boot>> {
+        let ids = self.unique("_BOOT_ID")?;
+        boots_from(ids, |id| {
+            let args = |lines: &[&str]| {
+                let mut options = vec!["--output=json", "--output-fields=__CURSOR"];
+                options.extend(lines);
+                with(&options, &[format!("_BOOT_ID={id}")])
+            };
+            let time = |line: &[u8]| parse_entry(line, Fields::Only(&[]), 0).map(|(e, _)| e.t_us);
+            let Some(first) = first_line(&args(&[]))? else {
+                return Ok(None);
+            };
+            let last = run(&args(&["--lines=1"]))?;
+            let last = last.split(|&b| b == b'\n').find(|l| !l.is_empty()).unwrap_or(&first);
+            Ok(Some((time(&first)?, time(last)?)))
+        })
     }
 
     pub(super) fn wait(&mut self, timeout: Duration) -> Result<Change> {
@@ -395,9 +418,81 @@ fn parse_boots(json: &[u8]) -> Result<Vec<Boot>> {
     Ok(boots.into_iter().map(|(_, b)| b).collect())
 }
 
+/// Boots oldest first from their ids and each one's (first, last) entry times; an id that is not a boot id, or has
+/// no entries left, is left out.
+fn boots_from(ids: Vec<String>, mut span: impl FnMut(&str) -> Result<Option<(u64, u64)>>) -> Result<Vec<Boot>> {
+    let mut boots = vec![];
+    for id in ids {
+        if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        if let Some((first_us, last_us)) = span(&id)? {
+            boots.push(Boot { id, first_us, last_us });
+        }
+    }
+    boots.sort_by_key(|b| b.first_us);
+    Ok(boots)
+}
+
+/// The first line journalctl prints, without waiting for the rest.
+fn first_line(args: &[String]) -> Result<Option<Vec<u8>>> {
+    let mut child = journalctl(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("running journalctl")?;
+    let mut out = BufReader::new(child.stdout.take().expect("stdout is piped"));
+    let mut line = vec![];
+    let read = out.read_until(b'\n', &mut line);
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok((read.context("reading journalctl")? > 0).then_some(line))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // journalctl 249 (Ubuntu 22.04) with --list-boots --output=json; ids are made up
+    const BOOTS_TABLE: &str = "\
+-2 0123456789abcdef0123456789abcdef Mon 2026-10-12 08:00:01 +06—Mon 2026-10-12 23:10:00 +06
+-1 fedcba9876543210fedcba9876543210 Tue 2026-10-13 09:15:42 +06—Tue 2026-10-13 18:02:11 +06
+ 0 00112233445566778899aabbccddeeff Wed 2026-10-14 07:30:00 +06—Wed 2026-10-14 12:00:00 +06
+";
+
+    #[test]
+    fn a_boot_table_from_an_old_journalctl_is_not_taken_for_json_and_boots_come_from_their_ids() {
+        assert!(
+            parse_boots(BOOTS_TABLE.as_bytes()).is_err(),
+            "the table must send boots() to the per-id fallback"
+        );
+        let ids = ["fedcba9876543210fedcba9876543210", "0123456789abcdef0123456789abcdef", "vacuumed00000000000000000000000x", "-n1"]
+            .map(String::from)
+            .to_vec();
+        let mut asked = vec![];
+        let boots = boots_from(ids, |id| {
+            asked.push(id.to_string());
+            Ok(match id {
+                "0123456789abcdef0123456789abcdef" => Some((10, 20)),
+                "fedcba9876543210fedcba9876543210" => Some((30, 40)),
+                _ => None,
+            })
+        })
+        .unwrap();
+        let got: Vec<_> = boots.iter().map(|b| (&b.id[..4], b.first_us, b.last_us)).collect();
+        assert_eq!(got, [("0123", 10, 20), ("fedc", 30, 40)], "oldest first, whatever order -F gives");
+        assert_eq!(asked.len(), 2, "a value that is not a boot id never reaches journalctl's arguments");
+    }
+
+    #[test]
+    #[ignore = "reads this machine's journal"]
+    fn smoke_boots_by_id_match_the_json_list() {
+        let mut cli = Cli::open().unwrap();
+        let json = cli.boots().unwrap();
+        let by_id = cli.boots_by_id().unwrap();
+        let n = json.len() - 1;
+        assert_eq!(json[..n], by_id[..n], "the current boot is left out as its last entry moves");
+    }
 
     const LINE: &str = r#"{"__CURSOR":"s=1;i=2","__REALTIME_TIMESTAMP":"1700000000000001","__MONOTONIC_TIMESTAMP":"5","_BOOT_ID":"0123456789abcdef0123456789abcdef","PRIORITY":"3","MESSAGE":[27,91,51,49,109,104,105,255],"_TRANSPORT":["stdout","journal"],"BIG":null,"__SEQNUM":"9"}"#;
 
