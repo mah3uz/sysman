@@ -93,7 +93,9 @@ pub fn parse_pacman(text: &str) -> Vec<Transaction> {
     let mut last_us = 0;
 
     for line in text.lines() {
-        let Some((ts, tag, msg)) = alpm_line(line) else { continue };
+        let Some((ts, tag, msg)) = alpm_line(line) else {
+            continue;
+        };
         let Some(t) = alpm_us(ts) else { continue };
         last_us = t;
         match (tag, msg) {
@@ -163,7 +165,12 @@ fn alpm_change(msg: &str) -> Option<Change> {
         Action::Removed | Action::Purged => (Some(versions.to_string()), None),
         Action::Reinstalled => (Some(versions.to_string()), Some(versions.to_string())),
     };
-    Some(Change { action, name: name.to_string(), old, new })
+    Some(Change {
+        action,
+        name: name.to_string(),
+        old,
+        new,
+    })
 }
 
 pub fn parse_dpkg(text: &str, tz: &TimeZone) -> Vec<Transaction> {
@@ -173,7 +180,9 @@ pub fn parse_dpkg(text: &str, tz: &TimeZone) -> Vec<Transaction> {
 
     for line in text.lines() {
         let line = line.trim_end();
-        let (Some(date), Some(rest)) = (line.get(..19), line.get(20..)) else { continue };
+        let (Some(date), Some(rest)) = (line.get(..19), line.get(20..)) else {
+            continue;
+        };
         let Some(t) = local_us(date, tz) else { continue };
         let mut words = rest.split(' ');
         let Some(verb) = words.next() else { continue };
@@ -210,12 +219,20 @@ pub fn parse_dpkg(text: &str, tz: &TimeZone) -> Vec<Transaction> {
         let version = |v: &str| (v != "<none>").then(|| v.to_string());
         let (old, new) = (version(old), version(new));
         if action == Action::Purged
-            && let Some(prev) = tx.changes.iter_mut().find(|c| c.name == name && c.action == Action::Removed)
+            && let Some(prev) = tx
+                .changes
+                .iter_mut()
+                .find(|c| c.name == name && c.action == Action::Removed)
         {
             prev.action = Action::Purged;
             continue;
         }
-        tx.changes.push(Change { action, name: name.to_string(), old, new });
+        tx.changes.push(Change {
+            action,
+            name: name.to_string(),
+            old,
+            new,
+        });
     }
     out.extend(current);
     out.retain(|t| !t.changes.is_empty());
@@ -264,7 +281,8 @@ pub fn parse_apt_history(text: &str, tz: &TimeZone) -> Vec<Transaction> {
                     "Reinstall" => Action::Reinstalled,
                     _ => continue,
                 };
-                tx.changes.extend(value.split("), ").filter_map(|e| apt_change(action, e)));
+                tx.changes
+                    .extend(value.split("), ").filter_map(|e| apt_change(action, e)));
             }
         }
     }
@@ -284,7 +302,12 @@ fn apt_change(action: Action, entry: &str) -> Option<Change> {
         Action::Removed | Action::Purged => (Some(first), None),
         Action::Reinstalled => (Some(first.clone()), Some(first)),
     };
-    Some(Change { action, name: name.to_string(), old, new })
+    Some(Change {
+        action,
+        name: name.to_string(),
+        old,
+        new,
+    })
 }
 
 /// Reads whichever of pacman, dpkg and apt history exist on this machine; transactions that
@@ -316,7 +339,9 @@ pub fn read_history_in(log_dir: &Path, since_us: u64, tz: &TimeZone) -> Vec<Tran
 }
 
 fn rotated_texts(dir: &Path, base: &str) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut paths: Vec<_> = entries
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -334,7 +359,9 @@ fn read_text(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
     let bytes = if path.extension().is_some_and(|e| e == "gz") {
         let mut plain = Vec::new();
-        flate2::read::MultiGzDecoder::new(bytes.as_slice()).read_to_end(&mut plain).ok()?;
+        flate2::read::MultiGzDecoder::new(bytes.as_slice())
+            .read_to_end(&mut plain)
+            .ok()?;
         plain
     } else {
         bytes
@@ -391,7 +418,10 @@ this line is garbage
         assert_eq!(up.action, Action::Upgraded);
         assert_eq!((up.old.as_deref(), up.new.as_deref()), (Some("2.0-1"), Some("2.1-1")));
         let down = &txs[1].changes[2];
-        assert_eq!((down.action, down.old.as_deref(), down.new.as_deref()), (Action::Downgraded, Some("5-1"), Some("4-1")));
+        assert_eq!(
+            (down.action, down.old.as_deref(), down.new.as_deref()),
+            (Action::Downgraded, Some("5-1"), Some("4-1"))
+        );
     }
 
     #[test]
@@ -440,7 +470,10 @@ bad line
         let txs = parse_dpkg(DPKG, &tz(0));
         assert_eq!(txs[0].manager, Manager::Dpkg);
         let names: Vec<_> = txs[0].changes.iter().map(|c| (c.action, c.name.as_str())).collect();
-        assert_eq!(names, vec![(Action::Installed, "foo:amd64"), (Action::Upgraded, "bar:amd64")]);
+        assert_eq!(
+            names,
+            vec![(Action::Installed, "foo:amd64"), (Action::Upgraded, "bar:amd64")]
+        );
         let up = &txs[0].changes[1];
         assert_eq!((up.old.as_deref(), up.new.as_deref()), (Some("2.0"), Some("2.1")));
     }
@@ -455,7 +488,11 @@ bad line
     #[test]
     fn a_removal_followed_by_its_purge_is_one_purged_change() {
         let txs = parse_dpkg(DPKG, &tz(0));
-        let purged: Vec<_> = txs.iter().flat_map(|t| &t.changes).filter(|c| c.name == "old:amd64").collect();
+        let purged: Vec<_> = txs
+            .iter()
+            .flat_map(|t| &t.changes)
+            .filter(|c| c.name == "old:amd64")
+            .collect();
         assert_eq!(purged.len(), 1);
         assert_eq!(purged[0].action, Action::Purged);
     }
@@ -510,7 +547,10 @@ Install: cut:amd64 (1.0), tail:amd6";
     fn apt_covers_every_action_and_records_errors_as_warnings() {
         let txs = parse_apt_history(APT, &tz(0));
         let actions: Vec<_> = txs[1].changes.iter().map(|c| c.action).collect();
-        assert_eq!(actions, vec![Action::Removed, Action::Purged, Action::Downgraded, Action::Reinstalled]);
+        assert_eq!(
+            actions,
+            vec![Action::Removed, Action::Purged, Action::Downgraded, Action::Reinstalled]
+        );
         assert_eq!(txs[1].warnings.len(), 1);
     }
 
@@ -553,7 +593,11 @@ Install: cut:amd64 (1.0), tail:amd6";
         fs::write(dir.path().join("dpkg.log"), DPKG).unwrap();
         let txs = read_history_in(dir.path(), 0, &tz(0));
         let dpkg: Vec<_> = txs.iter().filter(|t| t.manager == Manager::Dpkg).collect();
-        assert_eq!(dpkg.len(), 2, "the 03-01 run lies inside an apt block; the two 03-02 12:00 runs do not");
+        assert_eq!(
+            dpkg.len(),
+            2,
+            "the 03-01 run lies inside an apt block; the two 03-02 12:00 runs do not"
+        );
         assert!(dpkg.iter().all(|t| t.start_us >= us("2026-03-02T12:00:00Z")));
         assert!(txs.windows(2).all(|w| w[0].start_us <= w[1].start_us));
     }

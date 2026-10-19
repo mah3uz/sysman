@@ -492,7 +492,8 @@ impl Scan {
     fn open(&self) -> Result<(Journal, Vec<Boot>, Seek)> {
         let mut j = Journal::open()?;
         *self.backend.lock().unwrap() = Some(j.backend());
-        let boots = j.boots()?;
+        // A journalctl too old to list boots costs the boot timeline, not the whole scan.
+        let boots = j.boots().unwrap_or_default();
         j.set_filter(&self.scope.filter())?;
         j.set_data_threshold(FIELD_LIMIT)?;
         let seek = match &self.scope.span {

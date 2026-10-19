@@ -199,11 +199,7 @@ impl Finding {
         let title = match self.kind {
             FindingKind::FailedUnit => {
                 let once = format!("{} failed ({})", self.field("unit"), self.field("result"));
-                if n > 1 {
-                    format!("{once}, {n} times")
-                } else {
-                    once
-                }
+                if n > 1 { format!("{once}, {n} times") } else { once }
             }
             FindingKind::RestartLoop => format!("{} keeps restarting ({n} restarts)", self.field("unit")),
             FindingKind::ThermalThrottle if self.data.contains_key("critical") => {
@@ -412,8 +408,8 @@ pub fn decode_reset_reason(text: &str) -> (&str, ResetKind) {
         ("power button", "power button held", ResetKind::PowerCut),
         ("shutdown pin", "shutdown pin", ResetKind::PowerCut),
         ("ASF power off", "remote power-off", ResetKind::PowerCut),
-        ("BP_SYS_RST_L", "reset pin", ResetKind::Abrupt),
-        ("KB_RST_L", "keyboard reset pin", ResetKind::Abrupt),
+        ("BP_SYS_RST_L", "reset button or board reset", ResetKind::Abrupt),
+        ("KB_RST_L", "keyboard controller reset", ResetKind::Abrupt),
         ("watchdog", "watchdog", ResetKind::Abrupt),
         ("sync flood", "sync flood", ResetKind::Abrupt),
         ("CPU shutdown event", "CPU shutdown event", ResetKind::Abrupt),
@@ -1648,7 +1644,7 @@ mod tests {
             (f[0].title.as_str(), f[0].data["certainty"].as_str()),
             ("Ended without shutdown", "confirmed")
         );
-        assert_eq!(f[0].data["reset_reason"], "reset pin");
+        assert_eq!(f[0].data["reset_reason"], "reset button or board reset");
 
         let f = run_with(reason("software wrote 0x6 to reset control register 0xCF9"));
         assert_eq!(
