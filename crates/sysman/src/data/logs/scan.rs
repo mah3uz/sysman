@@ -9,13 +9,16 @@ use journal::Entry;
 use journal::categories::{Categories, Category, INDEX_FIELDS, categorize, source};
 use journal::findings::{Detector, FindingKind};
 use journal::packages::{self, Manager, Transaction};
-use journal::reader::{Backend, Boot, Fields, Filter, Journal, Seek};
+use journal::reader::{Backend, Boot, Change, Fields, Filter, Journal, Seek};
 
 use super::index::{Batch, Coverage, Index, Row};
 use super::query::{Query, SearchSpec};
 
 const PUBLISH_EVERY: Duration = Duration::from_millis(100);
 const CHECK_EVERY: u64 = 512;
+const FOLLOW_WAIT: Duration = Duration::from_millis(250);
+/// Following stops once the index holds this many rows, so a journal left open for days cannot grow without bound.
+pub const FOLLOW_ROW_CAP: usize = 2_000_000;
 const FIELD_LIMIT: usize = 2048;
 const HASH_BYTES: usize = 1024;
 const LOCATE_WINDOW: usize = 64;
@@ -163,6 +166,11 @@ pub(super) fn entry_hash(e: &Entry) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanState {
     Running,
+    /// The scope is open-ended and the initial scan is over: new entries are appended as they arrive unless
+    /// [`Scan::set_follow`] turned that off. The index is complete up to the last batch published.
+    Following,
+    /// Following stopped because the index reached [`FOLLOW_ROW_CAP`] rows; what is there stays usable.
+    FollowCapped,
     Done,
     Cancelled,
     Failed(String),
@@ -171,6 +179,54 @@ pub enum ScanState {
 impl ScanState {
     pub fn is_running(&self) -> bool {
         *self == ScanState::Running
+    }
+
+    /// The scan thread is still alive and may append rows.
+    pub fn is_following(&self) -> bool {
+        *self == ScanState::Following
+    }
+}
+
+/// Where following stands in the journal by time and identity, so that after the journal files change, a re-seek
+/// to the last timestamp skips the entries already read and keeps the rest.
+#[derive(Default)]
+struct Resume {
+    t_us: u64,
+    seen: Vec<u64>,
+    skip: Option<Vec<u64>>,
+}
+
+impl Resume {
+    fn note(&mut self, e: &Entry, hash: u64) {
+        if e.t_us != self.t_us {
+            self.t_us = e.t_us;
+            self.seen.clear();
+        }
+        self.seen.push(hash);
+    }
+
+    fn reseek_point(&mut self) -> u64 {
+        self.skip = Some(self.seen.clone());
+        self.t_us
+    }
+
+    /// Whether `e`, read after a re-seek, is not one already noted: entries at the last timestamp are matched
+    /// one for one by hash, so identical messages written in the same microsecond each count.
+    fn is_new(&mut self, e: &Entry, hash: u64) -> bool {
+        let Some(skip) = &mut self.skip else {
+            return true;
+        };
+        if e.t_us > self.t_us {
+            self.skip = None;
+            return true;
+        }
+        match skip.iter().position(|h| *h == hash) {
+            Some(i) => {
+                skip.swap_remove(i);
+                false
+            }
+            None => e.t_us == self.t_us,
+        }
     }
 }
 
@@ -270,6 +326,7 @@ pub struct Scan {
     cancel: AtomicBool,
     state: Mutex<ScanState>,
     backend: Mutex<Option<Backend>>,
+    follow: AtomicBool,
     started: Instant,
     elapsed_ms: AtomicU64,
 }
@@ -285,19 +342,22 @@ impl Scan {
             cancel: AtomicBool::new(false),
             state: Mutex::new(ScanState::Running),
             backend: Mutex::new(None),
+            follow: AtomicBool::new(true),
             started: Instant::now(),
             elapsed_ms: AtomicU64::new(0),
         });
         let worker = scan.clone();
         let spawned = thread::Builder::new().name("logs-scan".into()).spawn(move || {
             let result = worker.run();
-            worker
-                .elapsed_ms
-                .store(worker.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            if worker.elapsed_ms.load(Ordering::Relaxed) == 0 {
+                worker
+                    .elapsed_ms
+                    .store(worker.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            }
             let state = match result {
                 Err(e) => ScanState::Failed(format!("{e:#}")),
-                Ok(()) if worker.cancelled() => ScanState::Cancelled,
-                Ok(()) => ScanState::Done,
+                Ok(_) if worker.cancelled() => ScanState::Cancelled,
+                Ok(end) => end,
             };
             *worker.state.lock().unwrap() = state;
         });
@@ -332,7 +392,7 @@ impl Scan {
         self.at_us.load(Ordering::Relaxed)
     }
 
-    /// Wall time the scan took once it ended; 0 while running.
+    /// Wall time the scan took once it ended, or reached the present and began following; 0 while running.
     pub fn elapsed(&self) -> Duration {
         Duration::from_millis(self.elapsed_ms.load(Ordering::Relaxed))
     }
@@ -348,6 +408,64 @@ impl Scan {
 
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Whether new journal entries are appended once the scan reaches the present; on by default. Turning it off
+    /// pauses appending within about 250 ms; turning it on again reads what arrived meanwhile. It has no effect
+    /// on a scope that ends in the past.
+    pub fn set_follow(&self, on: bool) {
+        self.follow.store(on, Ordering::Relaxed);
+    }
+
+    pub fn follow(&self) -> bool {
+        self.follow.load(Ordering::Relaxed)
+    }
+
+    fn follows(&self, current: &str) -> bool {
+        match &self.scope.span {
+            Span::Range { to_us, .. } => to_us.is_none(),
+            Span::Boot(id) => id == current,
+        }
+    }
+
+    fn follow_loop(&self, mut j: Journal, mut b: Builder, mut resume: Resume, mut n: u64) -> Result<ScanState> {
+        let mut last = Instant::now();
+        loop {
+            if self.cancelled() {
+                return Ok(ScanState::Cancelled);
+            }
+            if !self.follow() {
+                thread::sleep(FOLLOW_WAIT);
+                continue;
+            }
+            if j.wait(FOLLOW_WAIT)? == Change::FilesChanged {
+                j.seek(Seek::Realtime(resume.reseek_point()))?;
+            }
+            while let Some(e) = j.next(Fields::Only(INDEX_FIELDS))? {
+                let hash = entry_hash(&e);
+                if resume.is_new(&e, hash) {
+                    resume.note(&e, hash);
+                    b.add_entry(&e);
+                    n += 1;
+                }
+                if n.is_multiple_of(CHECK_EVERY) && last.elapsed() >= PUBLISH_EVERY {
+                    self.entries.store(n, Ordering::Relaxed);
+                    self.at_us.store(e.t_us, Ordering::Relaxed);
+                    self.publish(&mut b);
+                    last = Instant::now();
+                }
+                if self.cancelled() || !self.follow() {
+                    break;
+                }
+            }
+            self.entries.store(n, Ordering::Relaxed);
+            self.at_us.fetch_max(resume.t_us, Ordering::Relaxed);
+            self.publish(&mut b);
+            last = Instant::now();
+            if self.index().len() >= FOLLOW_ROW_CAP {
+                return Ok(ScanState::FollowCapped);
+            }
+        }
     }
 
     fn publish(&self, b: &mut Builder) {
@@ -375,7 +493,7 @@ impl Scan {
         }
     }
 
-    fn run(&self) -> Result<()> {
+    fn run(&self) -> Result<ScanState> {
         let (mut j, boots, seek) = self.open()?;
         let current = current_boot_id();
         let (pkg_from, pkg_to, coverage) = self.bounds(&boots, &current);
@@ -397,6 +515,7 @@ impl Scan {
         let to = self.upper_bound();
         let mut b = Builder::default();
         let mut detector = Detector::new();
+        let mut resume = Resume::default();
         let mut last = Instant::now();
         let mut n = 0u64;
         while let Some(e) = j.next(Fields::Only(INDEX_FIELDS))? {
@@ -407,6 +526,7 @@ impl Scan {
                 b.add_package(t, &boots);
             }
             detector.push(b.next_id(), &e);
+            resume.note(&e, entry_hash(&e));
             b.add_entry(&e);
             n += 1;
             if n.is_multiple_of(CHECK_EVERY) {
@@ -420,7 +540,7 @@ impl Scan {
         }
         self.entries.store(n, Ordering::Relaxed);
         if self.cancelled() {
-            return Ok(());
+            return Ok(ScanState::Cancelled);
         }
         for t in packages {
             b.add_package(t, &boots);
@@ -434,7 +554,13 @@ impl Scan {
             });
         }
         self.index.write().unwrap().set_findings(findings);
-        Ok(())
+        if to.is_none() && self.follows(&current) {
+            self.elapsed_ms
+                .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            *self.state.lock().unwrap() = ScanState::Following;
+            return self.follow_loop(j, b, resume, n);
+        }
+        Ok(ScanState::Done)
     }
 
     fn bounds(&self, boots: &[Boot], current: &str) -> (u64, u64, Coverage) {
@@ -764,5 +890,110 @@ mod tests {
         assert!(!first.state().is_running(), "and it stops: {:?}", first.state());
         logs.cancel();
         assert!(second.cancelled());
+    }
+
+    fn replay(resume: &mut Resume, entries: &[Entry]) -> Vec<String> {
+        entries
+            .iter()
+            .filter(|e| resume.is_new(e, entry_hash(e)))
+            .map(|e| e.message().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_reseek_after_rotation_keeps_only_entries_not_yet_read() {
+        let read = [
+            entry(1, 6, "a", "old", &[]),
+            entry(5, 6, "a", "x", &[]),
+            entry(5, 6, "a", "x", &[]),
+        ];
+        let mut resume = Resume::default();
+        read.iter().for_each(|e| resume.note(e, entry_hash(e)));
+        assert_eq!(resume.reseek_point(), 5);
+        let after_seek = [
+            read[1].clone(),
+            read[2].clone(),
+            entry(5, 6, "a", "y", &[]),
+            entry(5, 6, "a", "x", &[]),
+            entry(7, 6, "a", "z", &[]),
+        ];
+        assert_eq!(
+            replay(&mut resume, &after_seek),
+            ["y", "x", "z"],
+            "two x were read; a third x and everything newer are not duplicates"
+        );
+        assert_eq!(
+            replay(&mut resume, &[entry(5, 6, "a", "x", &[])]),
+            ["x"],
+            "skipping ends after newer entries"
+        );
+    }
+
+    #[test]
+    fn without_a_reseek_nothing_is_skipped() {
+        let mut resume = Resume::default();
+        let e = entry(5, 6, "a", "x", &[]);
+        resume.note(&e, entry_hash(&e));
+        assert_eq!(replay(&mut resume, &[e.clone(), e]), ["x", "x"]);
+    }
+
+    fn write(msg: &str) {
+        let mut child = std::process::Command::new("systemd-cat")
+            .args(["-t", "sysman-follow-test"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        writeln!(child.stdin.take().unwrap(), "{msg}").unwrap();
+        child.wait().unwrap();
+    }
+
+    fn settle(scan: &Scan, want: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while scan.index().len() != want && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        thread::sleep(Duration::from_millis(600));
+        scan.index().len()
+    }
+
+    #[test]
+    #[ignore = "writes to the user journal with systemd-cat and follows it live"]
+    fn following_appends_new_entries_and_pausing_loses_and_repeats_none() {
+        let scope = Scope::since(now_us() - 60_000_000).narrowed(Narrow {
+            sources: vec!["sysman-follow-test".into()],
+            ..Default::default()
+        });
+        let scan = Scan::start(scope);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !scan.state().is_following() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(scan.state(), ScanState::Following);
+        let base = scan.index().len();
+
+        (0..3).for_each(|i| write(&format!("live {i}")));
+        assert_eq!(
+            settle(&scan, base + 3),
+            base + 3,
+            "entries written after the scan arrive"
+        );
+
+        scan.set_follow(false);
+        thread::sleep(Duration::from_millis(600));
+        (0..2).for_each(|i| write(&format!("paused {i}")));
+        assert_eq!(settle(&scan, base + 3), base + 3, "nothing is appended while off");
+
+        scan.set_follow(true);
+        assert_eq!(settle(&scan, base + 5), base + 5, "turning it on catches up exactly");
+        write("again");
+        assert_eq!(settle(&scan, base + 6), base + 6);
+
+        scan.cancel();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while scan.state() != ScanState::Cancelled && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(scan.state(), ScanState::Cancelled);
     }
 }

@@ -28,7 +28,7 @@ fn measure_scans_queries_and_fetches_on_the_local_journal() {
                 first_rows = Some(t.elapsed());
             }
         }
-        assert_eq!(scan.state(), ScanState::Done);
+        assert!(matches!(scan.state(), ScanState::Done | ScanState::Following));
         let index = scan.index();
         println!(
             "{name}: {} entries, {} rows in {:.2} s (first rows after {:?}), {:.1} MiB, {} findings, backend {:?}",
