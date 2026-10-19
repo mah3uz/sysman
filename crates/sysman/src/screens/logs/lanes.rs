@@ -112,7 +112,7 @@ fn paint(bounds: Bounds<Pixels>, p: &Paint, window: &mut Window) {
         // 20–100 °C covers idle to throttling on every CPU sysman reads
         for run in runs(temp).iter().filter(|r| r.len() > 1) {
             let y = |v: f64| top + height * (1. - ((v - 20.) / 80.).clamp(0., 1.) as f32);
-            let mut line = PathBuilder::stroke(px(1.5));
+            let mut line = PathBuilder::stroke(px(1.25));
             line.move_to(point(px(x(&run[0])), px(y(run[0].avg))));
             for b in &run[1..] {
                 line.line_to(point(px(x(b)), px(y(b.avg))));
@@ -222,6 +222,21 @@ impl Logs {
                 }
             }
         }
+        let width = f32::from(self.strip.get().size.width);
+        if width > 0. {
+            let char_w = f32::from(t.small_caption) * 0.62 / width;
+            flags.sort_by_key(|f| !f.3);
+            let mut taken: Vec<(f32, f32)> = Vec::new();
+            flags.retain(|(f, text, _, right)| {
+                let w = text.chars().count() as f32 * char_w + 8. / width;
+                let span = if *right { (f - w, *f) } else { (*f, f + w) };
+                let free = taken.iter().all(|&(a, b)| span.1 <= a || span.0 >= b);
+                if free {
+                    taken.push(span);
+                }
+                free
+            });
+        }
         let data = self.lanes_rec.as_ref().and_then(|r| r.data());
         let recorded = data.filter(|d| !d.is_empty());
         let span_s = self
@@ -240,7 +255,7 @@ impl Logs {
             crash: t.red,
             hovered: t.text,
             cpu_fill: t.blue.opacity(0.16),
-            temp_line: t.orange.opacity(0.85),
+            temp_line: t.orange.opacity(0.7),
         };
         let cell = self.strip.clone();
         let surface = canvas(
