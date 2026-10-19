@@ -17,7 +17,7 @@ use crate::data::logs::{BootEnd, BootSummary};
 use crate::ui::shell::paused;
 use crate::ui::theme::{Theme, rem_px, theme};
 
-pub(super) const ROW: f32 = 22.;
+const ROW: f32 = 22.;
 /// What is on screen while a newer scan reads, see [`Logs::stale`].
 pub(super) const STALE: f32 = 0.6;
 const FADE: Duration = Duration::from_millis(160);

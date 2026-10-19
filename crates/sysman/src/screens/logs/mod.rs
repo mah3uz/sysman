@@ -46,8 +46,6 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 const AROUND: usize = 6;
 const LINE_CACHE: usize = 4096;
 const LINE_CHARS: usize = 400;
-/// How long a newer scan reads before its rows replace the older scan's results on screen.
-const SWAP: Duration = Duration::from_millis(1500);
 
 /// One finding, or several folded together, as a card shows it, copied out of the index.
 #[derive(Debug, Clone)]
@@ -126,7 +124,6 @@ struct Dev {
 struct Next {
     scan: Arc<Scan>,
     search: Option<Arc<Search>>,
-    since: Instant,
     view: Option<View>,
 }
 
@@ -721,7 +718,6 @@ impl Logs {
         self.next = Some(Next {
             scan,
             search,
-            since: Instant::now(),
             view: None,
         });
         self.recompute(cx);
@@ -747,24 +743,14 @@ impl Logs {
         self.next.is_some()
     }
 
-    /// The newer scan's view replaces the older one when it is complete, or once it has read for a while and
-    /// has rows enough to fill the list, including the selected entry.
-    fn ready(&self, view: &View, next: &Next) -> bool {
-        if view.key.settled || self.view.items.is_empty() || self.first {
-            return true;
-        }
-        if next.since.elapsed() < SWAP {
-            return false;
-        }
-        let height = f32::from(self.list.0.borrow().base_handle.bounds().size.height);
-        // twice over, so the list can scroll and is not taken for scrolled to its end, which would follow
-        let rows = 2 * (height / list::ROW).ceil() as usize;
-        view.items.len() >= rows && self.selected.is_none_or(|r| carry(&self.scan, &next.scan, r).is_some())
+    /// The newer scan's view replaces the older one once it is complete: the scan reads oldest first, so the
+    /// newest entries the list opens at come last.
+    fn ready(&self, view: &View) -> bool {
+        view.key.settled || self.view.items.is_empty() || self.first
     }
 
     fn offer(&mut self, view: View, cx: &mut Context<Self>) {
-        let Some(next) = &self.next else { return };
-        if self.ready(&view, next) {
+        if self.ready(&view) {
             self.promote(view, cx);
         } else if let Some(next) = &mut self.next {
             next.view = Some(view);
@@ -811,11 +797,10 @@ impl Logs {
         self.dropped = view.key.dropped;
         self.wanted.clear();
         self.in_flight.clear();
-        self.stick = false;
+        self.stick = carried.is_none();
         self.apply_view(view, cx);
-        match carried {
-            Some(row) => self.reveal(row),
-            None => self.list.scroll_to_item_strict(0, ScrollStrategy::Top),
+        if let Some(row) = carried {
+            self.reveal(row);
         }
     }
 
@@ -976,13 +961,6 @@ impl Logs {
         if dropped != self.dropped {
             self.dropped = dropped;
             self.forget_rows(cx);
-        }
-        if let Some(next) = &self.next
-            && let Some(view) = &next.view
-            && self.ready(view, next)
-            && let Some(view) = self.next.as_mut().and_then(|n| n.view.take())
-        {
-            self.promote(view, cx);
         }
         let key = self.key();
         let state = self.target().0.state();

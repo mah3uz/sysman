@@ -120,7 +120,7 @@ impl Logs {
 
     fn summary(&self) -> String {
         let reading = self.reading();
-        let mut out = if reading.state().is_running() {
+        let mut out = if reading.state().is_running() || self.stale() {
             let at = reading.position_us();
             let mut s = format!("Reading the journal · {} entries", thousands(reading.entries_read()));
             if at > 0 {
