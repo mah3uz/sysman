@@ -351,12 +351,15 @@ impl Logs {
                         )
                         .child(
                             div()
+                                .w_full()
                                 .flex()
                                 .flex_row()
                                 .items_center()
                                 .gap(rem_px(4.))
                                 .child(
                                     div()
+                                        .flex_1()
+                                        .min_w_0()
                                         .px(rem_px(6.))
                                         .py(rem_px(1.))
                                         .rounded(rem_px(4.))
@@ -365,7 +368,7 @@ impl Logs {
                                         .text_size(t.small_caption)
                                         .child(command.clone()),
                                 )
-                                .child(copy("logs-copy-sudo", "Copy", IconName::Copy, command, cx)),
+                                .child(copy("logs-copy-sudo", "Copy", IconName::Copy, command, cx).flex_shrink_0()),
                         )
                 }
             }

@@ -226,13 +226,17 @@ impl Logs {
                     .items_center()
                     .child(heading)
                     .child(div().flex_1())
-                    .children(self.status.filter(|s| !s.crash_reports).map(|_| {
-                        div()
-                            .text_size(t.caption)
-                            .text_color(t.text_tertiary)
-                            .mr(rem_px(12.))
-                            .child("Crash reports need systemd-coredump")
-                    }))
+                    .children(
+                        self.status
+                            .filter(|s| !s.crash_reports && !cards.iter().any(|c| c.kind == FindingKind::Crash))
+                            .map(|_| {
+                                div()
+                                    .text_size(t.caption)
+                                    .text_color(t.text_tertiary)
+                                    .mr(rem_px(12.))
+                                    .child("Crash reports need systemd-coredump")
+                            }),
+                    )
                     .children(more),
             )
             .children(grid)

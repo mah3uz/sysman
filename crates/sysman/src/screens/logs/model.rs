@@ -193,14 +193,21 @@ fn subject(f: &Finding) -> Option<String> {
 /// A unit's failure with result `core-dump` this close to a crash of its process is that same crash.
 const CRASH_FAILURE_US: u64 = 10_000_000;
 
+/// A crash in a user service names only the user manager as its unit, so there the program's name must appear in
+/// the failed unit's.
 fn same_crash(failed: &Finding, crash: &Finding) -> bool {
-    let unit = |f: &Finding| f.data.get("unit").filter(|u| !u.is_empty()).cloned();
+    let get = |f: &Finding, k: &str| f.data.get(k).filter(|v| !v.is_empty()).map(|v| v.to_lowercase());
+    let (Some(unit), Some(crashed_in)) = (get(failed, "unit"), get(crash, "unit")) else {
+        return false;
+    };
+    let ours = unit == crashed_in
+        || (crashed_in.starts_with("user@") && get(crash, "comm").is_some_and(|c| unit.contains(&c)));
     failed.kind == FindingKind::FailedUnit
         && crash.kind == FindingKind::Crash
         && failed.count <= 1
         && failed.data.get("result").map(String::as_str) == Some("core-dump")
         && failed.boot_id == crash.boot_id
-        && unit(failed).is_some_and(|u| unit(crash) == Some(u))
+        && ours
         && failed.first_us.abs_diff(crash.first_us) <= CRASH_FAILURE_US
 }
 
@@ -711,6 +718,21 @@ mod tests {
             vec![vec![0, 1], vec![4, 3], vec![2]],
             "the unit failed because its process dumped core: one event, seen once; a later failure, another \
              result or another unit stays a failure"
+        );
+        let in_user_manager = about(
+            FindingKind::Crash,
+            1_000_000_000,
+            &[("comm", "nautilus"), ("unit", "user@1000.service")],
+        );
+        let f = [
+            in_user_manager,
+            failed(1_000_045_000, "dbus-:1.2-org.gnome.Nautilus@0.service", "core-dump"),
+            failed(1_000_045_000, "pipewire.service", "core-dump"),
+        ];
+        assert_eq!(
+            grouped(&f),
+            vec![vec![0, 1], vec![2]],
+            "a user service's crash names the user manager, so the program's name ties it to its unit"
         );
     }
 
