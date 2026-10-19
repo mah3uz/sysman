@@ -1,5 +1,6 @@
 <script setup>
 import { computed, ref } from 'vue'
+import Shot from './Shot.vue'
 
 const screens = [
   {
@@ -133,13 +134,10 @@ function onKey(e, i) {
         >
           <div class="relative">
             <Transition name="swap" mode="out-in">
-              <img
+              <Shot
+                :id="current.id"
                 :key="current.id"
-                :src="`/shots/${current.id}.webp`"
-                :srcset="`/shots/${current.id}-640.webp 640w, /shots/${current.id}.webp 1280w`"
                 sizes="(min-width: 1024px) 860px, 100vw"
-                width="1280"
-                height="720"
                 loading="lazy"
                 :alt="current.alt"
                 class="shot h-auto w-full"

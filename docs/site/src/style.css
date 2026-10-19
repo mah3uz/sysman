@@ -153,6 +153,26 @@
     border: 1px solid var(--line);
     overflow-wrap: anywhere;
   }
+  .art {
+    position: relative;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 0.9rem;
+    padding: 0.75rem;
+    font-size: 0.72rem;
+    line-height: 1.35;
+    color: var(--muted);
+    background:
+      radial-gradient(120% 90% at 0% 0%, color-mix(in oklab, var(--tint, var(--blue)) 10%, transparent), transparent 62%),
+      var(--canvas-2);
+  }
+  .art-label {
+    font-size: 0.62rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--subtle);
+  }
 }
 
 .js [data-reveal] {

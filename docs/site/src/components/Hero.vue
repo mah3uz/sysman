@@ -1,6 +1,7 @@
 <script setup>
 import Icon from './Icon.vue'
 import LiveSpark from './LiveSpark.vue'
+import Shot from './Shot.vue'
 </script>
 
 <template>
@@ -47,12 +48,9 @@ import LiveSpark from './LiveSpark.vue'
     <div v-reveal="200" class="wrap relative mt-14 sm:mt-16">
       <div class="relative mx-auto max-w-6xl">
         <div class="hero-halo pointer-events-none absolute -inset-x-8 -top-10 -bottom-6 -z-10 rounded-[3rem]" aria-hidden="true" />
-        <img
-          src="/shots/gpu.webp"
-          srcset="/shots/gpu-640.webp 640w, /shots/gpu.webp 1280w"
+        <Shot
+          id="gpu"
           sizes="(min-width: 1200px) 1152px, 100vw"
-          width="1280"
-          height="720"
           fetchpriority="high"
           alt="The sysman GPU screen: utilisation, power, VRAM, temperature, clock and video engine cards above a 30-minute utilisation chart, with device details and per-category GPU use in the side rail."
           class="shot h-auto w-full"
