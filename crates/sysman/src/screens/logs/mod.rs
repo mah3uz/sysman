@@ -69,6 +69,7 @@ struct Key {
     scan: u64,
     query: u64,
     rows: usize,
+    dropped: usize,
     hits: usize,
     settled: bool,
     lanes: bool,
@@ -90,7 +91,7 @@ struct View {
     cards: Vec<Card>,
     /// Every finding as a card of its own, by its place in [`data::Index::findings`].
     singles: Vec<Card>,
-    tallies: Vec<(FindingKind, usize)>,
+    tallies: Vec<(FindingKind, usize, usize)>,
     packages: Option<&'static str>,
     /// Computed after the scan's first pass, so the findings and boot ends are in.
     scanned: bool,
@@ -113,9 +114,9 @@ struct Inspected {
 struct Dev {
     select: Option<String>,
     finding: Option<usize>,
-    own_only: bool,
     hover: Option<usize>,
-    /// `backtrace` opens the selected crash's sheet; `restart` shows the restart confirmation, never running it.
+    /// `backtrace` opens the selected crash's sheet; `restart` shows the restart confirmation, never running it;
+    /// `nopolkit` shows what a restart without a polkit agent says.
     action: Option<String>,
 }
 
@@ -184,6 +185,10 @@ pub struct Logs {
     /// The copy button showing its feedback, by row.
     copied: Option<(u32, &'static str)>,
     restart: Option<(u32, actions::Restart)>,
+    /// A restart failed because no polkit agent could ask for the password; later confirmations say so up front.
+    no_agent: bool,
+    /// [`data::Index::dropped`] when the row ids in hand were taken.
+    dropped: usize,
     tz: TimeZone,
     #[cfg(debug_assertions)]
     dev: Dev,
@@ -274,6 +279,8 @@ impl Logs {
             pending: None,
             copied: None,
             restart: None,
+            no_agent: false,
+            dropped: 0,
             tz: TimeZone::system(),
             #[cfg(debug_assertions)]
             dev: Dev::default(),
@@ -290,8 +297,9 @@ impl Logs {
 
     /// Screenshot aids: `SYSMAN_DEV_LOGS_QUERY` (search text), `_RANGE` (`5min` … `7day`), `_BOOT` (`-1`, …),
     /// `_FINDING` (the nth card, once the scan ends), `_SELECT` (`error`, or rows back from the newest),
-    /// `_ACCESS=own` (the own-entries banner), `_AT` (open at the entry this many seconds ago) and `_HOVER` (hover the
-    /// busiest mark of this lane) and `_ACTION` (see [`Dev::action`]).
+    /// `_ACCESS=own` (read as if only the user's own journal were readable), `_COREDUMP=missing`, `_JOURNAL=none`,
+    /// `_PACKAGES=dnf` (the "can't tell" notes), `_CAP` (a lower row cap), `_AT` (open at the entry this many seconds
+    /// ago) and `_HOVER` (hover the busiest mark of this lane) and `_ACTION` (see [`Dev::action`]).
     #[cfg(debug_assertions)]
     fn dev_setup(&mut self, cx: &mut Context<Self>) {
         use crate::ui::widgets::range::Range;
@@ -323,7 +331,6 @@ impl Logs {
         }
         self.dev.select = var("SELECT");
         self.dev.finding = var("FINDING").and_then(|f| f.parse().ok());
-        self.dev.own_only = var("ACCESS").as_deref() == Some("own");
         self.dev.hover = var("HOVER").and_then(|l| l.parse().ok());
         self.dev.action = var("ACTION");
         if let Some(ago) = var("AT").and_then(|s| s.parse::<u64>().ok()) {
@@ -386,6 +393,10 @@ impl Logs {
                 }
             }
             Some("restart") => self.restart = Some((i.row, actions::Restart::Confirm)),
+            Some("nopolkit") => {
+                self.no_agent = true;
+                self.restart = Some((i.row, actions::Restart::NoAgent));
+            }
             _ => {}
         }
     }
@@ -433,7 +444,11 @@ impl Logs {
             && let Some(message) = &self.message
         {
             self.message_row = shown;
-            let text = self.inspected.as_ref().map(inspector::shown_message).unwrap_or_default();
+            let text = self
+                .inspected
+                .as_ref()
+                .map(inspector::shown_message)
+                .unwrap_or_default();
             message.update(cx, |s, cx| s.set_value(text, window, cx));
         }
     }
@@ -662,10 +677,8 @@ impl Logs {
         self.scan.set_follow(self.follow);
         self.scan_gen += 1;
         self.fetcher = Arc::default();
-        self.lines.clear();
-        self.wanted.clear();
-        self.in_flight.clear();
-        self.select(None, cx);
+        self.dropped = 0;
+        self.forget_rows(cx);
         // finding indexes and the strip's slice belong to the old index
         self.controls.finding = None;
         self.finding_rec = None;
@@ -684,6 +697,13 @@ impl Logs {
         cx.notify();
     }
 
+    fn forget_rows(&mut self, cx: &mut Context<Self>) {
+        self.lines.clear();
+        self.wanted.clear();
+        self.in_flight.clear();
+        self.select(None, cx);
+    }
+
     fn retry(&mut self, cx: &mut Context<Self>) {
         self.rescan(cx);
     }
@@ -700,7 +720,16 @@ impl Logs {
     }
 
     fn following(&self) -> bool {
-        self.follow && self.span.reaches_now()
+        self.follow && self.span.reaches_now() && !self.follow_capped()
+    }
+
+    fn own_only(&self) -> bool {
+        self.status
+            .is_some_and(|s| s.access == journal::reader::Access::OwnOnly)
+    }
+
+    fn follow_capped(&self) -> bool {
+        self.scan.state() == ScanState::FollowCapped
     }
 
     fn key(&self) -> Key {
@@ -710,6 +739,7 @@ impl Logs {
             scan: self.scan_gen,
             query: self.query_gen,
             rows: self.scan.index().len(),
+            dropped: self.scan.index().dropped(),
             hits: self.search.as_ref().map_or(0, |s| s.hits().len()),
             settled: !state.is_running() && !searching,
             lanes: self.lanes_open,
@@ -795,6 +825,11 @@ impl Logs {
     }
 
     fn poll(&mut self, cx: &mut Context<Self>) -> bool {
+        let dropped = self.scan.index().dropped();
+        if dropped != self.dropped {
+            self.dropped = dropped;
+            self.forget_rows(cx);
+        }
         let key = self.key();
         let state = self.scan.state();
         if key != self.view.key {
@@ -1031,17 +1066,25 @@ fn compute(scan: &Scan, search: Option<&Search>, q: &Query, span: &Span, from_us
 /// `members` are newest first, as [`model::grouped`] gives them.
 fn card(findings: &[journal::findings::Finding], members: Vec<usize>) -> Card {
     let f = &findings[members[0]];
-    let events = members.iter().map(|&i| findings[i].count).sum();
-    let folded = members.len() > 1;
+    let same: Vec<usize> = members
+        .iter()
+        .copied()
+        .filter(|&i| findings[i].kind == f.kind)
+        .collect();
+    let events = same.iter().map(|&i| findings[i].count).sum();
+    let folded = same.len() > 1;
     Card {
         kind: f.kind,
         severity: f.severity,
         title: if folded {
-            model::folded_title(f, members.len(), events)
+            model::folded_title(f, same.len(), events)
         } else {
             f.title.clone()
         },
-        evidence: f.evidence.clone(),
+        evidence: match data::end_note(f) {
+            Some(note) if f.kind == FindingKind::BootWithoutShutdown => format!("{} · {note}", f.evidence),
+            _ => f.evidence.clone(),
+        },
         count: events,
         first_us: members
             .iter()

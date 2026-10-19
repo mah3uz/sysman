@@ -13,7 +13,8 @@ use crate::ui::theme::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
     Crash,
-    PowerLoss,
+    /// A boot that ended with no shutdown recorded: a hang, a panic, a forced reset or a power cut.
+    UncleanEnd,
     Oom,
     RestartLoop,
     UnitFailed,
@@ -33,7 +34,7 @@ impl Kind {
             "restart_loop" => Self::RestartLoop,
             "packages" => Self::Packages,
             "boot" => Self::Boot,
-            "boot_end" if data["clean"].as_bool() == Some(false) => Self::PowerLoss,
+            "boot_end" if data["clean"].as_bool() == Some(false) => Self::UncleanEnd,
             "boot_end" => Self::Shutdown,
             "suspend" => Self::Suspend,
             "resume" => Self::Resume,
@@ -49,7 +50,7 @@ impl Kind {
     pub fn icon(self) -> IconName {
         match self {
             Self::Crash => IconName::Skull,
-            Self::PowerLoss => IconName::Zap,
+            Self::UncleanEnd => IconName::TriangleAlert,
             Self::Oom => IconName::MemoryStick,
             Self::RestartLoop => IconName::RefreshCw,
             Self::UnitFailed => IconName::CircleX,
@@ -61,8 +62,8 @@ impl Kind {
 
     pub fn color(self, t: &Theme) -> Hsla {
         match self {
-            Self::Crash | Self::PowerLoss | Self::Oom => t.red,
-            Self::RestartLoop | Self::UnitFailed => t.orange,
+            Self::Crash | Self::Oom => t.red,
+            Self::UncleanEnd | Self::RestartLoop | Self::UnitFailed => t.orange,
             Self::Packages => t.blue,
             _ => t.text_secondary,
         }
@@ -110,6 +111,10 @@ pub fn between(history: &History, from: i64, to: i64) -> Result<Option<Vec<Event
         let (t, kind, summary, data) = row?;
         let data = serde_json::from_str(&data).unwrap_or(Value::Null);
         if let Some(kind) = Kind::parse(&kind, &data) {
+            let summary = match kind {
+                Kind::UncleanEnd => unclean_end(&data),
+                _ => summary,
+            };
             out.push(Event {
                 t,
                 kind,
@@ -118,6 +123,25 @@ pub fn between(history: &History, from: i64, to: i64) -> Result<Option<Vec<Event
         }
     }
     Ok(Some(out))
+}
+
+/// What is known of a boot's end without shutdown: only that, unless the collector found more.
+fn unclean_end(data: &Value) -> String {
+    let certainty = match data["certainty"].as_str() {
+        Some("confirmed") => Some("journal confirms an unclean end".to_string()),
+        Some("ended_while_suspended") => Some("ended while suspended".to_string()),
+        _ => None,
+    };
+    let reason = data["reset_reason"]
+        .as_str()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(|r| format!("reset reason: {r}"));
+    std::iter::once("Ended without shutdown".to_string())
+        .chain(certainty)
+        .chain(reason)
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// The `n` notable events most worth a look: most severe first, newest first within a kind.
@@ -161,8 +185,12 @@ mod tests {
         let kinds: Vec<_> = got.iter().map(|e| (e.t, e.kind)).collect();
         assert_eq!(
             kinds,
-            [(10, Kind::PowerLoss), (20, Kind::Shutdown), (30, Kind::Crash)],
+            [(10, Kind::UncleanEnd), (20, Kind::Shutdown), (30, Kind::Crash)],
             "an unknown kind is skipped and `to` is exclusive"
+        );
+        assert_eq!(
+            got[0].summary, "Ended without shutdown",
+            "a missing shutdown record is not proof the power was cut"
         );
         assert_eq!(got[2].t_us(), 30_000_000, "Logs opens at microseconds");
     }
@@ -181,7 +209,7 @@ mod tests {
             e(4, Kind::Crash),
             e(5, Kind::Suspend),
             e(6, Kind::Crash),
-            e(7, Kind::PowerLoss),
+            e(7, Kind::UncleanEnd),
         ];
         let got: Vec<_> = worst(&events, 4).iter().map(|e| (e.t, e.kind)).collect();
         assert_eq!(
@@ -189,10 +217,31 @@ mod tests {
             [
                 (6, Kind::Crash),
                 (4, Kind::Crash),
-                (7, Kind::PowerLoss),
+                (7, Kind::UncleanEnd),
                 (3, Kind::UnitFailed)
             ],
-            "a crash outranks a newer power loss; packages fall off the end"
+            "a crash outranks a newer unclean end; packages fall off the end"
+        );
+    }
+
+    #[test]
+    fn an_unclean_end_says_what_the_collector_could_confirm() {
+        let data = |j: &str| serde_json::from_str::<Value>(j).unwrap();
+        assert_eq!(
+            unclean_end(&data(
+                r#"{"clean": false, "certainty": "confirmed", "reset_reason": "thermal trip"}"#
+            )),
+            "Ended without shutdown · journal confirms an unclean end · reset reason: thermal trip"
+        );
+        assert_eq!(
+            unclean_end(&data(r#"{"clean": false, "certainty": "ended_while_suspended"}"#)),
+            "Ended without shutdown · ended while suspended"
+        );
+        assert_eq!(
+            unclean_end(&data(
+                r#"{"clean": false, "certainty": "unconfirmed", "reset_reason": " "}"#
+            )),
+            "Ended without shutdown"
         );
     }
 }

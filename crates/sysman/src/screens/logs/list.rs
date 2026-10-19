@@ -95,10 +95,13 @@ impl Logs {
                 );
             }
             let filtered = !self.query.is_empty();
+            let no_journal = self.status.is_some_and(|s| s.no_journal);
             return self.empty(
                 IconName::Inbox,
                 if filtered {
                     "No entries match".into()
+                } else if no_journal {
+                    "No systemd journal found on this system".into()
                 } else {
                     format!("Nothing was logged in {}", self.scope_name())
                 },
@@ -272,8 +275,15 @@ impl Logs {
             BootEnd::Clean => format!("{name} shut down at {at}"),
             _ => format!("{name} ends at {at}"),
         };
+        if let Some(note) = boot.note.as_deref().filter(|_| boot.end == BootEnd::Abrupt) {
+            text.push_str(&format!(" · {note}"));
+        }
         if let Some(next) = boots.get(b + 1) {
-            text.push_str(&format!(" · {}", model::off_time(boot, next).to_lowercase()));
+            let gap = match boot.end {
+                BootEnd::Abrupt => model::next_boot(boot, next),
+                _ => model::off_time(boot, next).to_lowercase(),
+            };
+            text.push_str(&format!(" · {gap}"));
         }
         let abrupt = boot.end == BootEnd::Abrupt;
         let colour = if abrupt { t.red } else { t.text_tertiary };
@@ -289,7 +299,7 @@ impl Logs {
             .text_size(t.small_caption)
             .text_color(if abrupt { t.red } else { t.text_secondary })
             .child(rule())
-            .when(abrupt, |d| d.child(Icon::new(IconName::Zap).xsmall()))
+            .when(abrupt, |d| d.child(Icon::new(IconName::TriangleAlert).xsmall()))
             .child(text)
             .child(rule())
             .into_any_element()

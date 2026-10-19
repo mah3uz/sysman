@@ -15,6 +15,8 @@ use journal::findings::FindingKind;
 
 use super::list::priority_label;
 use super::{Inspected, Logs, inspector, model};
+#[cfg(test)]
+use crate::data::systemd::Ran;
 use crate::data::systemd::{Runner, System};
 use crate::ui::theme::{rem_px, theme};
 
@@ -31,6 +33,46 @@ pub(super) enum Restart {
     Confirm,
     Running,
     Done(Result<(), String>),
+    /// systemctl could not ask for a password: nothing on the desktop answers polkit.
+    NoAgent,
+}
+
+/// Units whose restart ends the user's session or the desktop under them.
+const SESSION_UNITS: &[&str] = &[
+    "user",
+    "user-runtime-dir",
+    "display-manager",
+    "gdm",
+    "gdm3",
+    "sddm",
+    "lightdm",
+    "greetd",
+    "ly",
+    "dbus",
+    "dbus-broker",
+];
+
+/// A unit name that is safe to hand to `systemctl restart`: well formed, a service, socket or mount, and not one
+/// whose restart takes the session down. Transient D-Bus activated services come and go on their own.
+fn restartable_unit(name: &str) -> bool {
+    let Some(stem) = [".service", ".socket", ".mount"]
+        .into_iter()
+        .find_map(|s| name.strip_suffix(s))
+    else {
+        return false;
+    };
+    let well_formed = name.len() <= 255
+        && !name.starts_with('-')
+        && name.matches('@').count() <= 1
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b":-_.\\@".contains(&b));
+    let (prefix, instance) = stem.split_once('@').map_or((stem, None), |(p, i)| (p, Some(i)));
+    well_formed
+        && !prefix.is_empty()
+        && instance.is_none_or(|i| !i.is_empty())
+        && !SESSION_UNITS.contains(&prefix)
+        && !prefix.starts_with("dbus-:")
 }
 
 /// A unit a failure entry names, which the inspector may offer to restart.
@@ -46,45 +88,57 @@ impl Target {
         if self.user {
             args.push("--user");
         }
-        args.extend(["restart", self.unit.as_str()]);
+        args.extend(["restart", "--", self.unit.as_str()]);
         args
     }
 }
 
 /// Only failures are offered a restart, and a user unit only when it is this user's, since `systemctl --user` reaches
-/// no one else's manager.
+/// no one else's manager. `UNIT` is a field anyone can write, so the entry must come from the manager itself: pid 1,
+/// or this user's `systemd`, as journald records them.
 pub(super) fn restart_target(kind: Option<FindingKind>, e: &Entry, uid: u32) -> Option<Target> {
     if !matches!(kind, Some(FindingKind::FailedUnit | FindingKind::RestartLoop)) {
         return None;
     }
-    if let Some(unit) = e.get("UNIT") {
-        return Some(Target {
+    let target = match e.get("UNIT") {
+        Some(unit) => (e.get("_PID") == Some("1")).then(|| Target {
             unit: unit.to_string(),
             user: false,
-        });
-    }
-    let unit = e.get("USER_UNIT")?;
-    let mine = e.get("_UID").and_then(|u| u.parse::<u32>().ok()) == Some(uid);
-    mine.then(|| Target {
-        unit: unit.to_string(),
-        user: true,
-    })
+        }),
+        None => {
+            let unit = e.get("USER_UNIT")?;
+            let mine = e.get("_UID").and_then(|u| u.parse::<u32>().ok()) == Some(uid);
+            (mine && e.get("_COMM") == Some("systemd")).then(|| Target {
+                unit: unit.to_string(),
+                user: true,
+            })
+        }
+    }?;
+    restartable_unit(&target.unit).then_some(target)
 }
 
-fn restart(runner: &dyn Runner, target: &Target) -> Result<(), String> {
+pub(super) fn sudo_restart(unit: &str) -> String {
+    format!("sudo systemctl restart {unit}")
+}
+
+fn restart(runner: &dyn Runner, target: &Target) -> Restart {
     let args = target.args();
-    let ran = runner
-        .run("systemctl", &args)
-        .map_err(|e| format!("Could not run systemctl: {e}"))?;
+    let ran = match runner.run("systemctl", &args) {
+        Ok(ran) => ran,
+        Err(e) => return Restart::Done(Err(format!("Could not run systemctl: {e}"))),
+    };
     if ran.ok {
-        return Ok(());
+        return Restart::Done(Ok(()));
     }
     let message = ran.stderr.trim();
-    Err(if message.is_empty() {
+    if message.contains("Interactive authentication required") {
+        return Restart::NoAgent;
+    }
+    Restart::Done(Err(if message.is_empty() {
         format!("systemctl {} failed", args.join(" "))
     } else {
         message.to_owned()
-    })
+    }))
 }
 
 /// The stack traces systemd-coredump wrote into the entry's message, from the first thread on.
@@ -118,11 +172,17 @@ fn coredumpctl(pid: u32, t_us: u64) -> Result<String, String> {
         .map_err(|e| format!("Could not run coredumpctl: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
     match out.status.code() {
-        Some(124) => Err(format!("coredumpctl did not answer within {COREDUMPCTL_TIMEOUT_S} seconds.")),
+        Some(124) => Err(format!(
+            "coredumpctl did not answer within {COREDUMPCTL_TIMEOUT_S} seconds."
+        )),
         _ if !stdout.is_empty() => Ok(stdout),
         _ => {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            Err(if stderr.is_empty() { "coredumpctl found no dump for this process.".into() } else { stderr })
+            Err(if stderr.is_empty() {
+                "coredumpctl found no dump for this process.".into()
+            } else {
+                stderr
+            })
         }
     }
 }
@@ -209,6 +269,10 @@ impl Logs {
             }));
         let status = target.zip(restarting).map(|(target, state)| {
             let unit = target.unit.clone();
+            let state = match state {
+                Restart::Confirm if self.no_agent && !target.user => Restart::NoAgent,
+                s => s,
+            };
             let line = div()
                 .flex()
                 .flex_row()
@@ -253,9 +317,7 @@ impl Logs {
                             .label("Restart")
                             .on_click(cx.listener(move |this, _, _, cx| this.run_restart(row, target.clone(), cx))),
                     ),
-                Restart::Running => line
-                    .text_color(t.text_secondary)
-                    .child(format!("Restarting {unit}…")),
+                Restart::Running => line.text_color(t.text_secondary).child(format!("Restarting {unit}…")),
                 Restart::Done(Ok(())) => line
                     .text_color(t.green)
                     .child(Icon::new(IconName::Check).xsmall())
@@ -271,14 +333,44 @@ impl Logs {
                             .child(format!("Could not restart {unit}")),
                     )
                     .child(div().text_size(t.small_caption).text_color(t.text_secondary).child(e)),
+                Restart::NoAgent => {
+                    let command = sudo_restart(&unit);
+                    line.flex_col()
+                        .items_start()
+                        .gap(rem_px(4.))
+                        .child(
+                            div()
+                                .font_weight(t.weight_semibold)
+                                .child(format!("{unit} was not restarted")),
+                        )
+                        .child(
+                            div()
+                                .text_size(t.small_caption)
+                                .text_color(t.text_secondary)
+                                .child("No polkit agent is running to ask for your password. Run:"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(rem_px(4.))
+                                .child(
+                                    div()
+                                        .px(rem_px(6.))
+                                        .py(rem_px(1.))
+                                        .rounded(rem_px(4.))
+                                        .bg(t.panel)
+                                        .font_family(t.mono.clone())
+                                        .text_size(t.small_caption)
+                                        .child(command.clone()),
+                                )
+                                .child(copy("logs-copy-sudo", "Copy", IconName::Copy, command, cx)),
+                        )
+                }
             }
         });
-        div()
-            .flex()
-            .flex_col()
-            .gap(rem_px(6.))
-            .child(buttons)
-            .children(status)
+        div().flex().flex_col().gap(rem_px(6.)).child(buttons).children(status)
     }
 
     fn copied_feedback(&mut self, row: u32, which: &'static str, cx: &mut Context<Self>) {
@@ -304,8 +396,9 @@ impl Logs {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
+                this.no_agent |= result == Restart::NoAgent;
                 if this.restart.as_ref().is_some_and(|(r, _)| *r == row) {
-                    this.restart = Some((row, Restart::Done(result)));
+                    this.restart = Some((row, result));
                     cx.notify();
                 }
             })
@@ -487,7 +580,7 @@ mod tests {
 
     #[test]
     fn only_failures_are_offered_a_restart() {
-        let failed = entry(&[("UNIT", "keyd.service")]);
+        let failed = entry(&[("UNIT", "keyd.service"), ("_PID", "1")]);
         assert_eq!(
             restart_target(Some(FindingKind::FailedUnit), &failed, 1000),
             Some(Target {
@@ -496,16 +589,111 @@ mod tests {
             })
         );
         assert!(restart_target(Some(FindingKind::RestartLoop), &failed, 1000).is_some());
-        assert_eq!(restart_target(None, &failed, 1000), None, "a unit's ordinary message is not a failure");
+        assert_eq!(
+            restart_target(None, &failed, 1000),
+            None,
+            "a unit's ordinary message is not a failure"
+        );
         assert_eq!(restart_target(Some(FindingKind::Crash), &failed, 1000), None);
     }
 
     #[test]
     fn a_user_unit_is_restarted_only_for_its_own_user() {
-        let mine = entry(&[("USER_UNIT", "pipewire.service"), ("_UID", "1000")]);
+        let mine = entry(&[
+            ("USER_UNIT", "pipewire.service"),
+            ("_UID", "1000"),
+            ("_COMM", "systemd"),
+        ]);
         let target = restart_target(Some(FindingKind::FailedUnit), &mine, 1000).unwrap();
-        assert_eq!(target.args(), ["--user", "restart", "pipewire.service"]);
+        assert_eq!(target.args(), ["--user", "restart", "--", "pipewire.service"]);
         assert_eq!(restart_target(Some(FindingKind::FailedUnit), &mine, 1001), None);
+    }
+
+    #[test]
+    fn only_the_service_manager_can_name_a_unit_to_restart() {
+        let failed = Some(FindingKind::FailedUnit);
+        let forged = entry(&[("UNIT", "sshd.service"), ("_PID", "4242")]);
+        assert_eq!(
+            restart_target(failed, &forged, 1000),
+            None,
+            "any local user can log UNIT=; only pid 1 speaks for the system manager"
+        );
+        let forged_user = entry(&[("USER_UNIT", "pipewire.service"), ("_UID", "1000"), ("_COMM", "bash")]);
+        assert_eq!(restart_target(failed, &forged_user, 1000), None);
+        let option = entry(&[("UNIT", "--host=attacker"), ("_PID", "1")]);
+        assert_eq!(
+            restart_target(failed, &option, 1000),
+            None,
+            "never something systemctl reads as an option"
+        );
+    }
+
+    #[test]
+    fn units_that_take_the_session_down_are_never_offered() {
+        for unit in [
+            "keyd.service",
+            "cups.socket",
+            "home.mount",
+            "getty@tty2.service",
+            "systemd-pcrproduct.service",
+        ] {
+            assert!(restartable_unit(unit), "{unit}");
+        }
+        for unit in [
+            "user@1000.service",
+            "user-runtime-dir@1000.service",
+            "session-2.scope",
+            "user.slice",
+            "graphical.target",
+            "gdm.service",
+            "sddm.service",
+            "lightdm.service",
+            "greetd.service",
+            "ly@tty2.service",
+            "display-manager.service",
+            "dbus.service",
+            "dbus-:1.2-org.gnome.Nautilus@0.service",
+            "getty@.service",
+            "-.mount",
+            "--host=x.service",
+            "a b.service",
+            "keyd",
+            ".service",
+        ] {
+            assert!(!restartable_unit(unit), "{unit}");
+        }
+    }
+
+    struct Fake(Ran);
+
+    impl Runner for Fake {
+        fn run(&self, _: &str, _: &[&str]) -> std::io::Result<Ran> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn without_a_polkit_agent_the_restart_says_what_to_run_instead() {
+        let target = Target {
+            unit: "keyd.service".into(),
+            user: false,
+        };
+        let refused = Fake(Ran {
+            ok: false,
+            stdout: String::new(),
+            stderr: "Failed to restart keyd.service: Interactive authentication required.\n".into(),
+        });
+        assert_eq!(restart(&refused, &target), Restart::NoAgent);
+        assert_eq!(sudo_restart(&target.unit), "sudo systemctl restart keyd.service");
+        let denied = Fake(Ran {
+            ok: false,
+            stdout: String::new(),
+            stderr: "Failed to restart keyd.service: Access denied\n".into(),
+        });
+        assert_eq!(
+            restart(&denied, &target),
+            Restart::Done(Err("Failed to restart keyd.service: Access denied".into()))
+        );
     }
 
     #[test]
@@ -514,7 +702,7 @@ mod tests {
             unit: "keyd.service".into(),
             user: false,
         };
-        assert_eq!(target.args(), ["restart", "keyd.service"]);
+        assert_eq!(target.args(), ["restart", "--", "keyd.service"]);
     }
 
     #[test]

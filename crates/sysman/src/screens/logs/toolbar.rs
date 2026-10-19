@@ -99,9 +99,12 @@ impl Logs {
                 }))
                 .label(if self.following() { "Following" } else { "Follow" })
                 .selected(self.following())
-                .disabled(!follows)
+                .disabled(!follows || self.follow_capped())
                 .tooltip(match (follows, self.following()) {
                     (false, _) => "This boot has ended; following needs a range that reaches now",
+                    _ if self.follow_capped() => {
+                        "Stopped: the list holds as many entries as it keeps; narrow the range"
+                    }
                     (true, true) => "Stop adding new entries as they arrive",
                     (true, false) => "Add new entries as they arrive",
                 })
@@ -188,27 +191,12 @@ impl Logs {
             )
     }
 
-    /// The access banner, or the note that no journal reader works.
+    /// The access banner, or the note that no journal reader works, and the note that the list holds only the
+    /// newest entries.
     pub(super) fn banner(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let t = theme(cx);
-        let status = self.status?;
-        #[cfg(debug_assertions)]
-        let own_only = self.dev.own_only || status.access == Access::OwnOnly;
-        #[cfg(not(debug_assertions))]
-        let own_only = status.access == Access::OwnOnly;
-        let (icon, text) = match (status.backend, own_only) {
-            (None, _) => (
-                IconName::TriangleAlert,
-                "The journal cannot be read: neither libsystemd nor journalctl is available.",
-            ),
-            (Some(_), true) => (
-                IconName::Lock,
-                "Showing only your own entries. To read the whole system journal, join the systemd-journal group \
-                 and sign in again:",
-            ),
-            (Some(_), false) => return None,
-        };
-        Some(
+        let capped = self.scan.index().dropped() > 0;
+        let line = |icon: IconName, text: String| {
             hair_b(
                 div()
                     .flex()
@@ -224,29 +212,52 @@ impl Logs {
             )
             .child(Icon::new(icon).small().text_color(t.orange).flex_shrink_0())
             .child(div().min_w_0().child(text))
-            .when(own_only && status.backend.is_some(), |d| {
-                d.child(
-                    div()
-                        .flex_shrink_0()
-                        .px(rem_px(6.))
-                        .py(rem_px(1.))
-                        .rounded(rem_px(4.))
-                        .bg(t.card)
-                        .font_family(t.mono.clone())
-                        .text_size(t.small_caption)
-                        .child(JOIN_GROUP),
-                )
-                .child(
-                    Button::new("logs-copy-usermod")
-                        .ghost()
-                        .xsmall()
-                        .icon(Icon::new(IconName::Copy))
-                        .tooltip("Copy the command")
-                        .on_click(|_, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(JOIN_GROUP.into()))),
-                )
-            })
-            .into_any_element(),
-        )
+        };
+        let cap = capped.then(|| {
+            line(
+                IconName::Info,
+                format!(
+                    "Showing the latest {} entries — narrow the range to see older ones.",
+                    model::thousands(self.scan.row_cap() as u64)
+                ),
+            )
+        });
+        let status = self.status;
+        let own_only = status.is_some_and(|s| s.access == Access::OwnOnly);
+        let (icon, text) = match status.map(|s| (s.backend, own_only)) {
+            Some((None, _)) => (
+                IconName::TriangleAlert,
+                "The journal cannot be read: neither libsystemd nor journalctl is available.",
+            ),
+            Some((Some(_), true)) => (
+                IconName::Lock,
+                "Showing only your own entries; how boots ended needs the system journal. To read it, join the \
+                 systemd-journal group and sign in again:",
+            ),
+            _ => return cap.map(IntoElement::into_any_element),
+        };
+        let access = line(icon, text.into()).when(own_only, |d| {
+            d.child(
+                div()
+                    .flex_shrink_0()
+                    .px(rem_px(6.))
+                    .py(rem_px(1.))
+                    .rounded(rem_px(4.))
+                    .bg(t.card)
+                    .font_family(t.mono.clone())
+                    .text_size(t.small_caption)
+                    .child(JOIN_GROUP),
+            )
+            .child(
+                Button::new("logs-copy-usermod")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(IconName::Copy))
+                    .tooltip("Copy the command")
+                    .on_click(|_, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(JOIN_GROUP.into()))),
+            )
+        });
+        Some(div().flex().flex_col().child(access).children(cap).into_any_element())
     }
 
     pub(super) fn status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -258,6 +269,14 @@ impl Logs {
             (t.red, format!("Could not read the journal: {e}"))
         } else if self.following() && state.is_following() {
             (t.green, format!("Following {}", self.scope_name()))
+        } else if self.follow_capped() {
+            (
+                t.orange,
+                format!(
+                    "Stopped following at {} entries",
+                    model::thousands(self.scan.row_cap() as u64)
+                ),
+            )
         } else {
             (t.text_tertiary, format!("Paused on {}", self.scope_name()))
         };
@@ -270,14 +289,14 @@ impl Logs {
                 .child(dot(colour, 6.))
                 .child(text)
         };
-        let tallies = self.view.tallies.iter().take(5).map(|&(kind, n)| {
+        let tallies = self.view.tallies.iter().take(5).map(|&(kind, n, units)| {
             let colour = severity_colour(kind.severity(), t);
             let colour = if kind == FindingKind::PackageChange {
                 t.text_tertiary
             } else {
                 colour
             };
-            rule(colour, model::tally_label(kind, n))
+            rule(colour, model::tally_label(kind, n, units))
         });
         let backend = match (self.scan.backend(), self.status.and_then(|s| s.backend)) {
             (Some(Backend::Journalctl), _) | (None, Some(Backend::Journalctl)) => "Journal through journalctl",

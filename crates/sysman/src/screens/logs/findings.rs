@@ -22,7 +22,7 @@ pub(super) fn kind_icon(kind: FindingKind) -> IconName {
         FindingKind::OomKill => IconName::MemoryStick,
         FindingKind::FailedUnit => IconName::CircleX,
         FindingKind::RestartLoop => IconName::RefreshCw,
-        FindingKind::BootWithoutShutdown => IconName::Zap,
+        FindingKind::BootWithoutShutdown => IconName::TriangleAlert,
         FindingKind::ThermalThrottle => IconName::Thermometer,
         FindingKind::HardwareError => IconName::CircuitBoard,
         FindingKind::FailedSignIns => IconName::Lock,
@@ -52,6 +52,7 @@ impl Logs {
         };
         let collapsed = self.findings_collapsed;
         let caption = match cards.len() {
+            0 if self.own_only() => format!("No problems found among your own entries in {}", self.scope_name()),
             0 => format!("Nothing stands out in {}", self.scope_name()),
             1 => format!("1 finding in {}", self.scope_name()),
             n => format!("{n} findings in {}", self.scope_name()),
@@ -225,6 +226,13 @@ impl Logs {
                     .items_center()
                     .child(heading)
                     .child(div().flex_1())
+                    .children(self.status.filter(|s| !s.crash_reports).map(|_| {
+                        div()
+                            .text_size(t.caption)
+                            .text_color(t.text_tertiary)
+                            .mr(rem_px(12.))
+                            .child("Crash reports need systemd-coredump")
+                    }))
                     .children(more),
             )
             .children(grid)

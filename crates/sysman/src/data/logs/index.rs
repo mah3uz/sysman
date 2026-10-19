@@ -43,6 +43,8 @@ pub(super) struct Coverage {
     pub from_us: u64,
     pub to_us: u64,
     pub unfiltered: bool,
+    /// Only the user's own journal was read, which never holds the shutdown messages.
+    pub own_only: bool,
 }
 
 #[derive(Default)]
@@ -57,6 +59,9 @@ pub struct Index {
     findings: Vec<Finding>,
     findings_ready: bool,
     coverage: Coverage,
+    /// While set, the oldest rows are dropped to keep at most this many.
+    cap: Option<usize>,
+    dropped: usize,
 }
 
 /// One visible list row: `row` is the first of `count` consecutive identical rows, `last` the final one.
@@ -133,6 +138,8 @@ pub struct BootSummary {
     pub crashes: usize,
     pub failed_units: usize,
     pub oom_kills: usize,
+    /// What the journal adds about an end without shutdown, such as a recorded reset reason.
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -196,6 +203,15 @@ impl Plan<'_> {
 
 impl Index {
     pub(super) fn append(&mut self, b: Batch) {
+        if let Some(cap) = self.cap {
+            let full = cap + cap / 4;
+            let need = self.rows.len() + b.rows.len();
+            if need > full {
+                self.trim(need - cap);
+            } else if need > self.rows.capacity() && need > cap / 2 {
+                self.rows.reserve_exact(full - self.rows.len());
+            }
+        }
         for n in b.names {
             self.name_ids.insert(n.clone(), self.names.len() as u32);
             self.names.push(n);
@@ -209,6 +225,34 @@ impl Index {
         self.boots = boots;
         self.current_boot = current_boot;
         self.coverage = coverage;
+    }
+
+    /// Keeps only the newest `cap` rows from here on, dropping the oldest in chunks so ids shift rarely.
+    pub(super) fn set_cap(&mut self, cap: Option<usize>) {
+        if let Some(cap) = cap.or(self.cap) {
+            self.trim(self.rows.len().saturating_sub(cap));
+        }
+        if cap.is_none() && self.dropped > 0 {
+            self.rows.shrink_to_fit();
+        }
+        self.cap = cap;
+    }
+
+    fn trim(&mut self, n: usize) {
+        let n = n.min(self.rows.len());
+        if n == 0 {
+            return;
+        }
+        self.rows.drain(..n);
+        self.dropped += n;
+        if let Some(r) = self.rows.first() {
+            self.coverage.from_us = self.coverage.from_us.max(r.t_us);
+        }
+    }
+
+    /// Rows dropped from the front to keep within the cap; row ids shift down by as many each time it grows.
+    pub fn dropped(&self) -> usize {
+        self.dropped
     }
 
     pub(super) fn set_findings(&mut self, findings: Vec<Finding>) {
@@ -292,14 +336,22 @@ impl Index {
                     crashes: 0,
                     failed_units: 0,
                     oom_kills: 0,
+                    note: None,
                 };
                 if !covered {
                     return s;
                 }
-                s.end = if current { BootEnd::Running } else { BootEnd::Clean };
+                s.end = match (current, c.own_only) {
+                    (true, _) => BootEnd::Running,
+                    (false, true) => BootEnd::Unknown,
+                    (false, false) => BootEnd::Clean,
+                };
                 for f in self.findings.iter().filter(|f| f.boot_id == b.id) {
                     match f.kind {
-                        FindingKind::BootWithoutShutdown => s.end = BootEnd::Abrupt,
+                        FindingKind::BootWithoutShutdown if !c.own_only => {
+                            s.end = BootEnd::Abrupt;
+                            s.note = end_note(f);
+                        }
                         FindingKind::Crash => s.crashes += f.count,
                         FindingKind::FailedUnit => s.failed_units += f.count,
                         FindingKind::OomKill => s.oom_kills += f.count,
@@ -479,6 +531,23 @@ impl Index {
     }
 }
 
+/// The qualifiers a boot-end finding carries, when the journal had them: how sure the end is, and why it reset.
+pub fn end_note(f: &Finding) -> Option<String> {
+    let certainty = match f.data.get("certainty").map(String::as_str) {
+        Some("confirmed") => Some("journal confirms an unclean end".to_string()),
+        Some("ended_while_suspended") => Some("ended while suspended".to_string()),
+        _ => None,
+    };
+    let reason = f
+        .data
+        .get("reset_reason")
+        .map(|r| r.trim())
+        .filter(|r| !r.is_empty())
+        .map(|r| format!("reset reason: {r}"));
+    let parts: Vec<String> = certainty.into_iter().chain(reason).collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 fn bucket_of(t: u64, from: u64, to: u64, n: usize) -> Option<usize> {
     if n == 0 || t < from || t >= to {
         return None;
@@ -527,6 +596,65 @@ pub(super) mod tests {
 
     fn rows(m: &Matches) -> Vec<(u32, u32)> {
         m.rows.iter().map(|v| (v.row, v.count)).collect()
+    }
+
+    #[test]
+    fn a_huge_scan_keeps_the_newest_rows_in_bounded_memory() {
+        const CAP: usize = 2_000_000;
+        let row = |t: u64| Row {
+            t_us: t,
+            hash: t,
+            source: 0,
+            extra: 0,
+            categories: Categories::default(),
+            boot: 0,
+            priority: 6,
+            package: false,
+        };
+        let mut idx = Index::default();
+        idx.set_cap(Some(CAP));
+        let (batch, mut peak) = (50_000u64, 0);
+        for b in 0..120 {
+            idx.append(Batch {
+                rows: (0..batch).map(|i| row(b * batch + i)).collect(),
+                ..Batch::default()
+            });
+            peak = peak.max(idx.memory_bytes());
+        }
+        idx.set_cap(None);
+        assert_eq!(idx.len(), CAP);
+        assert_eq!(idx.dropped(), 4_000_000);
+        assert_eq!(idx.rows()[0].t_us, 4_000_000, "the oldest rows go, the newest stay");
+        assert!(
+            peak <= (CAP + CAP / 4) * std::mem::size_of::<Row>(),
+            "6 M rows read, at most 2.5 M held at once: peak {} MB",
+            peak / 1_000_000
+        );
+        assert!(idx.memory_bytes() <= CAP * std::mem::size_of::<Row>() + 1024);
+    }
+
+    #[test]
+    fn boot_ends_are_unknown_without_the_system_journal() {
+        let mut idx = build(&[entry(10, 6, "a", "x", &[])]);
+        let boot = |id: &str, first_us, last_us| Boot {
+            id: id.into(),
+            first_us,
+            last_us,
+        };
+        let coverage = Coverage {
+            from_us: 0,
+            to_us: u64::MAX,
+            unfiltered: true,
+            own_only: true,
+        };
+        idx.begin(vec![boot("old", 0, 5), boot("now", 6, 20)], "now".into(), coverage);
+        idx.set_findings(vec![]);
+        let ends: Vec<BootEnd> = idx.boot_summaries().iter().map(|b| b.end).collect();
+        assert_eq!(
+            ends,
+            [BootEnd::Unknown, BootEnd::Running],
+            "the shutdown messages are only in the system journal, so their absence says nothing"
+        );
     }
 
     #[test]
