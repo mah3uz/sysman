@@ -19,12 +19,13 @@ use crate::charts::format::{Unit, bytes, duration};
 use crate::charts::sparkline::Sparkline;
 use crate::charts::stacked_bar::{Segment, stacked_bar};
 use crate::charts::trend::{ChartState, TrendChart, YScale, clock};
+use crate::data::events::{self, Event};
 use crate::data::history::{Bucket, History, bucket_width, db_path};
-use crate::data::live::Live;
+use crate::data::live::{Conn, Live};
 use crate::data::pressure::{self, Band, CRITICAL, WARNING};
 use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source, matching};
-use crate::ui::shell::Tab;
+use crate::ui::shell::{Focus, Tab, navigate};
 use crate::ui::theme::{Theme, rem_px, theme};
 use crate::ui::widgets::card::metric_card;
 use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
@@ -43,6 +44,7 @@ const CPU_TICKS: [f64; 4] = [0., BUSY, HEAVY, 100.];
 const CHART_HEIGHT: f32 = 150.;
 const RAIL_CHART_HEIGHT: f32 = 120.;
 const TOP_ROWS: usize = 5;
+const EVENT_ROWS: usize = 5;
 const CPU_CAPTION: &str = "Live values are the latest sample, not selected-range means. Total CPU is the share of all \
                            cores in use, 0-100%. Per-process CPU uses one core as 100%, so multi-threaded work can exceed 100%.";
 const GROUP_COLOURS: usize = 5;
@@ -235,6 +237,8 @@ struct Stored {
     range: Range,
     known: Vec<String>,
     buckets: HashMap<Metric, Vec<Bucket>>,
+    /// `None` when the collector has not made the `events` table.
+    events: Option<Vec<Event>>,
 }
 
 fn load(range: Range, to: i64) -> Result<Stored> {
@@ -249,7 +253,13 @@ fn load(range: Range, to: i64) -> Result<Stored> {
         let source = metric.source(known.iter().map(String::as_str));
         buckets.insert(metric, source.query(&history, from, to, BUCKETS)?);
     }
-    Ok(Stored { range, known, buckets })
+    let events = events::between(&history, from, to + 1)?;
+    Ok(Stored {
+        range,
+        known,
+        buckets,
+        events,
+    })
 }
 
 #[derive(Default)]
@@ -268,6 +278,8 @@ pub struct Dashboard {
     feed: Entity<ProcessFeed>,
     range: Range,
     stored: Option<Stored>,
+    /// The stored read's events, shared with every chart.
+    events: Option<Rc<[Event]>>,
     loading: bool,
     /// Range and time of the last history read, so a failing read is not retried every tick.
     attempt: Option<(Range, f64)>,
@@ -297,8 +309,15 @@ impl Dashboard {
             me: cx.weak_entity(),
             live,
             feed,
+            #[cfg(not(debug_assertions))]
             range: remembered(Tab::Dashboard, cx),
+            #[cfg(debug_assertions)]
+            range: std::env::var("SYSMAN_DEV_RANGE")
+                .ok()
+                .and_then(|r| Range::ALL.into_iter().find(|x| x.label() == r))
+                .unwrap_or_else(|| remembered(Tab::Dashboard, cx)),
             stored: None,
+            events: None,
             loading: false,
             attempt: None,
             error: None,
@@ -366,8 +385,9 @@ impl Dashboard {
             this.update(cx, |this, cx| {
                 this.loading = false;
                 match result {
-                    Ok(stored) => {
+                    Ok(mut stored) => {
                         this.error = None;
+                        this.events = stored.events.take().map(Rc::from);
                         this.stored = Some(stored);
                     }
                     Err(e) => this.error = Some(format!("History unavailable: {e}").into()),
@@ -437,6 +457,15 @@ impl Dashboard {
             self.width_s as f64,
             self.gap_s(metric, cx),
         )
+        .events(self.events().unwrap_or_default())
+    }
+
+    /// Only those read for the current range, so a range change never shows the last range's events.
+    fn events(&self) -> Option<Rc<[Event]>> {
+        self.stored
+            .as_ref()
+            .filter(|s| s.range == self.range)
+            .and(self.events.clone())
     }
 
     fn spark(&self, metric: Metric, color: Hsla, cx: &App) -> Sparkline {
@@ -1180,6 +1209,64 @@ impl Dashboard {
             )
             .child(section(IconName::Activity, "Top CPU", cx).child(top_list(top_cpu, "No processes reported", cx)))
             .child(section(IconName::HardDrive, "Top disk", cx).child(top_list(top_disk, "No disk activity", cx)))
+            .child(section(IconName::Zap, "Recent events", cx).child(self.recent_events(cx)))
+    }
+
+    fn recent_events(&self, cx: &App) -> AnyElement {
+        let t = theme(cx);
+        let events = self.events();
+        let worst = events.as_deref().map(|e| events::worst(e, EVENT_ROWS)).unwrap_or_default();
+        let collecting = matches!(self.live.read(cx).conn, Conn::Connected);
+        if worst.is_empty() {
+            let line = if events.is_some() && collecting {
+                let span = match self.range {
+                    Range::D7 => "7 days",
+                    r => r.label(),
+                };
+                format!("Nothing notable in the last {span}")
+            } else {
+                "Events appear here once the collector records them.".into()
+            };
+            return caption(line, cx).into_any_element();
+        }
+        let now = self.now(cx);
+        div()
+            .flex()
+            .flex_col()
+            .gap(rem_px(2.))
+            .mx(rem_px(-6.))
+            .text_size(t.caption)
+            .children(worst.into_iter().enumerate().map(|(i, e)| {
+                let pattern = if now - e.t as f64 > 86400. { "%a %H:%M" } else { "%H:%M" };
+                let t_us = e.t_us();
+                div()
+                    .id(("recent-event", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(rem_px(8.))
+                    .px(rem_px(6.))
+                    .py(rem_px(3.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(t.card_hover))
+                    .child(
+                        Icon::new(e.kind.icon())
+                            .size_3p5()
+                            .flex_shrink_0()
+                            .text_color(e.kind.color(t)),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(e.summary.clone()))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(t.text_secondary)
+                            .font_features(t.numbers.clone())
+                            .child(clock(e.t as f64, pattern)),
+                    )
+                    .on_click(move |_, _, cx| navigate(Tab::Logs, Some(Focus::LogEntry { t_us }), cx))
+            }))
+            .into_any_element()
     }
 }
 
