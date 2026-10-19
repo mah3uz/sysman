@@ -117,7 +117,11 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut log = Jsonl::new(dir.clone(), false, 2).unwrap();
         log.open(date(2026, 10, 15)).unwrap();
-        assert_eq!(mode(&dir), 0o700, "an older daemon's directory let every user list and read the samples");
+        assert_eq!(
+            mode(&dir),
+            0o700,
+            "an older daemon's directory let every user list and read the samples"
+        );
         assert_eq!(mode(&dir.join("2026-10-15.jsonl")), 0o600);
     }
 

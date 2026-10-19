@@ -239,7 +239,11 @@ fn read_boot_end(src: &mut impl Source, boot: &Boot, next: &Boot) -> Result<Boot
         last_us: boot.last_us,
         ..BootEndFacts::default()
     };
-    let kernel = |id: &str| Filter::default().any([("_BOOT_ID", id)]).any([("_TRANSPORT", "kernel")]);
+    let kernel = |id: &str| {
+        Filter::default()
+            .any([("_BOOT_ID", id)])
+            .any([("_TRANSPORT", "kernel")])
+    };
     feed(src, &kernel(&boot.id), KERNEL_HEAD, |e| {
         f.note(e);
         !f.kernel_start
@@ -385,7 +389,10 @@ fn finding_event(f: &Finding) -> Option<Event> {
     let comm = field("comm").unwrap_or("A process");
     let (kind, summary) = match f.kind {
         // the detector numbers repeat crashes from where it started reading; the row must not depend on that
-        FindingKind::Crash => ("crash", crash_summary(comm, field("signal").unwrap_or("unknown signal"), 1)),
+        FindingKind::Crash => (
+            "crash",
+            crash_summary(comm, field("signal").unwrap_or("unknown signal"), 1),
+        ),
         FindingKind::OomKill => ("oom", f.title.clone()),
         FindingKind::FailedUnit => ("unit_failed", f.title.clone()),
         FindingKind::RestartLoop => ("restart_loop", f.title.clone()),
@@ -771,7 +778,11 @@ mod tests {
         fn restart(&mut self, t_s: u64) {
             self.add(
                 t_s,
-                &[[("MESSAGE_ID", ids::RESTART_SCHEDULED), ("UNIT", "x.service")].as_slice(), &PID1].concat(),
+                &[
+                    [("MESSAGE_ID", ids::RESTART_SCHEDULED), ("UNIT", "x.service")].as_slice(),
+                    &PID1,
+                ]
+                .concat(),
             );
         }
 
@@ -803,9 +814,10 @@ mod tests {
 
         fn next(&mut self) -> Result<Option<Entry>> {
             let passes = |e: &Entry| {
-                self.filter.0.iter().all(|group| {
-                    group.is_empty() || group.iter().any(|(f, v)| e.get(f) == Some(v.as_str()))
-                })
+                self.filter
+                    .0
+                    .iter()
+                    .all(|group| group.is_empty() || group.iter().any(|(f, v)| e.get(f) == Some(v.as_str())))
             };
             let Some(skip) = self.entries[self.at.min(self.entries.len())..].iter().position(passes) else {
                 self.at = self.entries.len();
@@ -913,12 +925,19 @@ mod tests {
         run(&mut db, &mut src, 3000);
         let rows = rows(&db);
         let kinds: Vec<_> = rows.iter().map(|r| r.1.as_str()).collect();
-        assert_eq!(kinds, ["crash", "restart_loop"], "one loop, not one per read; one row per program's crashes");
+        assert_eq!(
+            kinds,
+            ["crash", "restart_loop"],
+            "one loop, not one per read; one row per program's crashes"
+        );
         let data: Value = serde_json::from_str(&rows[1].4).unwrap();
         assert_eq!(data["n_restarts"], 4, "the row grows with the loop");
         assert_eq!((rows[1].0, rows[1].2.as_str()), (1000, "c1"));
         let crash: Value = serde_json::from_str(&rows[0].4).unwrap();
-        assert_eq!((rows[0].3.as_str(), &crash["count"]), ("waybar crashed 2 times (SIGSEGV)", &json!(2)));
+        assert_eq!(
+            (rows[0].3.as_str(), &crash["count"]),
+            ("waybar crashed 2 times (SIGSEGV)", &json!(2))
+        );
 
         run(&mut db, &mut src, 4000);
         assert_eq!(
@@ -981,20 +1000,32 @@ mod tests {
             }
         }
         for t in 0..500 {
-            src.add_in("b", 1200 + t, &[("MESSAGE", "noise"), ("PRIORITY", "6"), ("_UID", "1000")]);
+            src.add_in(
+                "b",
+                1200 + t,
+                &[("MESSAGE", "noise"), ("PRIORITY", "6"), ("_UID", "1000")],
+            );
         }
         // a: PID 1 stopping multi-user.target is a shutdown whoever started it, logind or not
         src.add_in(
             "a",
             890,
-            &[[("MESSAGE_ID", ids::UNIT_STOPPED), ("UNIT", "multi-user.target")].as_slice(), &PID1].concat(),
+            &[
+                [("MESSAGE_ID", ids::UNIT_STOPPED), ("UNIT", "multi-user.target")].as_slice(),
+                &PID1,
+            ]
+            .concat(),
         );
         // b: a forged shutdown, and PID 1 stopping some other unit, are not shutdowns; c's journald says why
         src.add_in("b", 1890, &[("MESSAGE_ID", ids::SHUTDOWN), ("_UID", "1000")]);
         src.add_in(
             "b",
             1895,
-            &[[("MESSAGE_ID", ids::UNIT_STOPPED), ("UNIT", "x.service")].as_slice(), &PID1].concat(),
+            &[
+                [("MESSAGE_ID", ids::UNIT_STOPPED), ("UNIT", "x.service")].as_slice(),
+                &PID1,
+            ]
+            .concat(),
         );
         src.add_in(
             "c",
@@ -1032,7 +1063,14 @@ mod tests {
         let ends: Vec<_> = events
             .iter()
             .filter(|e| e.kind == "boot_end")
-            .map(|e| (e.key.as_str(), e.summary.as_str(), e.data["clean"].clone(), e.data["certainty"].clone()))
+            .map(|e| {
+                (
+                    e.key.as_str(),
+                    e.summary.as_str(),
+                    e.data["clean"].clone(),
+                    e.data["certainty"].clone(),
+                )
+            })
             .collect();
         assert_eq!(
             ends,
@@ -1040,16 +1078,31 @@ mod tests {
                 ("a", "Shut down", json!(true), json!("clean")),
                 ("b", "Ended without shutdown", json!(false), json!("confirmed")),
                 ("c", "Power lost: thermal trip", json!(false), json!("confirmed")),
-                ("d", "Ended while suspended", json!(false), json!("ended_while_suspended")),
+                (
+                    "d",
+                    "Ended while suspended",
+                    json!(false),
+                    json!("ended_while_suspended")
+                ),
             ],
             "e's start is gone, so how it ended is unknown and gets no row; f is running"
         );
         let c = events.iter().find(|e| e.kind == "boot_end" && e.key == "c").unwrap();
-        assert_eq!((&c.data["reset_reason"], &c.data["suspended"]), (&json!("thermal trip"), &json!(false)));
+        assert_eq!(
+            (&c.data["reset_reason"], &c.data["suspended"]),
+            (&json!("thermal trip"), &json!(false))
+        );
         assert_eq!(events.iter().filter(|e| e.kind == "boot").count(), 6);
-        assert!(src.read < 50, "read {} entries: only markers and boot starts, never b's noise", src.read);
+        assert!(
+            src.read < 50,
+            "read {} entries: only markers and boot starts, never b's noise",
+            src.read
+        );
         assert_eq!(src.filter, stream_filter(), "the stream reads on with its own filter");
-        assert!(boot_events(&mut src, &mut state, 0, true).unwrap().is_empty(), "each boot is judged once");
+        assert!(
+            boot_events(&mut src, &mut state, 0, true).unwrap().is_empty(),
+            "each boot is judged once"
+        );
 
         let mut own = State::default();
         let events = boot_events(&mut ended_boots(), &mut own, 0, false).unwrap();
@@ -1101,9 +1154,16 @@ mod tests {
         let mut db = open(&dir);
         run(&mut db, &mut src, 10_000);
         let rows = rows(&db);
-        assert_eq!(rows.len(), 1, "with no core dump the kernel's line is the only sign of the crash");
+        assert_eq!(
+            rows.len(),
+            1,
+            "with no core dump the kernel's line is the only sign of the crash"
+        );
         let data: Value = serde_json::from_str(&rows[0].4).unwrap();
-        assert_eq!((rows[0].3.as_str(), &data["source"]), ("Hyprland crashed (SIGSEGV)", &json!("kernel")));
+        assert_eq!(
+            (rows[0].3.as_str(), &data["source"]),
+            ("Hyprland crashed (SIGSEGV)", &json!("kernel"))
+        );
         assert_eq!(src.read, 1, "debug lines are filtered out by the journal, not read");
     }
 
@@ -1119,7 +1179,13 @@ mod tests {
         run(&mut db, &mut src, 10_000);
         let first = rows(&db);
         let got: Vec<_> = first.iter().map(|r| (r.0, r.3.as_str())).collect();
-        assert_eq!(got, [(100, "Hyprland crashed 10 times (SIGSEGV)"), (600, "waybar crashed (SIGSEGV)")]);
+        assert_eq!(
+            got,
+            [
+                (100, "Hyprland crashed 10 times (SIGSEGV)"),
+                (600, "waybar crashed (SIGSEGV)")
+            ]
+        );
 
         db.write(&json!({"type": "events", "t": 1.0, "events": [], "state": State::default().rows()}))
             .unwrap();

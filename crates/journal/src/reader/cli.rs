@@ -466,9 +466,14 @@ mod tests {
             parse_boots(BOOTS_TABLE.as_bytes()).is_err(),
             "the table must send boots() to the per-id fallback"
         );
-        let ids = ["fedcba9876543210fedcba9876543210", "0123456789abcdef0123456789abcdef", "vacuumed00000000000000000000000x", "-n1"]
-            .map(String::from)
-            .to_vec();
+        let ids = [
+            "fedcba9876543210fedcba9876543210",
+            "0123456789abcdef0123456789abcdef",
+            "vacuumed00000000000000000000000x",
+            "-n1",
+        ]
+        .map(String::from)
+        .to_vec();
         let mut asked = vec![];
         let boots = boots_from(ids, |id| {
             asked.push(id.to_string());
@@ -480,8 +485,16 @@ mod tests {
         })
         .unwrap();
         let got: Vec<_> = boots.iter().map(|b| (&b.id[..4], b.first_us, b.last_us)).collect();
-        assert_eq!(got, [("0123", 10, 20), ("fedc", 30, 40)], "oldest first, whatever order -F gives");
-        assert_eq!(asked.len(), 2, "a value that is not a boot id never reaches journalctl's arguments");
+        assert_eq!(
+            got,
+            [("0123", 10, 20), ("fedc", 30, 40)],
+            "oldest first, whatever order -F gives"
+        );
+        assert_eq!(
+            asked.len(),
+            2,
+            "a value that is not a boot id never reaches journalctl's arguments"
+        );
     }
 
     #[test]
@@ -491,7 +504,11 @@ mod tests {
         let json = cli.boots().unwrap();
         let by_id = cli.boots_by_id().unwrap();
         let n = json.len() - 1;
-        assert_eq!(json[..n], by_id[..n], "the current boot is left out as its last entry moves");
+        assert_eq!(
+            json[..n],
+            by_id[..n],
+            "the current boot is left out as its last entry moves"
+        );
     }
 
     const LINE: &str = r#"{"__CURSOR":"s=1;i=2","__REALTIME_TIMESTAMP":"1700000000000001","__MONOTONIC_TIMESTAMP":"5","_BOOT_ID":"0123456789abcdef0123456789abcdef","PRIORITY":"3","MESSAGE":[27,91,51,49,109,104,105,255],"_TRANSPORT":["stdout","journal"],"BIG":null,"__SEQNUM":"9"}"#;

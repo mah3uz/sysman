@@ -355,7 +355,11 @@ fn fold_crash(tx: &Transaction, e: &Event) -> Result<()> {
 fn owner_only(path: &Path, create: bool) -> Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if create {
-        std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
     }
     match std::fs::metadata(path) {
         Ok(m) if m.permissions().mode() & 0o077 != 0 => {
