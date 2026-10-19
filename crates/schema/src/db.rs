@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS proc_rollup_1m (
     proc_id INTEGER NOT NULL, t INTEGER NOT NULL, cpu_avg REAL, cpu_max REAL, rss_avg REAL, rss_max INTEGER,
     threads_max INTEGER, fds_max INTEGER, read_bps_avg REAL, write_bps_avg REAL, count INTEGER NOT NULL,
     PRIMARY KEY (proc_id, t)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS events (
+    t INTEGER NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, boot_id TEXT, summary TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (t, kind, key)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS events_state (name TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS procs_comm ON procs (comm);
 CREATE INDEX IF NOT EXISTS procs_last ON procs (last_t);
 ";

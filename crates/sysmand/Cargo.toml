@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 schema.workspace = true
+journal.workspace = true
 sysman-config.workspace = true
 anyhow.workspace = true
 jiff.workspace = true

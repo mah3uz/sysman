@@ -6,6 +6,7 @@ mod sd;
 
 use std::fs::File;
 use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -113,6 +114,12 @@ impl Journal {
             Ok(_) => Journal::open_with(Backend::Libsystemd),
             Err(_) => Journal::open_with(Backend::Journalctl),
         }
+    }
+
+    /// Only the journal files listed, through libsystemd; a follower that opens just the files still growing maps only
+    /// those.
+    pub fn open_files(paths: &[PathBuf]) -> Result<Journal> {
+        Ok(Journal(Inner::Sd(sd::Sd::open_files(paths)?)))
     }
 
     pub fn open_with(backend: Backend) -> Result<Journal> {
@@ -412,6 +419,41 @@ mod tests {
                 assert_eq!(j.next(fields).unwrap().unwrap(), b);
             }
         }
+    }
+
+    #[test]
+    #[ignore = "writes one entry to this user's journal"]
+    fn smoke_a_handle_on_the_active_files_alone_follows_appended_entries() {
+        let id = std::fs::read_to_string("/etc/machine-id").unwrap();
+        let dir = format!("/var/log/journal/{}", id.trim());
+        let active: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                name.ends_with(".journal") && !name.contains('@') && File::open(p).is_ok()
+            })
+            .collect();
+        let mut j = Journal::open_files(&active).unwrap();
+        let tag = format!("sysman-journal-files-test-{}", std::process::id());
+        j.set_filter(&Filter::default().any([("SYSLOG_IDENTIFIER", tag.as_str())]))
+            .unwrap();
+        j.seek(Seek::Tail).unwrap();
+        assert_eq!(j.next(Fields::All).unwrap(), None);
+        let status = std::process::Command::new("systemd-cat")
+            .args(["-t", &tag, "echo", "files test"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let entry = loop {
+            assert!(std::time::Instant::now() < deadline, "no entry within 10 s");
+            j.wait(Duration::from_secs(1)).unwrap();
+            if let Some(e) = j.next(Fields::Only(&["MESSAGE"])).unwrap() {
+                break e;
+            }
+        };
+        assert_eq!(entry.message(), "files test");
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -21,6 +23,7 @@ struct Id128([u8; 16]);
 
 pub(super) struct Api {
     open: unsafe extern "C" fn(*mut Handle, c_int) -> c_int,
+    open_files: unsafe extern "C" fn(*mut Handle, *const *const c_char, c_int) -> c_int,
     close: unsafe extern "C" fn(Handle),
     add_match: unsafe extern "C" fn(Handle, *const c_void, usize) -> c_int,
     add_disjunction: unsafe extern "C" fn(Handle) -> c_int,
@@ -61,6 +64,7 @@ fn load() -> Result<Api, libloading::Error> {
     unsafe {
         Ok(Api {
             open: sym(&lib, b"sd_journal_open\0")?,
+            open_files: sym(&lib, b"sd_journal_open_files\0")?,
             close: sym(&lib, b"sd_journal_close\0")?,
             add_match: sym(&lib, b"sd_journal_add_match\0")?,
             add_disjunction: sym(&lib, b"sd_journal_add_disjunction\0")?,
@@ -137,6 +141,28 @@ impl Sd {
         let mut j = std::ptr::null_mut();
         // SAFETY: `j` is a valid out-pointer for the new handle.
         ok(unsafe { (api.open)(&mut j, LOCAL_ONLY) }, "sd_journal_open")?;
+        Sd::wrap(api, j)
+    }
+
+    pub(super) fn open_files(paths: &[PathBuf]) -> Result<Sd> {
+        let api = api()?;
+        let paths = paths
+            .iter()
+            .map(|p| CString::new(p.as_os_str().as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .context("journal path contains NUL")?;
+        let mut ptrs: Vec<*const c_char> = paths.iter().map(|p| p.as_ptr()).collect();
+        ptrs.push(std::ptr::null());
+        let mut j = std::ptr::null_mut();
+        // SAFETY: `j` is a valid out-pointer and `ptrs` a NULL-terminated array of strings that outlive the call.
+        ok(
+            unsafe { (api.open_files)(&mut j, ptrs.as_ptr(), 0) },
+            "sd_journal_open_files",
+        )?;
+        Sd::wrap(api, j)
+    }
+
+    fn wrap(api: &'static Api, j: Handle) -> Result<Sd> {
         let mut sd = Sd {
             api,
             j,
