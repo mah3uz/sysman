@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-10-20
+
 - **Logs**, a new tab: the systemd journal and the package manager's history on one timeline.
   - **Sources:** kernel, hardware, services, apps, scheduled jobs (cron and timers), sign-ins and privileges, boot and
     power, crashes, and package changes (pacman, apt and dpkg).

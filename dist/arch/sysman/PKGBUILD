@@ -1,7 +1,7 @@
 # Maintainer: Mahfuz Shaikh <mah3uz@gmail.com>
 
 pkgname=sysman
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='System monitor for Linux: a metrics collector daemon with crash log and history, and a GPUI app'
 arch=('x86_64')

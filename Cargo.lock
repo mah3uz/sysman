@@ -6967,7 +6967,7 @@ dependencies = [
 
 [[package]]
 name = "sysman"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "gpui-component",
@@ -6991,7 +6991,7 @@ dependencies = [
 
 [[package]]
 name = "sysman-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -7002,7 +7002,7 @@ dependencies = [
 
 [[package]]
 name = "sysman-helper"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "libbpf-cargo",
@@ -7016,7 +7016,7 @@ dependencies = [
 
 [[package]]
 name = "sysman-journal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "flate2",
@@ -7029,7 +7029,7 @@ dependencies = [
 
 [[package]]
 name = "sysman-schema"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7037,7 +7037,7 @@ dependencies = [
 
 [[package]]
 name = "sysmand"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "jiff",
