@@ -23,7 +23,7 @@ const AXIS_HEIGHT: Pixels = px(16.);
 const TOP_PAD: Pixels = px(6.);
 const LABEL_LINE: Pixels = px(12.);
 /// Events closer than this share one marker.
-const CLUSTER_PX: f32 = 8.;
+const CLUSTER_PX: f32 = 20.;
 /// How near the pointer must come to a marker's rule to pick it.
 const MARK_REACH: Pixels = px(6.);
 const GLYPH: Pixels = px(11.);
@@ -564,10 +564,7 @@ impl TrendChart {
             .filter(|e| !matches!(e.kind, Kind::Suspend | Kind::Resume))
             .filter(|e| (self.from..=self.to).contains(&(e.t as f64)))
             .collect();
-        let xs: Vec<f32> = shown
-            .iter()
-            .map(|e| f32::from(self.x_of(&plot, e.t as f64)))
-            .collect();
+        let xs: Vec<f32> = shown.iter().map(|e| f32::from(self.x_of(&plot, e.t as f64))).collect();
         for run in clusters(&xs, CLUSTER_PX) {
             let mut events: Vec<Event> = shown[run.clone()].iter().map(|&e| e.clone()).collect();
             events.sort_by_key(|e| e.kind);
@@ -708,11 +705,7 @@ impl TrendChart {
                 ink.grid,
             ));
         }
-        let mark_colors: Vec<Hsla> = built
-            .marks
-            .iter()
-            .map(|m| m.events[0].kind.color(theme(cx)))
-            .collect();
+        let mark_colors: Vec<Hsla> = built.marks.iter().map(|m| m.events[0].kind.color(theme(cx))).collect();
         window.with_content_mask(Some(ContentMask { bounds: plot }), |window| {
             // Drawn first and faint, so the data line always reads over them.
             for &(x0, x1) in &built.sleeps {
@@ -727,13 +720,19 @@ impl TrendChart {
                     Bounds::new(point(mark.x - px(0.5), below), size(px(1.), plot.bottom() - below)),
                     color.opacity(0.3),
                 ));
-                let glyph = Bounds::centered_at(point(mark.x, plot.top() + px(3.) + GLYPH / 2.), size(GLYPH, GLYPH));
+                let count = (mark.events.len() > 1)
+                    .then(|| shape(window, &ink.font, mark.events.len().to_string().into(), ink.axis, color));
+                let count_w = count.as_ref().map_or(px(1.), |c| c.width + px(3.));
+                // Kept whole at the plot's edges, where the newest events land.
+                let centre = mark
+                    .x
+                    .clamp(plot.left() + GLYPH / 2., plot.right() - GLYPH / 2. - count_w);
+                let glyph = Bounds::centered_at(point(centre, plot.top() + px(3.) + GLYPH / 2.), size(GLYPH, GLYPH));
                 let path = mark.events[0].kind.icon().path();
                 window
                     .paint_svg(glyph, path, None, TransformationMatrix::unit(), color.opacity(0.85), cx)
                     .ok();
-                if mark.events.len() > 1 {
-                    let count = shape(window, &ink.font, mark.events.len().to_string().into(), ink.axis, color);
+                if let Some(count) = count {
                     paint_text(window, cx, &count, point(glyph.right() + px(1.), glyph.top() - px(1.)));
                 }
             }

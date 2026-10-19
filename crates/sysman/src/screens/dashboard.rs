@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
@@ -290,6 +290,7 @@ pub struct Dashboard {
     version: u64,
     charts: Charts,
     cpu_meta: Option<CpuMeta>,
+    rail_scroll: ScrollHandle,
     /// A sheet to open once history has loaded, for off-screen captures.
     #[cfg(debug_assertions)]
     dev_sheet: Option<Metric>,
@@ -327,6 +328,7 @@ impl Dashboard {
             version: 0,
             charts: Charts::default(),
             cpu_meta: None,
+            rail_scroll: ScrollHandle::new(),
             #[cfg(debug_assertions)]
             dev_sheet: std::env::var("SYSMAN_DEV_SHEET").ok().and_then(|name| {
                 Metric::ALL
@@ -1215,7 +1217,10 @@ impl Dashboard {
     fn recent_events(&self, cx: &App) -> AnyElement {
         let t = theme(cx);
         let events = self.events();
-        let worst = events.as_deref().map(|e| events::worst(e, EVENT_ROWS)).unwrap_or_default();
+        let worst = events
+            .as_deref()
+            .map(|e| events::worst(e, EVENT_ROWS))
+            .unwrap_or_default();
         let collecting = matches!(self.live.read(cx).conn, Conn::Connected);
         if worst.is_empty() {
             let line = if events.is_some() && collecting {
@@ -1229,7 +1234,7 @@ impl Dashboard {
             };
             return caption(line, cx).into_any_element();
         }
-        let now = self.now(cx);
+        let today = clock(self.now(cx), "%F");
         div()
             .flex()
             .flex_col()
@@ -1237,7 +1242,8 @@ impl Dashboard {
             .mx(rem_px(-6.))
             .text_size(t.caption)
             .children(worst.into_iter().enumerate().map(|(i, e)| {
-                let pattern = if now - e.t as f64 > 86400. { "%a %H:%M" } else { "%H:%M" };
+                let at = e.t as f64;
+                let pattern = if clock(at, "%F") == today { "%H:%M" } else { "%a %H:%M" };
                 let t_us = e.t_us();
                 div()
                     .id(("recent-event", i))
@@ -1262,7 +1268,7 @@ impl Dashboard {
                             .flex_shrink_0()
                             .text_color(t.text_secondary)
                             .font_features(t.numbers.clone())
-                            .child(clock(e.t as f64, pattern)),
+                            .child(clock(at, pattern)),
                     )
                     .on_click(move |_, _, cx| navigate(Tab::Logs, Some(Focus::LogEntry { t_us }), cx))
             }))
@@ -1280,6 +1286,10 @@ impl Render for Dashboard {
             window.defer(cx, move |window, cx| {
                 crate::ui::widgets::detail_sheet::open(detail, window, cx)
             });
+        }
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYSMAN_DEV_RAIL_END").is_some() {
+            self.rail_scroll.scroll_to_bottom();
         }
         #[cfg(not(debug_assertions))]
         let _ = window;
@@ -1350,6 +1360,7 @@ impl Render for Dashboard {
             .child(
                 div()
                     .id("dashboard-rail")
+                    .track_scroll(&self.rail_scroll)
                     .flex_shrink_0()
                     .map(|d| t.rail(d))
                     .h_full()
