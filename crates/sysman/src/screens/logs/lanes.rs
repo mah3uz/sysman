@@ -49,10 +49,16 @@ fn mark_width(pitch: f32) -> f32 {
     (pitch * 0.8).max(MARK_MIN)
 }
 
+struct Overlay {
+    cpu: Rc<[Bucket]>,
+    temp: Rc<[Bucket]>,
+    width_s: f64,
+}
+
 struct Paint {
     lanes: Arc<Vec<Lane>>,
     max: u32,
-    cpu: Option<(Rc<[Bucket]>, Rc<[Bucket]>, f64)>,
+    overlay: Option<Overlay>,
     span_s: (f64, f64),
     rules: Vec<(f32, Hsla)>,
     hover: Option<(usize, usize)>,
@@ -78,7 +84,7 @@ fn paint(bounds: Bounds<Pixels>, p: &Paint, window: &mut Window) {
         );
         window.paint_quad(fill(r, p.wash));
     }
-    if let Some((cpu, temp, width_s)) = &p.cpu {
+    if let Some(Overlay { cpu, temp, width_s }) = &p.overlay {
         let (from, to) = p.span_s;
         let x = |b: &Bucket| left + width * (((b.t as f64 + width_s / 2.) - from) / (to - from).max(1.)) as f32;
         let runs = |data: &[Bucket]| {
@@ -246,7 +252,11 @@ impl Logs {
         let painted = Paint {
             lanes: lanes.clone(),
             max: lanes.iter().flat_map(|l| l.counts.iter().copied()).max().unwrap_or(0),
-            cpu: recorded.map(|d| (d.cpu.clone(), d.temp.clone(), d.width_s)),
+            overlay: recorded.map(|d| Overlay {
+                cpu: d.cpu.clone(),
+                temp: d.temp.clone(),
+                width_s: d.width_s,
+            }),
             span_s,
             rules,
             hover: self.lane_hover,
@@ -366,6 +376,7 @@ impl Logs {
             )
         });
         let legend = div()
+            .flex_shrink_0()
             .flex()
             .flex_row()
             .items_center()
@@ -477,11 +488,13 @@ impl Logs {
                 .child(div().w(rem_px(LABELS)).child(heading("Lanes", t)))
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
                         .text_size(t.small_caption)
                         .text_color(t.text_tertiary)
                         .child("Drag across to narrow the time · click a mark for its entries · double-click to clear"),
                 )
-                .child(div().flex_1())
                 .child(legend)
                 .child(
                     Button::new("logs-lanes")

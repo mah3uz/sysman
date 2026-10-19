@@ -127,8 +127,8 @@ impl Logs {
             .map(|e| fields(e, t).into_any_element());
         frame
             .child(
-                body.child(div().flex().flex_col().gap(rem_px(8.)).child(header).child(message))
-                    .children(finding)
+                body.children(finding)
+                    .child(div().flex().flex_col().gap(rem_px(8.)).child(header).child(message))
                     .children(recorded)
                     .children(around)
                     .children(fields),

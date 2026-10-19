@@ -363,9 +363,11 @@ impl Logs {
                     div()
                         .flex()
                         .flex_row()
+                        .flex_wrap()
                         .items_center()
+                        .gap_y(rem_px(4.))
                         .child(heading("What sysman recorded", t))
-                        .child(div().flex_1())
+                        .child(div().flex_1().min_w(rem_px(8.)))
                         .child(open_in_explorer("logs-entry-explorer", at, self)),
                 )
                 .child(charts("logs-entry-chart", recorded, 2, 26., t))
