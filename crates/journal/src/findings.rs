@@ -14,25 +14,75 @@ const USB_STORM_MIN: usize = 5;
 const SIGNIN_WINDOW_US: u64 = 10 * 60 * SECOND_US;
 const SIGNIN_FAILURES_MIN: usize = 3;
 const OOM_MERGE_US: u64 = 5 * SECOND_US;
+// systemd-coredump logs a dump seconds after the kernel's line; a large process takes longer.
+const CRASH_DEDUP_US: u64 = 30 * SECOND_US;
+const SHUTDOWN_STRETCH_US: u64 = 30 * 60 * SECOND_US;
+const JOURNAL_STOP_STRETCH_US: u64 = 60 * SECOND_US;
 const EVIDENCE_CHARS: usize = 200;
+// Kernel warnings and worse; informational lines such as "AER: enabled with IRQ" are not errors.
+const HARDWARE_MAX_PRIORITY: u8 = 4;
+// GPU drivers report hangs and resets at info or notice.
+const GPU_MAX_PRIORITY: u8 = 6;
 
 // Every text pattern the rules match on, kernel unless noted.
-const OOM_KILL: &str = "ut of memory: Kill";
-const OOM_KILL_SUMMARY: &str = "oom-kill:constraints=";
-const THROTTLE: &[&str] = &["clock throttled", "temperature above threshold"];
+const OOM_KILL: &[&str] = &["ut of memory: Kill", "Out of memory (oom_kill_allocating_task): Kill"];
+const OOM_KILL_SUMMARY: &str = "oom-kill:constraint=";
+const THROTTLE: &[&str] = &[
+    "temperature is above threshold, cpu clock is throttled",
+    "temperature above threshold, cpu clock throttled",
+];
+const CRITICAL_TEMPERATURE: &str = "critical temperature reached";
 const USB_DISCONNECT: &str = ": USB disconnect";
+const SEGFAULT: &str = ": segfault at ";
+const TRAPS: &str = "traps: ";
+const KERNEL_START: &str = "Linux version ";
+const RESET_REASON: &str = "x86/amd: Previous system reset reason [";
+// journald, not native: "File %s corrupted or uncleanly shut down, renaming and replacing."
+const UNCLEAN_JOURNAL: &str = "corrupted or uncleanly shut down";
+const GPU: &[(&str, &[&str])] = &[
+    ("NVIDIA GPU errors (Xid)", &["NVRM: Xid"]),
+    ("AMD GPU hangs", &[" timeout, signaled seq=", "GPU reset begin"]),
+    ("Intel GPU hangs", &["GPU HANG", "Timedout job"]),
+];
 const HARDWARE: &[(&str, &[&str])] = &[
-    ("PCIe AER errors", &["AER:"]),
     (
         "Machine check events",
         &["[Hardware Error]", "Machine check", "Machine Check"],
     ),
     ("Memory (EDAC) errors", &["EDAC MC"]),
-    ("Disk I/O errors", &["I/O error, dev ", "Buffer I/O error"]),
+    (
+        "NVMe timeouts",
+        &["timeout, aborting", "controller is down; will reset"],
+    ),
+    ("SATA errors", &["exception Emask", "failed command"]),
 ];
+// The per-error lines of aer.c; its other "AER:" lines are setup and detail.
+const AER_EVENT: &[&str] = &["severity=", "error message received", "error received"];
 const EDAC_ERROR: &[&str] = &[" CE ", " UE ", "error"];
+const UNCORRECTED: &[&str] = &["Uncorrect", "|UE|", " UE ", "Fatal", "|PCC|", "context corrupt"];
+const CORRECTED: &[&str] = &["Correctable", "Corrected", "|CE|", " CE "];
+// blk_print_req_error prints "%s error, dev %s" with every blk_errors[] name; fs/buffer.c its own line.
+const BLOCK_ERROR: &[&str] = &[
+    " error, dev ",
+    "Buffer I/O error on dev ",
+    "Buffer I/O error on device ",
+];
+// Empty optical drives, VM floppies and loop files fail reads routinely.
+const NOISY_DEVICES: &[&str] = &["fd", "sr", "loop"];
 const SIGNIN_FAILURE: &[&str] = &["Failed password", "authentication failure"];
 const AUTH_FACILITIES: &[&str] = &["4", "10"];
+const DISPLAY_MANAGERS: &[&str] = &[
+    "gdm",
+    "gdm3",
+    "sddm",
+    "lightdm",
+    "greetd",
+    "ly",
+    "lxdm",
+    "xdm",
+    "display-manager",
+];
+const RESTARTABLE_SUFFIXES: &[&str] = &["service", "socket", "mount"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -156,12 +206,22 @@ impl Finding {
                 }
             }
             FindingKind::RestartLoop => format!("{} keeps restarting ({n} restarts)", self.field("unit")),
+            FindingKind::ThermalThrottle if self.data.contains_key("critical") => {
+                format!("Critical temperature reached ({n})")
+            }
             FindingKind::ThermalThrottle => format!("Thermal throttling ({n} events)"),
             FindingKind::FailedSignIns => format!("Repeated failed sign-ins ({n})"),
             FindingKind::HardwareError if self.data.contains_key("device") => {
                 format!("{} disconnected {n} times in a minute", self.field("device"))
             }
-            FindingKind::HardwareError => format!("{} ({n})", self.field("error")),
+            FindingKind::HardwareError => {
+                let corrected = self.data.contains_key("corrected") && !self.data.contains_key("uncorrected");
+                self.severity = if corrected { Severity::Medium } else { Severity::High };
+                match corrected {
+                    true => format!("{}, corrected ({n})", self.field("error")),
+                    false => format!("{} ({n})", self.field("error")),
+                }
+            }
             FindingKind::OomKill => oom_title(self),
             _ => return,
         };
@@ -185,6 +245,205 @@ pub fn same_message(a: &Entry, b: &Entry) -> bool {
     source(a) == source(b) && a.message() == b.message()
 }
 
+/// Whether a system or user manager wrote this entry, judged from the fields journald sets itself. Any local user
+/// can log a unit failure with a forged `UNIT`; only PID 1 as root, or the reader's own user manager, is believed.
+pub fn trusted_manager_entry(e: &Entry, owner_uid: u32) -> bool {
+    match e.get("_PID") {
+        Some("1") => system_manager(e),
+        _ => e.get("_COMM") == Some("systemd") && e.get("_UID").and_then(|u| u.parse().ok()) == Some(owner_uid),
+    }
+}
+
+fn system_manager(e: &Entry) -> bool {
+    e.get("_PID") == Some("1") && e.get("_UID") == Some("0")
+}
+
+/// A unit the app may offer to restart: a valid instantiated or plain `.service`, `.socket` or `.mount` name that
+/// cannot be read as an option, and not one whose restart ends the user's session.
+pub fn restartable_unit(name: &str) -> bool {
+    const VALID: &str = ":-_.\\@";
+    let Some((prefix, suffix)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let valid = name.len() < 256
+        && !prefix.is_empty()
+        && !name.starts_with(['-', '@'])
+        && RESTARTABLE_SUFFIXES.contains(&suffix)
+        && prefix.chars().all(|c| c.is_ascii_alphanumeric() || VALID.contains(c));
+    let base = prefix.split_once('@').map_or(prefix, |(b, _)| b);
+    let template = prefix.ends_with('@');
+    valid && !template && !matches!(base, "user" | "user-runtime-dir") && !DISPLAY_MANAGERS.contains(&base)
+}
+
+/// How a past boot ended, from [`boot_end_verdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootEndVerdict {
+    /// The boot's start is not in the journal (vacuumed, or not readable), so its end is not judged.
+    Unknown,
+    Clean,
+    /// No shutdown, and the next boot's journald or reset reason shows it.
+    Confirmed,
+    /// No shutdown, and its last sleep event is a suspend with no resume.
+    EndedWhileSuspended,
+    /// No shutdown was logged, and nothing else says why.
+    Unconfirmed,
+}
+
+impl BootEndVerdict {
+    pub fn key(self) -> &'static str {
+        match self {
+            BootEndVerdict::Unknown => "unknown",
+            BootEndVerdict::Clean => "clean",
+            BootEndVerdict::Confirmed => "confirmed",
+            BootEndVerdict::EndedWhileSuspended => "ended_while_suspended",
+            BootEndVerdict::Unconfirmed => "unconfirmed",
+        }
+    }
+
+    pub fn ended_without_shutdown(self) -> bool {
+        !matches!(self, BootEndVerdict::Unknown | BootEndVerdict::Clean)
+    }
+}
+
+/// What a boot's own entries and the next boot's say about how it ended. Feed the boot's entries to `note` and the
+/// following boot's to `note_next`; only the markers matter, so a reader may feed just those, setting `last_us` to
+/// the boot's last entry.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BootEndFacts {
+    /// The kernel's "Linux version" line was seen.
+    pub kernel_start: bool,
+    pub last_us: u64,
+    /// The latest logind shutdown, or PID 1 stopping multi-user.target.
+    pub shutdown_us: Option<u64>,
+    pub journal_stopped_us: Option<u64>,
+    pub sleep_start_us: Option<u64>,
+    pub sleep_stop_us: Option<u64>,
+    /// The next boot's journald found a file of this one left open.
+    pub next_unclean_journal: bool,
+    /// The next boot's AMD reset reason text, after the register value.
+    pub next_reset_reason: Option<String>,
+}
+
+impl BootEndFacts {
+    pub fn note(&mut self, e: &Entry) {
+        let t = Some(e.t_us);
+        self.last_us = self.last_us.max(e.t_us);
+        let root = root_entry(e);
+        match e.get("MESSAGE_ID") {
+            Some(ids::SHUTDOWN) if root => self.shutdown_us = self.shutdown_us.max(t),
+            Some(ids::UNIT_STOPPED) if e.get("UNIT") == Some("multi-user.target") && system_manager(e) => {
+                self.shutdown_us = self.shutdown_us.max(t);
+            }
+            Some(ids::JOURNAL_STOPPED) if root => self.journal_stopped_us = self.journal_stopped_us.max(t),
+            Some(ids::SLEEP_START) if root => self.sleep_start_us = self.sleep_start_us.max(t),
+            Some(ids::SLEEP_STOP) if root => self.sleep_stop_us = self.sleep_stop_us.max(t),
+            _ => {}
+        }
+        if is_kernel(e) && e.message().starts_with(KERNEL_START) {
+            self.kernel_start = true;
+        }
+    }
+
+    pub fn note_next(&mut self, e: &Entry) {
+        let message = e.message();
+        if is_kernel(e)
+            && let Some(rest) = message.strip_prefix(RESET_REASON)
+        {
+            self.next_reset_reason = rest.split_once("]: ").map(|(_, r)| r.trim().to_string());
+        }
+        if e.get("SYSLOG_IDENTIFIER") == Some("systemd-journald") && root_entry(e) && message.contains(UNCLEAN_JOURNAL)
+        {
+            self.next_unclean_journal = true;
+        }
+    }
+
+    pub fn ended_suspended(&self) -> bool {
+        self.sleep_start_us
+            .is_some_and(|s| self.sleep_stop_us.is_none_or(|w| w < s))
+    }
+}
+
+/// A boot ended cleanly when logind's shutdown or PID 1 stopping multi-user.target falls in its final stretch: after
+/// its last resume and within 30 minutes of its last entry. journald stopping counts only within a minute of the end,
+/// since journald also stops when it is restarted.
+pub fn boot_end_verdict(f: &BootEndFacts) -> BootEndVerdict {
+    if !f.kernel_start {
+        return BootEndVerdict::Unknown;
+    }
+    let near_end = |t: u64, stretch: u64| t <= f.last_us && f.last_us - t <= stretch;
+    let after_resume = |t: u64| f.sleep_stop_us.is_none_or(|w| t > w);
+    let shutdown = f
+        .shutdown_us
+        .is_some_and(|t| after_resume(t) && near_end(t, SHUTDOWN_STRETCH_US));
+    let journal = f
+        .journal_stopped_us
+        .is_some_and(|t| near_end(t, JOURNAL_STOP_STRETCH_US));
+    if shutdown || journal {
+        return BootEndVerdict::Clean;
+    }
+    let reset = f
+        .next_reset_reason
+        .as_deref()
+        .is_some_and(|r| decode_reset_reason(r).1 != ResetKind::Orderly);
+    if f.next_unclean_journal || reset {
+        BootEndVerdict::Confirmed
+    } else if f.ended_suspended() {
+        BootEndVerdict::EndedWhileSuspended
+    } else {
+        BootEndVerdict::Unconfirmed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetKind {
+    /// The hardware cut power: a thermal trip, the power button held, a shutdown pin.
+    PowerCut,
+    /// A reset with no orderly path: the reset pin, a watchdog, a sync flood.
+    Abrupt,
+    /// What a normal power-off or reboot also leaves, or a reason not known.
+    Orderly,
+}
+
+/// A short name and kind for the text arch/x86/kernel/cpu/amd.c prints after "Previous system reset reason [..]: ".
+pub fn decode_reset_reason(text: &str) -> (&str, ResetKind) {
+    const REASONS: &[(&str, &str, ResetKind)] = &[
+        ("BP_THERMTRIP_L", "thermal trip", ResetKind::PowerCut),
+        ("CPU thermal limit", "CPU thermal limit", ResetKind::PowerCut),
+        ("power button", "power button held", ResetKind::PowerCut),
+        ("shutdown pin", "shutdown pin", ResetKind::PowerCut),
+        ("ASF power off", "remote power-off", ResetKind::PowerCut),
+        ("BP_SYS_RST_L", "reset pin", ResetKind::Abrupt),
+        ("KB_RST_L", "keyboard reset pin", ResetKind::Abrupt),
+        ("watchdog", "watchdog", ResetKind::Abrupt),
+        ("sync flood", "sync flood", ResetKind::Abrupt),
+        ("CPU shutdown event", "CPU shutdown event", ResetKind::Abrupt),
+        ("failed boot timer", "failed boot timer", ResetKind::Abrupt),
+        ("parity error", "parity error", ResetKind::Abrupt),
+        ("warm reset handshake", "failed warm reset", ResetKind::Abrupt),
+        ("ASF reset", "remote reset", ResetKind::Abrupt),
+        (
+            "ACPI power state transition",
+            "ACPI power transition",
+            ResetKind::Orderly,
+        ),
+        ("0xCF9", "software reset", ResetKind::Orderly),
+        ("PCI reset", "software reset", ResetKind::Orderly),
+    ];
+    REASONS
+        .iter()
+        .find(|(needle, ..)| text.contains(needle))
+        .map_or((text, ResetKind::Orderly), |(_, label, kind)| (*label, *kind))
+}
+
+fn is_kernel(e: &Entry) -> bool {
+    e.get("_TRANSPORT") == Some("kernel")
+}
+
+// Only root can write kmsg, and journald sets _UID itself.
+fn root_entry(e: &Entry) -> bool {
+    is_kernel(e) || e.get("_UID") == Some("0")
+}
+
 #[derive(Default)]
 struct BootSpan {
     id: String,
@@ -192,7 +451,18 @@ struct BootSpan {
     last_us: u64,
     last_index: usize,
     last_line: String,
-    stopped_cleanly: bool,
+    end: BootEndFacts,
+}
+
+struct PendingCrash {
+    t: u64,
+    index: usize,
+    boot: String,
+    pid: String,
+    comm: String,
+    signal: &'static str,
+    evidence: String,
+    cursor: Option<String>,
 }
 
 type BurstKey = (&'static str, String, String);
@@ -223,24 +493,41 @@ pub struct Detector {
     grouped: HashMap<(&'static str, String, String), usize>,
     bursts: HashMap<BurstKey, Burst>,
     last_oom: Option<usize>,
+    /// Kernel crash lines waiting to see whether a core dump of the same pid follows.
+    pending_crashes: Vec<PendingCrash>,
+    /// (boot, pid, time) of recent core dumps.
+    recent_dumps: VecDeque<(String, String, u64)>,
+    owner_uid: u32,
 }
 
 impl Detector {
+    /// Believes the user manager of the user running it.
     pub fn new() -> Detector {
-        Detector::default()
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        Detector::for_owner(unsafe { libc::geteuid() })
+    }
+
+    /// Believes the system manager and the user manager running as `owner_uid`.
+    pub fn for_owner(owner_uid: u32) -> Detector {
+        Detector {
+            owner_uid,
+            ..Detector::default()
+        }
     }
 
     pub fn push(&mut self, index: usize, e: &Entry) {
         let boot = e.get("_BOOT_ID").unwrap_or_default();
         self.track_boot(index, e, boot);
         let t = e.t_us;
+        self.flush_crashes(t);
         let before = self.out.len();
+        let trusted = trusted_manager_entry(e, self.owner_uid);
         match e.get("MESSAGE_ID") {
             Some(ids::COREDUMP) => self.crash(index, e, boot),
-            Some(ids::UNIT_FAILURE) => self.failed_unit(index, e, boot),
-            Some(ids::RESTART_SCHEDULED) => self.restart(index, e, boot),
-            Some(ids::OOMD_KILL | ids::UNIT_OOM) => self.oom(index, e, boot),
-            Some(ids::SHUTDOWN | ids::JOURNAL_STOPPED) => self.boots[self.current].stopped_cleanly = true,
+            Some(ids::UNIT_FAILURE) if trusted => self.failed_unit(index, e, boot),
+            Some(ids::RESTART_SCHEDULED) if trusted => self.restart(index, e, boot),
+            Some(ids::UNIT_OOM) if trusted => self.oom(index, e, boot),
+            Some(ids::OOMD_KILL) => self.oom(index, e, boot),
             _ => {}
         }
         if e.get("_TRANSPORT") == Some("kernel") {
@@ -265,6 +552,7 @@ impl Detector {
     /// `first_us` and `cursor`. A unit's failures fold until an entry of another boot arrives. Findings drained and
     /// closed are not returned by `finish`.
     pub fn drain(&mut self, now_us: u64) -> Vec<Finding> {
+        self.flush_crashes(now_us);
         let mut fresh: Vec<Finding> = self
             .out
             .iter()
@@ -312,7 +600,12 @@ impl Detector {
     /// repeats an episode.
     pub fn open_since(&self) -> Option<u64> {
         let quiet = self.bursts.values().filter_map(|b| b.events.front().map(|h| h.t));
-        self.held().map(|i| self.out[i].first_us).chain(quiet).min()
+        let pending = self.pending_crashes.iter().map(|p| p.t);
+        self.held()
+            .map(|i| self.out[i].first_us)
+            .chain(quiet)
+            .chain(pending)
+            .min()
     }
 
     fn held(&self) -> impl Iterator<Item = usize> + '_ {
@@ -327,23 +620,72 @@ impl Detector {
 
     /// `current_boot` is never reported as ended without shutdown, it has not ended yet.
     pub fn finish(mut self, current_boot: Option<&str>) -> Vec<Finding> {
+        self.flush_crashes(u64::MAX);
         for span in &self.boots {
-            if span.id.is_empty() || span.stopped_cleanly || Some(span.id.as_str()) == current_boot {
+            if span.id.is_empty() || Some(span.id.as_str()) == current_boot {
                 continue;
             }
-            let mut f = Finding::new(
-                FindingKind::BootWithoutShutdown,
-                span.last_us,
-                span.last_index,
-                &span.id,
-                "Boot ended without a shutdown".to_string(),
-                format!("Last entry: {}", span.last_line),
-            );
-            f.data.insert("boot_started_us".to_string(), span.first_us.to_string());
-            self.out.push(f);
+            let verdict = boot_end_verdict(&span.end);
+            if verdict.ended_without_shutdown() {
+                self.out.push(boot_end_finding(span, verdict));
+            }
         }
         self.out.sort_by_key(|f| f.first_us);
         self.out
+    }
+
+    /// Makes findings of the kernel crash lines that no core dump followed within the window, as of `now_us`.
+    fn flush_crashes(&mut self, now_us: u64) {
+        let ripe = |p: &PendingCrash| now_us.saturating_sub(p.t) > CRASH_DEDUP_US;
+        while self
+            .recent_dumps
+            .front()
+            .is_some_and(|d| now_us.saturating_sub(d.2) > CRASH_DEDUP_US)
+        {
+            self.recent_dumps.pop_front();
+        }
+        if !self.pending_crashes.iter().any(ripe) {
+            return;
+        }
+        let (done, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_crashes).into_iter().partition(ripe);
+        self.pending_crashes = wait;
+        for p in done {
+            let mut f = self.crash_finding(p.t, p.index, &p.boot, &p.comm, p.signal, p.evidence);
+            f.data.insert("pid".to_string(), p.pid);
+            f.data.insert("signal".to_string(), p.signal.to_string());
+            f.data.insert("source".to_string(), "kernel".to_string());
+            f.cursor = p.cursor;
+            self.out.push(f);
+        }
+    }
+
+    fn kernel_crash(&mut self, index: usize, e: &Entry, boot: &str, (comm, pid, signal): (&str, &str, &'static str)) {
+        let dumped = self.recent_dumps.iter().any(|d| d.0 == boot && d.1 == pid);
+        if dumped {
+            return;
+        }
+        self.pending_crashes.push(PendingCrash {
+            t: e.t_us,
+            index,
+            boot: boot.to_string(),
+            pid: pid.to_string(),
+            comm: comm.to_string(),
+            signal,
+            evidence: evidence(e.message()),
+            cursor: e.get("__CURSOR").map(str::to_string),
+        });
+    }
+
+    fn crash_finding(&mut self, t: u64, index: usize, boot: &str, comm: &str, signal: &str, shown: String) -> Finding {
+        let n = self.crashes.entry((boot.to_string(), comm.to_string())).or_default();
+        *n += 1;
+        let title = match *n {
+            1 => format!("{comm} crashed ({signal})"),
+            2 => format!("Second {comm} crash this boot ({signal})"),
+            3 => format!("Third {comm} crash this boot ({signal})"),
+            n => format!("{} {comm} crash this boot ({signal})", ordinal(n)),
+        };
+        Finding::new(FindingKind::Crash, t, index, boot, title, shown).with("comm", comm)
     }
 
     fn track_boot(&mut self, index: usize, e: &Entry, boot: &str) {
@@ -365,19 +707,19 @@ impl Detector {
         span.last_index = index;
         span.last_line.clear();
         let _ = write!(span.last_line, "{}: {}", source(e), evidence(e.message()));
+        span.end.note(e);
+        if let Some(previous) = self.current.checked_sub(1) {
+            self.boots[previous].end.note_next(e);
+        }
     }
 
     fn crash(&mut self, index: usize, e: &Entry, boot: &str) {
         let comm = e.get("COREDUMP_COMM").unwrap_or("A process");
         let signal = e.get("COREDUMP_SIGNAL_NAME").unwrap_or("unknown signal");
-        let n = self.crashes.entry((boot.to_string(), comm.to_string())).or_default();
-        *n += 1;
-        let title = match *n {
-            1 => format!("{comm} crashed ({signal})"),
-            2 => format!("Second {comm} crash this boot ({signal})"),
-            3 => format!("Third {comm} crash this boot ({signal})"),
-            n => format!("{n}th {comm} crash this boot ({signal})"),
-        };
+        if let Some(pid) = e.get("COREDUMP_PID") {
+            self.pending_crashes.retain(|p| p.boot != boot || p.pid != pid);
+            self.recent_dumps.push_back((boot.to_string(), pid.to_string(), e.t_us));
+        }
         let mut shown = evidence(e.message());
         if shown.is_empty() {
             // The reader may drop a long multi-line MESSAGE.
@@ -386,8 +728,7 @@ impl Detector {
                 e.get("COREDUMP_PID").unwrap_or("?")
             );
         }
-        let mut f = Finding::new(FindingKind::Crash, e.t_us, index, boot, title, shown);
-        f.data.insert("comm".to_string(), comm.to_string());
+        let mut f = self.crash_finding(e.t_us, index, boot, comm, signal, shown);
         for (field, key) in [
             ("COREDUMP_PID", "pid"),
             ("COREDUMP_SIGNAL_NAME", "signal"),
@@ -467,19 +808,25 @@ impl Detector {
 
     fn kernel_line(&mut self, index: usize, e: &Entry, boot: &str) {
         let message = e.message();
-        if message.contains(OOM_KILL) || message.contains(OOM_KILL_SUMMARY) {
+        if OOM_KILL.iter().any(|p| message.contains(p)) || message.contains(OOM_KILL_SUMMARY) {
             return self.oom(index, e, boot);
         }
-        if THROTTLE.iter().any(|p| message.contains(p)) {
-            return self.group(("thermal", boot.to_string(), String::new()), index, e, || {
-                Finding::new(
+        if let Some(crash) = kernel_crash_line(message) {
+            return self.kernel_crash(index, e, boot, crash);
+        }
+        let critical = message.contains(CRITICAL_TEMPERATURE);
+        if critical || THROTTLE.iter().any(|p| message.contains(p)) {
+            let key = if critical { "critical" } else { "" };
+            return self.group(("thermal", boot.to_string(), key.to_string()), index, e, || {
+                let f = Finding::new(
                     FindingKind::ThermalThrottle,
                     e.t_us,
                     index,
                     boot,
                     String::new(),
                     evidence(message),
-                )
+                );
+                if critical { f.with("critical", "true") } else { f }
             });
         }
         if let Some(at) = message.find(USB_DISCONNECT) {
@@ -500,8 +847,9 @@ impl Detector {
             });
             return;
         }
-        if let Some(what) = hardware_error(message) {
-            self.group(("hardware", boot.to_string(), what.to_string()), index, e, || {
+        if let Some((what, class)) = hardware_error(e) {
+            let key = ("hardware", boot.to_string(), what.to_string());
+            self.group(key.clone(), index, e, || {
                 Finding::new(
                     FindingKind::HardwareError,
                     e.t_us,
@@ -512,6 +860,11 @@ impl Detector {
                 )
                 .with("error", what)
             });
+            if let Some(class) = class {
+                let f = &mut self.out[self.grouped[&key]];
+                f.data.insert(class.to_string(), "true".to_string());
+                f.retitle();
+            }
         }
     }
 
@@ -664,12 +1017,115 @@ fn pam_service(message: &str) -> Option<String> {
     Some(rest.split(':').next()?.to_string())
 }
 
-fn hardware_error(message: &str) -> Option<&'static str> {
+/// The hardware rule a kernel line belongs to, and whether it says the error was corrected.
+fn hardware_error(e: &Entry) -> Option<(&'static str, Option<&'static str>)> {
+    let message = e.message();
+    let has = |needles: &[&str]| needles.iter().any(|n| message.contains(n));
+    let priority = e.priority();
+    if priority <= GPU_MAX_PRIORITY
+        && let Some((what, _)) = GPU.iter().find(|(_, needles)| has(needles))
+    {
+        return Some((what, None));
+    }
+    if priority > HARDWARE_MAX_PRIORITY {
+        return None;
+    }
+    let class = if has(UNCORRECTED) {
+        Some("uncorrected")
+    } else if has(CORRECTED) {
+        Some("corrected")
+    } else {
+        None
+    };
+    if message.contains("AER: ") {
+        return has(AER_EVENT).then_some(("PCIe AER errors", class));
+    }
+    if let Some(device) = block_error_device(message) {
+        let noise = NOISY_DEVICES.iter().any(|d| device.starts_with(d));
+        return (!noise).then_some(("Disk I/O errors", None));
+    }
     HARDWARE.iter().find_map(|(what, needles)| {
-        let hit = needles.iter().any(|n| message.contains(n));
-        let edac_noise = *what == "Memory (EDAC) errors" && !EDAC_ERROR.iter().any(|p| message.contains(p));
-        (hit && !edac_noise).then_some(*what)
+        let edac_noise = *what == "Memory (EDAC) errors" && !has(EDAC_ERROR);
+        (has(needles) && !edac_noise).then_some((*what, class))
     })
+}
+
+fn block_error_device(message: &str) -> Option<&str> {
+    let (_, rest) = BLOCK_ERROR.iter().find_map(|n| message.split_once(n))?;
+    rest.split([',', ' ']).next()
+}
+
+/// (comm, pid, signal) of arch/x86/mm/fault.c's "comm[pid]: segfault at" or arch/x86/kernel/traps.c's
+/// "traps: comm[pid] trap ..." line.
+fn kernel_crash_line(message: &str) -> Option<(&str, &str, &'static str)> {
+    if let Some(at) = message.find(SEGFAULT) {
+        let (comm, pid) = comm_pid(&message[..at])?;
+        return Some((comm, pid, "SIGSEGV"));
+    }
+    let rest = message.strip_prefix(TRAPS)?;
+    let close = rest.find("] ")?;
+    let (comm, pid) = comm_pid(&rest[..=close])?;
+    let what = &rest[close + 2..];
+    let signal = match what {
+        w if w.starts_with("trap invalid opcode") => "SIGILL",
+        w if w.starts_with("trap divide error") => "SIGFPE",
+        w if ["segment not present", "stack segment", "alignment check"]
+            .iter()
+            .any(|t| w.contains(t)) =>
+        {
+            "SIGBUS"
+        }
+        _ => "SIGSEGV",
+    };
+    Some((comm, pid, signal))
+}
+
+fn comm_pid(s: &str) -> Option<(&str, &str)> {
+    let (comm, pid) = s.strip_suffix(']')?.rsplit_once('[')?;
+    let numeric = !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit());
+    (numeric && !comm.is_empty()).then_some((comm, pid))
+}
+
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
+fn boot_end_finding(span: &BootSpan, verdict: BootEndVerdict) -> Finding {
+    let reason = span.end.next_reset_reason.as_deref();
+    let decoded = reason.map(decode_reset_reason);
+    let title = match decoded {
+        Some((label, ResetKind::PowerCut)) => format!("Power lost: {label}"),
+        _ if span.end.ended_suspended() => "Ended while suspended".to_string(),
+        _ => "Ended without shutdown".to_string(),
+    };
+    let evidence = match reason {
+        Some(r) => format!("Next boot's reset reason: {r}. Last entry: {}", span.last_line),
+        None => format!("Last entry: {}", span.last_line),
+    };
+    let mut f = Finding::new(
+        FindingKind::BootWithoutShutdown,
+        span.last_us,
+        span.last_index,
+        &span.id,
+        title,
+        evidence,
+    )
+    .with("boot_started_us", span.first_us.to_string())
+    .with("certainty", verdict.key());
+    if let Some((label, _)) = decoded {
+        f = f.with("reset_reason", label);
+    }
+    if span.end.ended_suspended() {
+        f = f.with("suspended", "true");
+    }
+    f
 }
 
 fn oom_victim(message: &str) -> (Option<String>, Option<String>) {
@@ -679,8 +1135,8 @@ fn oom_victim(message: &str) -> (Option<String>, Option<String>) {
         let pid = rest.split("pid=").nth(1).map(digits);
         return (pid.filter(|p| !p.is_empty()), comm.filter(|c| !c.is_empty()));
     }
-    if let Some(at) = message.find(OOM_KILL) {
-        let rest = message[at..].split("process ").nth(1).unwrap_or_default();
+    if let Some(at) = message.find("Killed process ") {
+        let rest = &message[at + "Killed process ".len()..];
         let pid = digits(rest);
         let comm = rest
             .split_once('(')
@@ -756,8 +1212,33 @@ mod tests {
         )
     }
 
+    fn kernel_at(t_s: u64, boot: &str, priority: &str, message: &str) -> Entry {
+        let mut e = kernel(t_s, boot, message);
+        e.fields.insert("PRIORITY".into(), priority.into());
+        e
+    }
+
+    const PID1: &[(&str, &str)] = &[("_PID", "1"), ("_UID", "0"), ("_COMM", "systemd")];
+
+    /// An entry as PID 1 writes it, with the fields journald sets.
+    fn manager(t_s: u64, boot: &str, fields: &[(&str, &str)]) -> Entry {
+        let mut e = ev(t_s, boot, fields);
+        for (k, v) in PID1 {
+            e.fields.insert(k.to_string(), v.to_string());
+        }
+        e
+    }
+
+    fn boot_start(t_s: u64, boot: &str) -> Entry {
+        kernel(
+            t_s,
+            boot,
+            "Linux version 6.12.0 (builder@example) (gcc 14.2.0) #1 SMP PREEMPT_DYNAMIC",
+        )
+    }
+
     fn restart(t_s: u64, unit: &str) -> Entry {
-        ev(
+        manager(
             t_s,
             BOOT_A,
             &[
@@ -772,8 +1253,52 @@ mod tests {
         ev(
             t_s,
             boot,
-            &[("MESSAGE_ID", ids::SHUTDOWN), ("MESSAGE", "System is powering down.")],
+            &[
+                ("MESSAGE_ID", ids::SHUTDOWN),
+                ("MESSAGE", "System is powering down."),
+                ("_COMM", "systemd-logind"),
+                ("_UID", "0"),
+                ("_PID", "812"),
+            ],
         )
+    }
+
+    fn multi_user_stopped(t_s: u64, boot: &str) -> Entry {
+        manager(
+            t_s,
+            boot,
+            &[
+                ("MESSAGE_ID", ids::UNIT_STOPPED),
+                ("UNIT", "multi-user.target"),
+                ("MESSAGE", "Stopped target multi-user.target - Multi-User System."),
+            ],
+        )
+    }
+
+    fn journal_stopped(t_s: u64, boot: &str) -> Entry {
+        ev(
+            t_s,
+            boot,
+            &[
+                ("MESSAGE_ID", ids::JOURNAL_STOPPED),
+                ("MESSAGE", "Journal stopped"),
+                ("_COMM", "systemd-journal"),
+                ("_UID", "0"),
+                ("_TRANSPORT", "driver"),
+            ],
+        )
+    }
+
+    fn sleep(t_s: u64, boot: &str, id: &str) -> Entry {
+        ev(
+            t_s,
+            boot,
+            &[("MESSAGE_ID", id), ("_COMM", "systemd-sleep"), ("_UID", "0")],
+        )
+    }
+
+    fn abrupt(f: &[Finding]) -> Vec<&Finding> {
+        of(f, FindingKind::BootWithoutShutdown)
     }
 
     fn noise(t_s: u64, boot: &str) -> Entry {
@@ -827,9 +1352,28 @@ mod tests {
     fn a_kernel_oom_kill_and_the_units_report_of_it_are_one_finding_naming_the_victim() {
         let f = run(
             &[
-                kernel(100, BOOT_A, "oom-kill:constraints=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task_memcg=/user.slice,task=firefox,pid=777,uid=1000"),
-                kernel(100, BOOT_A, "Out of memory: Killed process 777 (firefox) total-vm:9000kB, anon-rss:8000kB"),
-                ev(101, BOOT_A, &[("MESSAGE_ID", ids::UNIT_OOM), ("UNIT", "app.service"), ("MESSAGE", "app.service: A process of this unit has been killed by the OOM killer.")]),
+                kernel(
+                    100,
+                    BOOT_A,
+                    "oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task_memcg=/user.slice,task=firefox,pid=777,uid=1000",
+                ),
+                kernel(
+                    100,
+                    BOOT_A,
+                    "Out of memory: Killed process 777 (firefox) total-vm:9000kB, anon-rss:8000kB",
+                ),
+                manager(
+                    101,
+                    BOOT_A,
+                    &[
+                        ("MESSAGE_ID", ids::UNIT_OOM),
+                        ("UNIT", "app.service"),
+                        (
+                            "MESSAGE",
+                            "app.service: A process of this unit has been killed by the OOM killer.",
+                        ),
+                    ],
+                ),
             ],
             Some(BOOT_A),
         );
@@ -882,7 +1426,7 @@ mod tests {
     #[test]
     fn a_unit_failing_repeatedly_in_one_boot_is_one_finding_with_the_latest_result() {
         let fail = |t, result| {
-            ev(
+            manager(
                 t,
                 BOOT_A,
                 &[
@@ -937,37 +1481,202 @@ mod tests {
     }
 
     #[test]
-    fn a_boot_with_no_shutdown_entry_ended_abruptly_at_its_last_entry() {
-        let es = [noise(10, BOOT_A), noise(20, BOOT_A), noise(5000, BOOT_B)];
+    fn a_power_cut_boot_with_no_shutdown_is_an_unconfirmed_abrupt_end_at_its_last_entry() {
+        let es = [
+            boot_start(1, BOOT_A),
+            noise(10, BOOT_A),
+            noise(20, BOOT_A),
+            boot_start(5000, BOOT_B),
+        ];
         let f = run(&es, Some(BOOT_B));
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].kind, FindingKind::BootWithoutShutdown);
         assert_eq!(f[0].severity, Severity::High);
         assert_eq!((f[0].first_us, f[0].last_us), (20 * S, 20 * S));
         assert_eq!(f[0].boot_id, BOOT_A);
-        assert_eq!(f[0].entries, [1]);
+        assert_eq!(f[0].entries, [2]);
         assert_eq!(f[0].evidence, "Last entry: unknown: Started something.");
+        assert_eq!(f[0].title, "Ended without shutdown", "nothing proves the power went");
+        assert_eq!(f[0].data["certainty"], "unconfirmed");
+        assert_eq!(f[0].data["boot_started_us"], (S).to_string());
     }
 
     #[test]
     fn a_clean_reboot_is_not_flagged_as_power_loss() {
-        let es = [noise(10, BOOT_A), shutdown(20, BOOT_A), noise(5000, BOOT_B)];
+        let es = [
+            boot_start(1, BOOT_A),
+            noise(10, BOOT_A),
+            shutdown(20, BOOT_A),
+            noise(30, BOOT_A),
+            boot_start(5000, BOOT_B),
+        ];
         assert!(run(&es, Some(BOOT_B)).is_empty());
     }
 
     #[test]
-    fn the_journal_stopping_also_counts_as_an_orderly_end() {
-        let stopped = ev(
-            20,
-            BOOT_A,
-            &[("MESSAGE_ID", ids::JOURNAL_STOPPED), ("MESSAGE", "Journal stopped")],
+    fn ctrl_alt_del_shutdown_is_clean_via_multi_user_target_stopped() {
+        // PID 1 starts ctrl-alt-del.target itself, so logind logs no shutdown.
+        let es = [
+            boot_start(1, BOOT_A),
+            noise(10, BOOT_A),
+            multi_user_stopped(20, BOOT_A),
+            noise(25, BOOT_A),
+            boot_start(5000, BOOT_B),
+        ];
+        assert!(run(&es, Some(BOOT_B)).is_empty());
+    }
+
+    #[test]
+    fn a_forged_shutdown_marker_does_not_hide_a_power_cut() {
+        let mut fake_stop = multi_user_stopped(20, BOOT_A);
+        fake_stop.fields.insert("_PID".into(), "4242".into());
+        fake_stop.fields.insert("_UID".into(), "1000".into());
+        let mut fake_logind = shutdown(21, BOOT_A);
+        fake_logind.fields.insert("_UID".into(), "1000".into());
+        let es = [boot_start(1, BOOT_A), fake_stop, fake_logind, boot_start(5000, BOOT_B)];
+        assert_eq!(abrupt(&run(&es, Some(BOOT_B))).len(), 1);
+    }
+
+    #[test]
+    fn a_journald_restart_mid_boot_doesnt_make_a_power_cut_boot_clean() {
+        let es = [
+            boot_start(1, BOOT_A),
+            journal_stopped(100, BOOT_A),
+            noise(100 + 3600, BOOT_A),
+            boot_start(9000, BOOT_B),
+        ];
+        assert_eq!(
+            abrupt(&run(&es, Some(BOOT_B))).len(),
+            1,
+            "journald stopped an hour before the end"
         );
-        assert!(run(&[noise(10, BOOT_A), stopped, noise(5000, BOOT_B)], Some(BOOT_B)).is_empty());
+    }
+
+    #[test]
+    fn the_journal_stopping_in_the_last_minute_counts_as_an_orderly_end() {
+        let es = [
+            boot_start(1, BOOT_A),
+            noise(10, BOOT_A),
+            journal_stopped(20, BOOT_A),
+            noise(50, BOOT_A),
+            boot_start(5000, BOOT_B),
+        ];
+        assert!(run(&es, Some(BOOT_B)).is_empty());
+    }
+
+    #[test]
+    fn a_shutdown_marker_followed_by_a_resume_or_long_activity_is_not_the_end() {
+        // soft-reboot logs a shutdown but keeps the boot id; the boot went on and was later cut
+        let resumed = [
+            boot_start(1, BOOT_A),
+            shutdown(10, BOOT_A),
+            sleep(20, BOOT_A, ids::SLEEP_START),
+            sleep(30, BOOT_A, ids::SLEEP_STOP),
+            noise(40, BOOT_A),
+            boot_start(5000, BOOT_B),
+        ];
+        assert_eq!(abrupt(&run(&resumed, Some(BOOT_B))).len(), 1);
+        let long = [
+            boot_start(1, BOOT_A),
+            shutdown(10, BOOT_A),
+            noise(10 + 31 * 60, BOOT_A),
+            boot_start(9000, BOOT_B),
+        ];
+        assert_eq!(abrupt(&run(&long, Some(BOOT_B))).len(), 1);
+    }
+
+    #[test]
+    fn a_boot_whose_start_was_vacuumed_away_is_not_judged() {
+        let es = [noise(10, BOOT_A), noise(20, BOOT_A), boot_start(5000, BOOT_B)];
+        assert!(
+            run(&es, Some(BOOT_B)).is_empty(),
+            "its shutdown may have gone with its start"
+        );
+        let mut facts = BootEndFacts::default();
+        facts.note(&noise(10, BOOT_A));
+        assert_eq!(boot_end_verdict(&facts), BootEndVerdict::Unknown);
+    }
+
+    #[test]
+    fn the_next_boots_unclean_journal_line_confirms_the_abrupt_end() {
+        let unclean = kernel_at(
+            5001,
+            BOOT_B,
+            "4",
+            "File /var/log/journal/0123/system.journal corrupted or uncleanly shut down, renaming and replacing.",
+        );
+        let mut unclean = unclean;
+        unclean
+            .fields
+            .insert("SYSLOG_IDENTIFIER".into(), "systemd-journald".into());
+        let es = [
+            boot_start(1, BOOT_A),
+            noise(20, BOOT_A),
+            boot_start(5000, BOOT_B),
+            unclean,
+        ];
+        let f = run(&es, Some(BOOT_B));
+        assert_eq!(f[0].data["certainty"], "confirmed");
+        assert_eq!(f[0].title, "Ended without shutdown");
+    }
+
+    #[test]
+    fn an_amd_thermal_trip_reset_reason_is_named_and_is_the_only_power_lost_title() {
+        // arch/x86/kernel/cpu/amd.c: "x86/amd: Previous system reset reason [0x%08x]: %s\n"
+        let reason = |text: &str| {
+            kernel(
+                5001,
+                BOOT_B,
+                &format!("x86/amd: Previous system reset reason [0x00000001]: {text}"),
+            )
+        };
+        let run_with = |r| {
+            run(
+                &[boot_start(1, BOOT_A), noise(20, BOOT_A), boot_start(5000, BOOT_B), r],
+                Some(BOOT_B),
+            )
+        };
+
+        let f = run_with(reason("thermal pin BP_THERMTRIP_L was tripped"));
+        assert_eq!(f[0].title, "Power lost: thermal trip");
+        assert_eq!(f[0].data["certainty"], "confirmed");
+        assert_eq!(f[0].data["reset_reason"], "thermal trip");
+        assert!(f[0].evidence.contains("BP_THERMTRIP_L"), "{}", f[0].evidence);
+
+        let f = run_with(reason("system reset pin BP_SYS_RST_L was tripped"));
+        assert_eq!(
+            (f[0].title.as_str(), f[0].data["certainty"].as_str()),
+            ("Ended without shutdown", "confirmed")
+        );
+        assert_eq!(f[0].data["reset_reason"], "reset pin");
+
+        let f = run_with(reason("software wrote 0x6 to reset control register 0xCF9"));
+        assert_eq!(
+            f[0].data["certainty"], "unconfirmed",
+            "a software reboot leaves the same reason as a normal one"
+        );
+        assert_eq!(f[0].data["reset_reason"], "software reset");
+        assert!(f[0].evidence.starts_with("Next boot's reset reason: software wrote"));
+    }
+
+    #[test]
+    fn a_boot_that_ended_suspended_says_so() {
+        let es = [
+            boot_start(1, BOOT_A),
+            sleep(10, BOOT_A, ids::SLEEP_START),
+            sleep(20, BOOT_A, ids::SLEEP_STOP),
+            sleep(30, BOOT_A, ids::SLEEP_START),
+            boot_start(90000, BOOT_B),
+        ];
+        let f = run(&es, Some(BOOT_B));
+        assert_eq!(f[0].title, "Ended while suspended");
+        assert_eq!(f[0].data["certainty"], "ended_while_suspended");
+        assert_eq!(f[0].data["suspended"], "true");
     }
 
     #[test]
     fn the_current_boot_is_never_ended_without_shutdown() {
-        let es = [noise(10, BOOT_A), noise(20, BOOT_A)];
+        let es = [boot_start(1, BOOT_A), noise(10, BOOT_A), noise(20, BOOT_A)];
         assert!(run(&es, Some(BOOT_A)).is_empty(), "it has not ended yet");
         assert_eq!(
             run(&es, None).len(),
@@ -977,62 +1686,273 @@ mod tests {
     }
 
     #[test]
-    fn throttle_lines_are_counted_per_boot_at_low_severity() {
-        let line = "CPU0: Core temperature above threshold, cpu clock throttled (total events = 1)";
+    fn an_intel_throttle_line_from_a_current_kernel_is_found_per_boot_at_low_severity() {
+        // drivers/thermal/intel/therm_throt.c
+        let line = "CPU0: Core temperature is above threshold, cpu clock is throttled (total events = 1)";
+        let old = "CPU0: Package temperature above threshold, cpu clock throttled (total events = 9)";
         let f = run(
             &[
                 kernel(1, BOOT_A, line),
-                kernel(2, BOOT_A, line),
+                kernel(2, BOOT_A, old),
                 kernel(3, BOOT_B, line),
-                kernel(4, BOOT_B, "CPU0: Core temperature/speed normal"),
+                kernel(4, BOOT_B, "CPU0: Core temperature/speed normal (total events = 1)"),
             ],
             Some(BOOT_B),
         );
         let t = of(&f, FindingKind::ThermalThrottle);
         assert_eq!(t.len(), 2);
-        assert_eq!(t[0].count, 2);
+        assert_eq!(t[0].count, 2, "the pre-5.x text still counts");
         assert_eq!(t[1].count, 1, "the 'normal' line is not a throttle");
         assert_eq!(t[0].severity, Severity::Low);
         assert_eq!(t[0].title, "Thermal throttling (2 events)");
     }
 
     #[test]
-    fn hardware_error_lines_are_high_severity_and_grouped_by_kind() {
+    fn a_thermal_zone_reaching_its_critical_temperature_is_found_on_any_vendor() {
+        // drivers/thermal/thermal_core.c: "%s: critical temperature reached, shutting down"
+        let f = run(
+            &[kernel_at(
+                1,
+                BOOT_A,
+                "0",
+                "thermal thermal_zone0: acpitz: critical temperature reached, shutting down",
+            )],
+            Some(BOOT_A),
+        );
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            (f[0].kind, f[0].severity),
+            (FindingKind::ThermalThrottle, Severity::Low)
+        );
+        assert_eq!(f[0].title, "Critical temperature reached (1)");
+    }
+
+    #[test]
+    fn hardware_error_lines_are_grouped_by_kind_and_corrected_ones_are_medium() {
         let f = run(
             &[
-                kernel(1, BOOT_A, "mce: [Hardware Error]: Machine check events logged"),
-                kernel(
+                kernel_at(
+                    1,
+                    BOOT_A,
+                    "0",
+                    "mce: [Hardware Error]: CPU 2: Machine Check: 0 Bank 5: be00000000800400",
+                ),
+                kernel_at(
                     2,
                     BOOT_A,
-                    "pcieport 0000:00:1c.0: AER: Corrected error message received from 0000:00:1c.0",
+                    "4",
+                    "pcieport 0000:00:1c.0: AER: PCIe Bus Error: severity=Correctable, type=Physical Layer, (Receiver ID)",
                 ),
-                kernel(
+                kernel_at(
                     3,
                     BOOT_A,
-                    "pcieport 0000:00:1c.0: AER: Multiple Corrected error received",
+                    "4",
+                    "pcieport 0000:00:1c.0: AER:   device [8086:a33c] error status/mask=00000001/00002000",
                 ),
-                kernel(4, BOOT_A, "EDAC MC0: 1 CE memory read error on DIMM0"),
-                kernel(
+                kernel_at(
+                    4,
+                    BOOT_A,
+                    "4",
+                    "EDAC MC0: 1 CE memory read error on DIMM0 (channel:0 slot:0 page:0x0)",
+                ),
+                kernel_at(
                     5,
                     BOOT_A,
-                    "blk_update_request: I/O error, dev sda, sector 123 op 0x0:(READ)",
+                    "3",
+                    "I/O error, dev sda, sector 123 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 2",
                 ),
             ],
             Some(BOOT_A),
         );
-        let titles: Vec<_> = f.iter().map(|f| f.title.as_str()).collect();
+        let got: Vec<_> = f.iter().map(|f| (f.title.as_str(), f.severity)).collect();
         assert_eq!(
-            titles,
+            got,
             [
-                "Machine check events (1)",
-                "PCIe AER errors (2)",
-                "Memory (EDAC) errors (1)",
-                "Disk I/O errors (1)"
-            ]
+                ("Machine check events (1)", Severity::High),
+                ("PCIe AER errors, corrected (1)", Severity::Medium),
+                ("Memory (EDAC) errors, corrected (1)", Severity::Medium),
+                ("Disk I/O errors (1)", Severity::High),
+            ],
+            "the AER detail line is not a second error"
         );
-        assert!(f
-            .iter()
-            .all(|f| f.severity == Severity::High && f.kind == FindingKind::HardwareError));
+        assert!(f.iter().all(|f| f.kind == FindingKind::HardwareError));
+    }
+
+    #[test]
+    fn aer_enabled_with_irq_at_boot_is_not_a_hardware_error() {
+        // drivers/pci/pcie/aer.c: pci_info(port, "enabled with IRQ %d\n") under pr_fmt "AER: "
+        for priority in ["6", "4"] {
+            let line = kernel_at(1, BOOT_A, priority, "pcieport 0000:00:01.1: AER: enabled with IRQ 28");
+            assert!(run(&[line], Some(BOOT_A)).is_empty(), "priority {priority}");
+        }
+    }
+
+    #[test]
+    fn informational_hardware_lines_are_not_errors() {
+        let f = run(
+            &[
+                kernel_at(1, BOOT_A, "6", "mce: [Hardware Error]: Machine check events logged"),
+                kernel_at(
+                    2,
+                    BOOT_A,
+                    "6",
+                    "EDAC MC0: Giving out device to module amd64_edac controller F19h: DEV 0000:00:18.3 (INTERRUPT)",
+                ),
+            ],
+            Some(BOOT_A),
+        );
+        assert!(f.is_empty(), "{f:#?}");
+    }
+
+    #[test]
+    fn corrected_and_uncorrected_errors_take_their_own_severity() {
+        // drivers/edac/mce_amd.c prints every line with pr_emerg; drivers/pci/pcie/aer.c logs uncorrected at KERN_ERR
+        let amd_ce = run(
+            &[
+                kernel_at(
+                    1,
+                    BOOT_A,
+                    "0",
+                    "mce: [Hardware Error]: Corrected error, no action required.",
+                ),
+                kernel_at(
+                    1,
+                    BOOT_A,
+                    "0",
+                    "mce: [Hardware Error]: CPU:0 (19:21:0) MC9_STATUS[-|CE|MiscV|AddrV|-|-|-|-|CECC|-|-|-]: 0x9c2040000000011b",
+                ),
+                kernel_at(1, BOOT_A, "0", "mce: [Hardware Error]: Error Addr: 0x00000004a3b2c1c0"),
+            ],
+            Some(BOOT_A),
+        );
+        assert_eq!(amd_ce.len(), 1);
+        assert_eq!(
+            amd_ce[0].severity,
+            Severity::Medium,
+            "detail lines do not make a corrected error worse"
+        );
+        assert_eq!(amd_ce[0].count, 3);
+
+        let fatal = run(
+            &[
+                kernel_at(
+                    1,
+                    BOOT_A,
+                    "4",
+                    "pcieport 0000:00:1c.0: AER: PCIe Bus Error: severity=Correctable, type=Physical Layer, (Receiver ID)",
+                ),
+                kernel_at(
+                    2,
+                    BOOT_A,
+                    "3",
+                    "pcieport 0000:00:1c.0: AER: PCIe Bus Error: severity=Uncorrectable (Fatal), type=Transaction Layer, (Requester ID)",
+                ),
+            ],
+            Some(BOOT_A),
+        );
+        assert_eq!((fatal.len(), fatal[0].severity), (1, Severity::High));
+        assert_eq!(fatal[0].title, "PCIe AER errors (2)");
+
+        let ue = run(
+            &[kernel_at(1, BOOT_A, "0", "EDAC MC0: 1 UE memory read error on DIMM0")],
+            Some(BOOT_A),
+        );
+        assert_eq!(ue[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn gpu_faults_from_every_vendor_are_hardware_errors() {
+        let cases = [
+            // NVIDIA open-gpu-kernel-modules: "NVRM: Xid (PCI:%04x:%02x:%02x): %d, %s"
+            (
+                "3",
+                "NVRM: Xid (PCI:0000:01:00): 79, pid=1234, name=Xorg, GPU has fallen off the bus.",
+                "NVIDIA GPU errors (Xid)",
+            ),
+            // drivers/gpu/drm/amd/amdgpu/amdgpu_job.c: "ring %s timeout, signaled seq=%u, emitted seq=%u"
+            (
+                "3",
+                "amdgpu 0000:03:00.0: [drm] *ERROR* ring gfx_0.0.0 timeout, signaled seq=1234, emitted seq=1236",
+                "AMD GPU hangs",
+            ),
+            // drivers/gpu/drm/amd/amdgpu/amdgpu_device.c: dev_info "GPU reset begin!"
+            ("6", "amdgpu 0000:03:00.0: amdgpu: GPU reset begin!", "AMD GPU hangs"),
+            // drivers/gpu/drm/i915/i915_gpu_error.c: "GPU HANG: ecode %d:%x:%08x"
+            (
+                "6",
+                "i915 0000:00:02.0: [drm] GPU HANG: ecode 12:1:85dffffb, in Xorg [1234]",
+                "Intel GPU hangs",
+            ),
+            // drivers/gpu/drm/xe/xe_guc_submit.c: xe_gt_notice "Timedout job: seqno=%u, lrc_seqno=%u, guc_id=%d, flags=0x%lx"
+            (
+                "5",
+                "xe 0000:00:02.0: [drm] GT0: Timedout job: seqno=4294967169, lrc_seqno=4294967169, guc_id=2, flags=0x0 in gnome-shell [2034]",
+                "Intel GPU hangs",
+            ),
+        ];
+        for (priority, line, what) in cases {
+            let f = run(&[kernel_at(1, BOOT_A, priority, line)], Some(BOOT_A));
+            assert_eq!(f.len(), 1, "{line}");
+            assert_eq!((f[0].kind, f[0].severity), (FindingKind::HardwareError, Severity::High));
+            assert_eq!(f[0].data["error"], what);
+        }
+    }
+
+    #[test]
+    fn storage_timeouts_and_errors_are_found_but_empty_drives_and_loop_files_are_not() {
+        let cases = [
+            // drivers/nvme/host/pci.c
+            (
+                "4",
+                "nvme nvme0: I/O tag 12 (100c) QID 3 timeout, aborting req_op:READ(0) size:4096",
+                "NVMe timeouts",
+            ),
+            (
+                "4",
+                "nvme nvme0: controller is down; will reset: CSTS=0xffffffff, PCI_STATUS=0xffff",
+                "NVMe timeouts",
+            ),
+            // drivers/ata/libata-eh.c
+            (
+                "3",
+                "ata1.00: exception Emask 0x0 SAct 0x10 SErr 0x0 action 0x0",
+                "SATA errors",
+            ),
+            ("3", "ata1.00: failed command: READ FPDMA QUEUED", "SATA errors"),
+            // block/blk-core.c blk_print_req_error, with a blk_errors[] name other than "I/O"
+            (
+                "3",
+                "critical medium error, dev sdb, sector 2048 op 0x0:(READ) flags 0x80700 phys_seg 1 prio class 2",
+                "Disk I/O errors",
+            ),
+            (
+                "3",
+                "timeout error, dev nvme0n1, sector 4096 op 0x1:(WRITE) flags 0x0 phys_seg 1 prio class 2",
+                "Disk I/O errors",
+            ),
+            // fs/buffer.c
+            (
+                "3",
+                "Buffer I/O error on dev sda1, logical block 0, async page read",
+                "Disk I/O errors",
+            ),
+        ];
+        for (priority, line, what) in cases {
+            let f = run(&[kernel_at(1, BOOT_A, priority, line)], Some(BOOT_A));
+            assert_eq!(f.len(), 1, "{line}");
+            assert_eq!(f[0].data["error"], what, "{line}");
+        }
+        for line in [
+            "I/O error, dev fd0, sector 0 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 2",
+            "I/O error, dev sr0, sector 0 op 0x0:(READ) flags 0x80700 phys_seg 1 prio class 2",
+            "I/O error, dev loop3, sector 0 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 2",
+            "Buffer I/O error on dev sr0, logical block 0, async page read",
+        ] {
+            assert!(
+                run(&[kernel_at(1, BOOT_A, "3", line)], Some(BOOT_A)).is_empty(),
+                "{line}"
+            );
+        }
     }
 
     #[test]
@@ -1067,7 +1987,10 @@ mod tests {
             &[
                 ("SYSLOG_FACILITY", "10"),
                 ("SYSLOG_IDENTIFIER", "sudo"),
-                ("MESSAGE", "pam_unix(sudo:auth): authentication failure; logname=alice uid=1000 euid=0 tty=/dev/pts/1 ruser=alice rhost=  user=alice"),
+                (
+                    "MESSAGE",
+                    "pam_unix(sudo:auth): authentication failure; logname=alice uid=1000 euid=0 tty=/dev/pts/1 ruser=alice rhost=  user=alice",
+                ),
             ],
         )
     }
@@ -1135,6 +2058,7 @@ mod tests {
     #[test]
     fn findings_come_back_in_time_order_with_abrupt_ends_placed_by_their_last_entry() {
         let es = [
+            boot_start(1, BOOT_A),
             noise(10, BOOT_A),
             noise(20, BOOT_A),
             coredump(500, BOOT_B, "x"),
@@ -1165,7 +2089,7 @@ mod tests {
     }
 
     fn unit_failed(t_s: u64, boot: &str) -> Entry {
-        ev(
+        manager(
             t_s,
             boot,
             &[
@@ -1296,6 +2220,215 @@ mod tests {
         assert_eq!(d.open_since(), Some(100 * S), "the unit's report may still follow");
         assert!(d.drain(110 * S).is_empty());
         assert_eq!(d.open_since(), None);
+    }
+
+    // arch/x86/mm/fault.c show_signal_msg: "%s%s[%d]: segfault at %lx ip %px sp %px error %lx"
+    const SEGFAULT_LINE: &str = "Hyprland[4242]: segfault at 0 ip 00007fef17a2d5e1 sp 00007fffd7cfb4e0 error 4 in libfoo.so.0[bc5e1,7fef1799c000+e3000] likely on CPU 3 (core 3, socket 0)";
+
+    #[test]
+    fn a_kernel_segfault_with_no_core_dump_is_a_crash_so_systems_without_systemd_coredump_still_show_it() {
+        let f = run(
+            &[kernel_at(10, BOOT_A, "6", SEGFAULT_LINE), noise(100, BOOT_A)],
+            Some(BOOT_A),
+        );
+        assert_eq!(f.len(), 1);
+        assert_eq!((f[0].kind, f[0].severity), (FindingKind::Crash, Severity::High));
+        assert_eq!(f[0].title, "Hyprland crashed (SIGSEGV)");
+        assert_eq!(
+            (f[0].data["pid"].as_str(), f[0].data["source"].as_str()),
+            ("4242", "kernel")
+        );
+        assert_eq!((f[0].first_us, f[0].entries.clone()), (10 * S, vec![0]));
+    }
+
+    #[test]
+    fn a_traps_line_names_its_signal() {
+        // arch/x86/kernel/traps.c do_trap: pr_info("%s[%d] trap %s ip:%lx sp:%lx error:%lx") under pr_fmt "traps: "
+        let ill =
+            "traps: game[777] trap invalid opcode ip:55d0c1e0a1b2 sp:7ffd1e8b8c70 error:0 in game[55d0c1e00000+20000]";
+        let gp = "traps: tool[778] general protection fault ip:7f00 sp:7ffd error:0 in libc.so.6[7f00+1000]";
+        let f = run(&[kernel(10, BOOT_A, ill), kernel(11, BOOT_A, gp)], None);
+        let got: Vec<_> = f.iter().map(|f| f.title.as_str()).collect();
+        assert_eq!(got, ["game crashed (SIGILL)", "tool crashed (SIGSEGV)"]);
+        assert!(
+            run(
+                &[kernel(1, BOOT_A, "traps: PANIC: double fault, error_code: 0x0")],
+                None
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_segfault_and_its_core_dump_are_one_crash_in_either_order() {
+        let dump = coredump(12, BOOT_A, "Hyprland");
+        let f = run(&[kernel(10, BOOT_A, SEGFAULT_LINE), dump.clone()], Some(BOOT_A));
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert_eq!(
+            f[0].evidence, "Process 4242 (Hyprland) of user 1000 dumped core.",
+            "the richer report wins"
+        );
+        let f = run(&[dump, kernel(13, BOOT_A, SEGFAULT_LINE)], Some(BOOT_A));
+        assert_eq!(f.len(), 1);
+        let other_pid = SEGFAULT_LINE.replace("4242", "5151");
+        let f = run(
+            &[kernel(10, BOOT_A, &other_pid), coredump(12, BOOT_A, "Hyprland")],
+            Some(BOOT_A),
+        );
+        assert_eq!(f.len(), 2, "another process's crash is not deduplicated");
+    }
+
+    #[test]
+    fn a_followed_kernel_crash_waits_for_its_core_dump_then_comes_out_once() {
+        let mut d = Detector::new();
+        d.push(0, &cursored(kernel(10, BOOT_A, SEGFAULT_LINE), 0));
+        assert!(d.drain(15 * S).is_empty(), "a core dump may still follow");
+        assert_eq!(d.open_since(), Some(10 * S), "a resumed reader must see the line again");
+        let f = d.drain(10 * S + CRASH_DEDUP_US + 1);
+        assert_eq!((f.len(), f[0].cursor.as_deref()), (1, Some("c0")));
+        assert!(d.drain(100 * S).is_empty());
+        assert_eq!(d.open_since(), None);
+    }
+
+    #[test]
+    fn crash_ordinals_read_correctly_past_twenty() {
+        let es: Vec<_> = (0..111).map(|i| coredump(i, BOOT_A, "x")).collect();
+        let f = run(&es, Some(BOOT_A));
+        for (n, want) in [
+            (21, "21st"),
+            (22, "22nd"),
+            (23, "23rd"),
+            (11, "11th"),
+            (12, "12th"),
+            (13, "13th"),
+            (111, "111th"),
+        ] {
+            assert_eq!(f[n - 1].title, format!("{want} x crash this boot (SIGSEGV)"));
+        }
+    }
+
+    #[test]
+    fn the_kernel_kill_of_oom_kill_allocating_task_and_its_summary_are_found() {
+        // mm/oom_kill.c: "%s: Killed process %d (%s)" with "Out of memory (oom_kill_allocating_task)"
+        let f = run(
+            &[
+                kernel(
+                    100,
+                    BOOT_A,
+                    "oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task_memcg=/user.slice,task=big,pid=88,uid=1000",
+                ),
+                kernel(
+                    100,
+                    BOOT_A,
+                    "Out of memory (oom_kill_allocating_task): Killed process 88 (big) total-vm:9000kB, anon-rss:8000kB",
+                ),
+            ],
+            Some(BOOT_A),
+        );
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            (f[0].count, f[0].data["pid"].as_str(), f[0].title.as_str()),
+            (2, "88", "big was killed by the OOM killer")
+        );
+    }
+
+    fn forged(mut e: Entry, pid: &str, uid: &str, comm: &str) -> Entry {
+        for (k, v) in [("_PID", pid), ("_UID", uid), ("_COMM", comm)] {
+            e.fields.insert(k.into(), v.into());
+        }
+        e
+    }
+
+    #[test]
+    fn a_forged_unit_failure_or_restart_loop_from_another_uid_is_ignored() {
+        let failure = unit_failed(10, BOOT_A);
+        let mut d = Detector::for_owner(1000);
+        d.push(0, &forged(failure.clone(), "4242", "1001", "systemd"));
+        d.push(1, &forged(failure.clone(), "4243", "1000", "python3"));
+        for (i, t) in [20, 30, 40].into_iter().enumerate() {
+            d.push(2 + i, &forged(restart(t, "x.service"), "4242", "1001", "systemd"));
+        }
+        assert!(
+            d.finish(Some(BOOT_A)).is_empty(),
+            "another user, or a process merely claiming the unit"
+        );
+
+        let mut d = Detector::for_owner(1000);
+        d.push(0, &failure);
+        d.push(1, &forged(unit_failed(20, BOOT_A), "2011", "1000", "systemd"));
+        let f = d.finish(Some(BOOT_A));
+        assert_eq!(
+            (f.len(), f[0].count),
+            (1, 2),
+            "PID 1 and the owner's user manager are believed"
+        );
+    }
+
+    #[test]
+    fn only_pid_1_as_root_or_the_owners_user_manager_is_trusted() {
+        let e = |fields: &[(&str, &str)]| ev(1, BOOT_A, fields);
+        assert!(trusted_manager_entry(&e(PID1), 1000));
+        assert!(
+            !trusted_manager_entry(&e(&[("_PID", "1"), ("_UID", "1000"), ("_COMM", "systemd")]), 1000),
+            "PID 1 of a user namespace"
+        );
+        assert!(trusted_manager_entry(
+            &e(&[("_PID", "900"), ("_UID", "1000"), ("_COMM", "systemd")]),
+            1000
+        ));
+        assert!(!trusted_manager_entry(
+            &e(&[("_PID", "900"), ("_UID", "1001"), ("_COMM", "systemd")]),
+            1000
+        ));
+        assert!(!trusted_manager_entry(
+            &e(&[("_PID", "900"), ("_UID", "1000"), ("_COMM", "bash")]),
+            1000
+        ));
+        assert!(
+            !trusted_manager_entry(&e(&[("UNIT", "x.service")]), 1000),
+            "no trusted fields at all"
+        );
+    }
+
+    #[test]
+    fn only_ordinary_services_sockets_and_mounts_are_restartable() {
+        for ok in [
+            "sshd.service",
+            "cups.socket",
+            "home.mount",
+            "getty@tty1.service",
+            "foo\\x2dbar.service",
+            "a:b_c.service",
+        ] {
+            assert!(restartable_unit(ok), "{ok}");
+        }
+        for bad in [
+            "--host=attacker",
+            "-x.service",
+            "--host=a.service",
+            "user@1000.service",
+            "user-runtime-dir@1000.service",
+            "session-3.scope",
+            "user.slice",
+            "multi-user.target",
+            "backup.timer",
+            "gdm.service",
+            "gdm3.service",
+            "sddm.service",
+            "lightdm.service",
+            "greetd.service",
+            "ly.service",
+            "display-manager.service",
+            "getty@.service",
+            "@x.service",
+            ".service",
+            "a b.service",
+            "x.service; rm",
+            "",
+        ] {
+            assert!(!restartable_unit(bad), "{bad}");
+        }
+        assert!(!restartable_unit(&format!("{}.service", "a".repeat(250))));
     }
 
     #[test]
