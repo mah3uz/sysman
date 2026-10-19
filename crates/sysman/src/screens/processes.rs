@@ -59,6 +59,8 @@ const INSPECTOR_KEY: &str = "processes.inspector";
 /// Room the table leaves for its vertical scrollbar.
 const SCROLLBAR: f32 = 16.;
 const CELL_PAD: f32 = 6.;
+/// The first column's inset from the table's left edge, in line with the toolbar above it.
+const EDGE_PAD: f32 = 12.;
 const TABLE_TEXT: f32 = 14.;
 const TOOLBAR_HEIGHT: f32 = 46.;
 const CHART_HEIGHT: f32 = 110.;
@@ -653,6 +655,7 @@ impl TableDelegate for ProcessTable {
             .items_center()
             .gap(px(3.))
             .px(rem_px(CELL_PAD))
+            .when(col == Col::Process, |d| d.pl(rem_px(EDGE_PAD)))
             .when(col.numeric(), |d| d.justify_end())
             .cursor_pointer()
             .text_size(rem_px(TABLE_TEXT - 1.))
@@ -717,6 +720,7 @@ impl TableDelegate for ProcessTable {
             .flex()
             .items_center()
             .px(rem_px(CELL_PAD))
+            .when(col == Col::Process, |d| d.pl(rem_px(EDGE_PAD)))
             .overflow_hidden();
         let number = |text: String| {
             div()
