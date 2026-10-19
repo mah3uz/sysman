@@ -134,7 +134,13 @@ means" and "How it is calculated". Panels without a chart have no arrow.
 - Rail: CPU cores (one bar per logical CPU, coloured by CCD or by core type on
   Intel hybrid), Memory composition (Kernel / App / Compressed / Cached / Free,
   plus "Other" so the bar sums to total), Swap, Thermals (CPU `temp_c` orange,
-  GPU `temp_c` red), Top CPU, Top disk (live).
+  GPU `temp_c` red), Top CPU, Top disk (live), Recent events.
+- Recent events: up to 5 rows from the `events` table for the Dashboard's
+  range, most severe first (crash, boot ended without shutdown, OOM kill,
+  restart loop, failed unit, packages), each a glyph, a one-line summary and
+  its time; a row opens Logs at that entry. With none, one quiet line
+  ("Nothing notable in the last 24 hr"). It reads only `events`, never the
+  journal.
 - Clicking a card, or a chart panel's arrow, opens its detail sheet.
 
 ### 6.2 Processes
