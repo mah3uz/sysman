@@ -2143,7 +2143,7 @@ impl Render for Energy {
                 div()
                     .id("energy-rail")
                     .flex_shrink_0()
-                    .w(t.rail_width + t.gap + t.page_padding)
+                    .map(|d| t.rail(d))
                     .h_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.rail_scroll)

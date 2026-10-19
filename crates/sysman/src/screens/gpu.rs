@@ -1295,7 +1295,7 @@ impl Render for Gpu {
                 div()
                     .id("gpu-rail")
                     .flex_shrink_0()
-                    .w(t.rail_width + t.gap + t.page_padding)
+                    .map(|d| t.rail(d))
                     .h_full()
                     .overflow_y_scroll()
                     .child(div().pl(t.gap).pr(t.page_padding).py(t.page_padding).children(rail)),

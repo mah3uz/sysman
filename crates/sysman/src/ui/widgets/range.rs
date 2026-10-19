@@ -45,20 +45,30 @@ impl Range {
     }
 }
 
-/// Each tab's last range, kept for the session because tabs are unmounted when hidden.
+/// Each tab's last range, and its parts' that choose their own, kept for the session because tabs are
+/// unmounted when hidden.
 #[derive(Default)]
-struct Remembered(HashMap<Tab, Range>);
+struct Remembered(HashMap<(Tab, &'static str), Range>);
 
 impl Global for Remembered {}
 
 pub fn remembered(tab: Tab, cx: &App) -> Range {
-    cx.try_global::<Remembered>()
-        .and_then(|r| r.0.get(&tab).copied())
-        .unwrap_or(Range::M30)
+    remembered_in(tab, "", cx)
 }
 
 pub fn remember(tab: Tab, range: Range, cx: &mut App) {
-    cx.default_global::<Remembered>().0.insert(tab, range);
+    remember_in(tab, "", range, cx);
+}
+
+/// The last range of `part`, a view in `tab` with a range of its own.
+pub fn remembered_in(tab: Tab, part: &'static str, cx: &App) -> Range {
+    cx.try_global::<Remembered>()
+        .and_then(|r| r.0.get(&(tab, part)).copied())
+        .unwrap_or(Range::M30)
+}
+
+pub fn remember_in(tab: Tab, part: &'static str, range: Range, cx: &mut App) {
+    cx.default_global::<Remembered>().0.insert((tab, part), range);
 }
 
 pub fn range_picker(

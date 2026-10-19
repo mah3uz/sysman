@@ -42,25 +42,17 @@ const PRIVILEGED_NOTE: &str = "Drive health needs raw drive commands, CPU packag
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     General,
-    Display,
     Collector,
     Modules,
     Advanced,
 }
 
 impl Tab {
-    const ALL: [Tab; 5] = [
-        Self::General,
-        Self::Display,
-        Self::Collector,
-        Self::Modules,
-        Self::Advanced,
-    ];
+    const ALL: [Tab; 4] = [Self::General, Self::Collector, Self::Modules, Self::Advanced];
 
     fn label(self) -> &'static str {
         match self {
             Self::General => "General",
-            Self::Display => "Display",
             Self::Collector => "Collector",
             Self::Modules => "Modules",
             Self::Advanced => "Advanced",
@@ -70,7 +62,6 @@ impl Tab {
     fn icon(self) -> IconName {
         match self {
             Self::General => IconName::Settings,
-            Self::Display => IconName::Monitor,
             Self::Collector => IconName::Database,
             Self::Modules => IconName::Blocks,
             Self::Advanced => IconName::SlidersHorizontal,
@@ -433,25 +424,6 @@ impl Settings {
                 }
                 menu
             });
-        vec![
-            group(
-                vec![
-                    row("Refresh interval", interval, cx),
-                    row("Pause when not focused", pause, cx),
-                ],
-                cx,
-            )
-            .into_any_element(),
-            footnote(
-                "How often charts redraw, and when they stop while you work elsewhere. Collection keeps its own \
-                 interval, and history is recorded either way.",
-                cx,
-            )
-            .into_any_element(),
-        ]
-    }
-
-    fn display(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = theme(cx);
         let appearance = segmented_full(
             "appearance",
@@ -543,6 +515,21 @@ impl Settings {
             footnote(
                 "System follows the desktop's light or dark style as it changes. Bold draws text a little larger \
                  and heavier. Bigger scales the whole layout by about 15%.",
+                cx,
+            )
+            .into_any_element(),
+            group_title("Refresh", cx).into_any_element(),
+            group(
+                vec![
+                    row("Refresh interval", interval, cx),
+                    row("Pause when not focused", pause, cx),
+                ],
+                cx,
+            )
+            .into_any_element(),
+            footnote(
+                "How often charts redraw, and when they stop while you work elsewhere. Collection keeps its own \
+                 interval, and history is recorded either way.",
                 cx,
             )
             .into_any_element(),
@@ -745,7 +732,6 @@ impl Render for Settings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.tab {
             Tab::General => self.general(cx),
-            Tab::Display => self.display(cx),
             Tab::Collector => self.collector(window, cx),
             Tab::Modules => self.form.update(cx, |form, cx| form.modules_tab(window, cx)),
             Tab::Advanced => self.advanced(cx),
@@ -758,7 +744,6 @@ impl Render for Settings {
             .size_full()
             .flex()
             .flex_col()
-            .bg(t.window)
             .text_color(t.text)
             .font_family(t.font.clone())
             .font_weight(t.weight_body)

@@ -2,7 +2,10 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use gpui::{App, FontFeatures, FontWeight, Global, Hsla, Pixels, Rems, SharedString, WindowAppearance, px, rems, rgb};
+use gpui::{
+    App, FontFeatures, FontWeight, Global, Hsla, Pixels, Rems, SharedString, Styled, WindowAppearance, px, relative,
+    rems, rgb,
+};
 use gpui_component::ThemeMode;
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +104,8 @@ impl Appearance {
     }
 }
 
+const RAIL_SHARE: f32 = 0.3;
+
 /// A size given in pixels at the regular text size; it follows the text size setting like the theme's tokens.
 pub const fn rem_px(px: f32) -> Rems {
     rems(px / 16.)
@@ -158,6 +163,7 @@ pub struct Theme {
     pub card_padding_y: Pixels,
     pub card_padding_x: Pixels,
     pub rail_width: Pixels,
+    pub rail_max_width: Pixels,
 
     pub panel_radius: Pixels,
     pub card_radius: Pixels,
@@ -199,6 +205,15 @@ fn black(alpha: f32) -> Hsla {
 }
 
 impl Theme {
+    /// Sizes a screen's right rail with its gutters: a share of the row it ends, between `rail_width` and
+    /// `rail_max_width` wide inside the gutters.
+    pub fn rail<E: Styled>(&self, rail: E) -> E {
+        let gutters = self.gap + self.page_padding;
+        rail.w(relative(RAIL_SHARE))
+            .min_w(self.rail_width + gutters)
+            .max_w(self.rail_max_width + gutters)
+    }
+
     pub fn dark() -> Self {
         Self::dark_at(TextSize::Regular)
     }
@@ -261,6 +276,7 @@ impl Theme {
             card_padding_y: sz(11.),
             card_padding_x: sz(13.),
             rail_width: sz(300.),
+            rail_max_width: sz(440.),
 
             panel_radius: sz(12.),
             card_radius: sz(10.),
