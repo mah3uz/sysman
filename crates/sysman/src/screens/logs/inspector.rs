@@ -160,10 +160,10 @@ impl Logs {
     /// The finding the entry is part of; clicking it narrows the list to that finding.
     fn member_card(&self, i: &Inspected, cx: &Context<Self>) -> Option<AnyElement> {
         let t = theme(cx);
-        let card = self.view.cards.iter().find(|c| Some(c.index) == i.finding)?;
+        let index = i.finding?;
+        let card = self.view.singles.get(index)?;
         let colour = severity_colour(card.severity, t);
-        let index = card.index;
-        let shown = self.controls.finding == Some(index);
+        let shown = self.controls.finding.as_deref() == Some(&[index]);
         Some(
             div()
                 .id("logs-member")
@@ -180,7 +180,7 @@ impl Logs {
                 .cursor_pointer()
                 .hover(|d| d.bg(colour.opacity(0.13)))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_finding(if shown { None } else { Some(index) }, cx);
+                    this.set_finding(if shown { None } else { Some(vec![index]) }, cx);
                 }))
                 .child(
                     div()
@@ -210,7 +210,7 @@ impl Logs {
                             div()
                                 .text_size(t.small_caption)
                                 .text_color(t.text_secondary)
-                                .child(card.evidence.clone()),
+                                .child(self.evidence(card)),
                         )
                         .child(
                             div()

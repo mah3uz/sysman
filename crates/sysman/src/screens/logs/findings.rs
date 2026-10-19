@@ -9,7 +9,7 @@ use journal::findings::FindingKind;
 
 use super::inspector::heading;
 use super::toolbar::{hair_b, severity_colour};
-use super::{Logs, model, recorded};
+use super::{Logs, model, now_us, recorded};
 use crate::ui::theme::{rem_px, theme};
 use crate::ui::widgets::hairline;
 
@@ -111,10 +111,24 @@ impl Logs {
                 .gap(rem_px(8.))
                 .children(cards[..shown].iter().map(|card| {
                     let colour = severity_colour(card.severity, t);
-                    let selected = self.controls.finding == Some(card.index);
-                    let index = card.index;
+                    let selected = self.controls.finding.as_ref() == Some(&card.members);
+                    let members = card.members.clone();
+                    let evidence = if card.members.len() > 1 {
+                        let pattern = if model::same_day(card.last_us, now_us(), &self.tz) {
+                            "%H:%M"
+                        } else {
+                            "%b %-d %H:%M"
+                        };
+                        format!(
+                            "Latest {} · {}",
+                            model::clock(card.last_us, pattern, &self.tz),
+                            card.evidence
+                        )
+                    } else {
+                        self.evidence(card)
+                    };
                     div()
-                        .id(("logs-finding", card.index))
+                        .id(("logs-finding", card.members[0]))
                         .min_w_0()
                         .flex()
                         .flex_row()
@@ -135,10 +149,10 @@ impl Logs {
                             }
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let next = if this.controls.finding == Some(index) {
+                            let next = if this.controls.finding.as_ref() == Some(&members) {
                                 None
                             } else {
-                                Some(index)
+                                Some(members.clone())
                             };
                             this.set_finding(next, cx);
                         }))
@@ -176,7 +190,7 @@ impl Logs {
                                         .text_size(t.small_caption)
                                         .text_color(t.text_secondary)
                                         .truncate()
-                                        .child(card.evidence.clone()),
+                                        .child(evidence),
                                 ),
                         )
                         .when(card.count > 1, |d| {
@@ -221,8 +235,7 @@ impl Logs {
     /// Above the list while a finding narrows it: what it is, when, and what sysman recorded over its span.
     pub(super) fn finding_header(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let t = theme(cx);
-        let index = self.controls.finding?;
-        let card = self.view.cards.iter().find(|c| c.index == index)?;
+        let card = self.shown_card()?;
         let colour = severity_colour(card.severity, t);
         let pattern = if model::same_day(card.first_us, card.last_us, &self.tz) {
             "%H:%M:%S"
@@ -303,7 +316,7 @@ impl Logs {
                                 div()
                                     .text_size(t.caption)
                                     .text_color(t.text_secondary)
-                                    .child(card.evidence.clone()),
+                                    .child(self.evidence(card)),
                             ),
                     )
                     .child(recorded::open_in_explorer(

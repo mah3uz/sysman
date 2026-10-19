@@ -355,10 +355,15 @@ impl Index {
     }
 
     fn for_each(&self, plan: &Plan, mut f: impl FnMut(u32, &Row)) {
-        match plan.q.finding {
-            Some(i) => {
-                let mut ids = self.findings.get(i).map_or(vec![], |f| f.entries.clone());
+        match &plan.q.findings {
+            Some(wanted) => {
+                let mut ids: Vec<usize> = wanted
+                    .iter()
+                    .filter_map(|&i| self.findings.get(i))
+                    .flat_map(|f| f.entries.iter().copied())
+                    .collect();
                 ids.sort_unstable();
+                ids.dedup();
                 for id in ids {
                     if let Some(r) = self.rows.get(id).filter(|r| plan.test(id, r)) {
                         f(id as u32, r);
@@ -671,12 +676,22 @@ pub(super) mod tests {
             cursor: None,
             data: Default::default(),
         };
-        idx.set_findings(vec![f.clone()]);
+        let other = Finding {
+            entries: vec![1, 2],
+            ..f.clone()
+        };
+        idx.set_findings(vec![f.clone(), other]);
         let mut query = q("");
-        query.finding = Some(0);
+        query.findings = Some(vec![0]);
         assert_eq!(rows(&idx.matching(&query, None)), [(0, 1), (2, 1)]);
+        query.findings = Some(vec![1, 0]);
+        assert_eq!(
+            rows(&idx.matching(&query, None)),
+            [(0, 1), (1, 1), (2, 1)],
+            "a folded card shows each of its members' rows once"
+        );
         f.entries.clear();
-        query.finding = Some(7);
+        query.findings = Some(vec![7]);
         assert!(
             idx.matching(&query, None).rows.is_empty(),
             "a stale finding index shows nothing"

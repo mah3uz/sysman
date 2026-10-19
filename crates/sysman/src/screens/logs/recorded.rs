@@ -93,6 +93,64 @@ pub(super) fn read(ask: &Ask) -> Read {
     }
 }
 
+/// sysman's last readings before a boot was cut off.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Last {
+    pub t: i64,
+    /// The width of the buckets read: a minute once history has rolled the raw points up.
+    pub width_s: i64,
+    pub cpu: Option<f64>,
+    pub mem: Option<f64>,
+    pub temp: Option<f64>,
+}
+
+impl Last {
+    pub fn line(&self, tz: &jiff::tz::TimeZone) -> String {
+        let pattern = if self.width_s < 60 { "%H:%M:%S" } else { "%H:%M" };
+        let mut out = format!("Last readings {}", model::clock(self.t as u64 * 1_000_000, pattern, tz));
+        for part in [
+            self.cpu.map(|v| format!("CPU {v:.0}%")),
+            self.temp.map(|v| temperature(v, 0)),
+            self.mem.map(|v| format!("memory {v:.0}%")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.push_str(" · ");
+            out.push_str(&part);
+        }
+        out
+    }
+}
+
+/// The last readings in `(from, until)`, from buckets that end by `until` so the next boot's first reading,
+/// sharing a minute with the cut, is not taken for the last one.
+pub(super) fn last_before(from: i64, until: i64) -> Option<Last> {
+    let history = History::open(&db_path()).ok()?;
+    let points = ((until - from) / 2).clamp(1, 1800) as u32;
+    let series = |path: &str| history.series(path, from, until, points).unwrap_or_default();
+    last_of(
+        &series("/cpu/total_pct"),
+        &series("/memory/used_pct"),
+        &series("/cpu/temp_c"),
+        until,
+    )
+}
+
+fn last_of(cpu: &[Bucket], mem: &[Bucket], temp: &[Bucket], until: i64) -> Option<Last> {
+    let width_s = step(cpu).or_else(|| step(temp)).unwrap_or(60.) as i64;
+    let last = |data: &[Bucket]| data.iter().rev().find(|b| b.t + width_s <= until).copied();
+    let (cpu, mem, temp) = (last(cpu), last(mem), last(temp));
+    let t = [cpu, mem, temp].iter().flatten().map(|b| b.t).max()?;
+    Some(Last {
+        t,
+        width_s,
+        cpu: cpu.map(|b| b.avg),
+        mem: mem.map(|b| b.avg),
+        temp: temp.map(|b| b.avg),
+    })
+}
+
 /// History for one [`Ask`], kept until a different one is asked for; `None` data while the read runs.
 pub(super) struct Recorded {
     pub ask: Ask,
@@ -396,6 +454,17 @@ mod tests {
         assert_eq!(value_at(&data, 179, 60.), Some(30.));
         // a gap in history is not filled from a distant reading
         assert_eq!(value_at(&data, 1000, 60.), None);
+    }
+
+    #[test]
+    fn the_last_readings_before_a_cut_skip_the_minute_the_next_boot_shares() {
+        let cpu = [b(0, 90.), b(60, 98.), b(120, 3.)];
+        let last = last_of(&cpu, &[b(60, 61.)], &[], 150).expect("readings before the cut");
+        assert_eq!(
+            (last.t, last.width_s, last.cpu, last.mem, last.temp),
+            (60, 60, Some(98.), Some(61.), None)
+        );
+        assert_eq!(last_of(&[], &[], &[], 150), None, "nothing recorded is not a reading");
     }
 
     #[test]

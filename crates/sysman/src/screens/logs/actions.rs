@@ -168,7 +168,7 @@ impl Logs {
         let from = i.entry.as_deref().map_or(from, |e| source(e).to_string());
         let time = model::clock(t_us, "%Y-%m-%d %H:%M:%S%.3f", &self.tz);
         let text = entry_text(&time, priority, &from, &inspector::full_message(i));
-        let kind = self.view.cards.iter().find(|c| Some(c.index) == i.finding).map(|c| c.kind);
+        let kind = i.finding.and_then(|f| self.view.singles.get(f)).map(|c| c.kind);
         let target = i
             .entry
             .as_deref()

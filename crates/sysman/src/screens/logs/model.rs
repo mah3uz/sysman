@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -71,7 +72,8 @@ impl Level {
 pub struct Controls {
     pub level: Level,
     pub category: Option<Category>,
-    pub finding: Option<usize>,
+    /// The findings of the card the list is narrowed to.
+    pub finding: Option<Vec<usize>>,
     /// The strip's dragged-out slice.
     pub window: Option<(u64, u64)>,
 }
@@ -85,7 +87,7 @@ impl Controls {
         if let Some(c) = self.category {
             q.categories = vec![c];
         }
-        q.finding = self.finding;
+        q.findings = self.finding.clone();
         if let Some((from, to)) = self.window {
             q.since_us = Some(q.since_us.map_or(from, |s| s.max(from)));
             q.until_us = Some(q.until_us.map_or(to, |u| u.min(to)));
@@ -148,14 +150,75 @@ pub fn span(us: u64) -> String {
     if s < 120 { format!("{s} s") } else { format::duration(s) }
 }
 
-/// Indexes into `findings`, most severe first and the latest first within a severity.
+/// A lost boot can explain everything after it, so it leads; the nagging kinds come last.
+fn rank(kind: FindingKind) -> u8 {
+    match kind {
+        FindingKind::BootWithoutShutdown => 0,
+        FindingKind::OomKill => 1,
+        FindingKind::HardwareError => 2,
+        FindingKind::Crash => 3,
+        FindingKind::RestartLoop => 4,
+        FindingKind::FailedUnit => 5,
+        FindingKind::FailedSignIns => 6,
+        FindingKind::ThermalThrottle => 7,
+        FindingKind::PackageChange => 8,
+    }
+}
+
+/// Indexes into `findings` by [`rank`], the latest first within a rank.
 pub fn ordered(findings: &[Finding]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..findings.len()).collect();
     order.sort_by(|&a, &b| {
         let (a, b) = (&findings[a], &findings[b]);
-        b.severity.cmp(&a.severity).then(b.last_us.cmp(&a.last_us))
+        rank(a.kind).cmp(&rank(b.kind)).then(b.last_us.cmp(&a.last_us))
     });
     order
+}
+
+/// What findings of one kind must share to fold into one card; `None` keeps a finding on its own.
+fn subject(f: &Finding) -> Option<String> {
+    let get = |k: &str| f.data.get(k).filter(|v| !v.is_empty()).cloned();
+    match f.kind {
+        FindingKind::Crash => Some(format!("{}\0{}", get("comm")?, get("signal").unwrap_or_default())),
+        FindingKind::FailedUnit | FindingKind::RestartLoop => get("unit"),
+        FindingKind::OomKill => get("comm"),
+        _ => None,
+    }
+}
+
+/// The cards: [`ordered`] findings with the same kind and [`subject`] folded into the first of them, each
+/// card's members newest first.
+pub fn grouped(findings: &[Finding]) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = vec![];
+    let mut by_subject: HashMap<(FindingKind, String), usize> = HashMap::new();
+    for i in ordered(findings) {
+        match subject(&findings[i]) {
+            Some(s) => match by_subject.entry((findings[i].kind, s)) {
+                Entry::Occupied(e) => out[*e.get()].push(i),
+                Entry::Vacant(e) => {
+                    e.insert(out.len());
+                    out.push(vec![i]);
+                }
+            },
+            None => out.push(vec![i]),
+        }
+    }
+    out
+}
+
+/// The title of a card folding `members` findings like `f` that hold `events` between them.
+pub fn folded_title(f: &Finding, members: usize, events: usize) -> String {
+    let get = |k: &str| f.data.get(k).map_or("", String::as_str);
+    match f.kind {
+        FindingKind::Crash => {
+            let signal = f.data.get("signal").map_or("unknown signal", String::as_str);
+            format!("{} crashed {events} times ({signal})", get("comm"))
+        }
+        FindingKind::OomKill => format!("{} was killed by the OOM killer {events} times", get("comm")),
+        FindingKind::FailedUnit => format!("{} failed {events} times ({})", get("unit"), get("result")),
+        FindingKind::RestartLoop => format!("{} kept restarting, {members} times ({events} restarts)", get("unit")),
+        _ => f.title.clone(),
+    }
 }
 
 /// How many of each kind, most severe first: crashes, OOM kills and failed units by event (as the boot tallies
@@ -448,15 +511,98 @@ mod tests {
         }
     }
 
+    fn about(kind: FindingKind, last_us: u64, data: &[(&str, &str)]) -> Finding {
+        let mut f = finding(kind, last_us, 1);
+        f.data = data.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        f
+    }
+
+    fn crash(comm: &str, signal: &str, last_us: u64) -> Finding {
+        about(FindingKind::Crash, last_us, &[("comm", comm), ("signal", signal)])
+    }
+
     #[test]
-    fn findings_come_most_severe_first_then_latest() {
+    fn findings_come_by_rank_then_latest() {
         let f = [
             finding(FindingKind::PackageChange, 900, 1),
             finding(FindingKind::Crash, 100, 1),
             finding(FindingKind::RestartLoop, 500, 3),
             finding(FindingKind::OomKill, 300, 1),
+            finding(FindingKind::Crash, 200, 1),
+            finding(FindingKind::ThermalThrottle, 950, 1),
         ];
-        assert_eq!(ordered(&f), vec![3, 1, 2, 0]);
+        assert_eq!(ordered(&f), vec![3, 4, 1, 2, 5, 0]);
+    }
+
+    #[test]
+    fn a_power_loss_outranks_any_number_of_crashes() {
+        let mut f: Vec<Finding> = (0..20)
+            .map(|i| crash(&format!("app{i}"), "SIGSEGV", 1000 + i))
+            .collect();
+        f.push(finding(FindingKind::BootWithoutShutdown, 10, 1));
+        assert_eq!(
+            grouped(&f)[0],
+            vec![20],
+            "the cut explains the crashes after it, so it is seen first"
+        );
+    }
+
+    #[test]
+    fn crashes_of_one_program_fold_into_one_card() {
+        let f = [
+            crash("Hyprland", "SIGSEGV", 100),
+            crash("fladder", "SIGABRT", 150),
+            crash("Hyprland", "SIGSEGV", 300),
+            crash("Hyprland", "SIGABRT", 200),
+            crash("Hyprland", "SIGSEGV", 50),
+        ];
+        let cards = grouped(&f);
+        assert_eq!(
+            cards,
+            vec![vec![2, 0, 4], vec![3], vec![1]],
+            "newest first, a different signal stands apart"
+        );
+        assert_eq!(folded_title(&f[2], 3, 3), "Hyprland crashed 3 times (SIGSEGV)");
+    }
+
+    #[test]
+    fn units_and_oom_victims_fold_by_name() {
+        let f = [
+            about(
+                FindingKind::FailedUnit,
+                100,
+                &[("unit", "a.service"), ("result", "exit-code")],
+            ),
+            about(FindingKind::FailedUnit, 200, &[("unit", "b.service")]),
+            about(
+                FindingKind::FailedUnit,
+                300,
+                &[("unit", "a.service"), ("result", "exit-code")],
+            ),
+            about(FindingKind::OomKill, 400, &[("comm", "firefox")]),
+            about(FindingKind::OomKill, 500, &[("comm", "firefox")]),
+            about(FindingKind::OomKill, 600, &[]),
+            about(FindingKind::OomKill, 700, &[]),
+        ];
+        assert_eq!(
+            grouped(&f),
+            vec![vec![6], vec![5], vec![4, 3], vec![2, 0], vec![1]],
+            "kills with no victim named are not taken for one process"
+        );
+        assert_eq!(folded_title(&f[2], 2, 2), "a.service failed 2 times (exit-code)");
+    }
+
+    #[test]
+    fn boot_ends_are_never_folded() {
+        let f = [
+            about(FindingKind::BootWithoutShutdown, 100, &[("boot_started_us", "1")]),
+            about(FindingKind::BootWithoutShutdown, 200, &[("boot_started_us", "1")]),
+        ];
+        assert_eq!(
+            grouped(&f),
+            vec![vec![1], vec![0]],
+            "each lost boot has its own last readings"
+        );
     }
 
     #[test]

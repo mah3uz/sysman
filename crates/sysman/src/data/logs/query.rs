@@ -29,8 +29,8 @@ pub struct Query {
     pub until_us: Option<u64>,
     /// Free text terms, all of which must be in the message (case-insensitive). A quoted phrase is one term.
     pub text: Vec<String>,
-    /// Index into the finding list: only that finding's entries.
-    pub finding: Option<usize>,
+    /// Indexes into the finding list: only those findings' entries.
+    pub findings: Option<Vec<usize>>,
 }
 
 /// What the message-streaming scan has to check, since the index holds neither messages nor pids.

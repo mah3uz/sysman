@@ -131,44 +131,40 @@ impl Logs {
     /// The field, with the finding the list is narrowed to as a chip before the text.
     fn search_field(&self, cx: &Context<Self>) -> Div {
         let t = theme(cx);
-        let finding = self
-            .controls
-            .finding
-            .and_then(|f| self.view.cards.iter().find(|c| c.index == f))
-            .map(|card| {
-                let colour = severity_colour(card.severity, t);
-                div()
-                    .id("logs-finding-chip")
-                    .flex_shrink_0()
-                    .max_w(rem_px(220.))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(rem_px(4.))
-                    .h(rem_px(20.))
-                    .pl(rem_px(6.))
-                    .pr(rem_px(3.))
-                    .rounded(rem_px(5.))
-                    .bg(colour.opacity(0.14))
-                    .text_size(t.small_caption)
-                    .child(dot(colour, 6.))
-                    .child(div().min_w_0().truncate().child(card.title.clone()))
-                    .child(
-                        div()
-                            .id("logs-finding-clear")
-                            .flex_shrink_0()
-                            .p(rem_px(2.))
-                            .rounded(rem_px(3.))
-                            .text_color(t.text_secondary)
-                            .hover(|d| d.bg(colour.opacity(0.2)).text_color(t.text))
-                            .cursor_pointer()
-                            .child(Icon::new(IconName::X).xsmall())
-                            .tooltip(|window, cx| {
-                                gpui_component::tooltip::Tooltip::new("Show every entry again").build(window, cx)
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.set_finding(None, cx))),
-                    )
-            });
+        let finding = self.shown_card().map(|card| {
+            let colour = severity_colour(card.severity, t);
+            div()
+                .id("logs-finding-chip")
+                .flex_shrink_0()
+                .max_w(rem_px(220.))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(rem_px(4.))
+                .h(rem_px(20.))
+                .pl(rem_px(6.))
+                .pr(rem_px(3.))
+                .rounded(rem_px(5.))
+                .bg(colour.opacity(0.14))
+                .text_size(t.small_caption)
+                .child(dot(colour, 6.))
+                .child(div().min_w_0().truncate().child(card.title.clone()))
+                .child(
+                    div()
+                        .id("logs-finding-clear")
+                        .flex_shrink_0()
+                        .p(rem_px(2.))
+                        .rounded(rem_px(3.))
+                        .text_color(t.text_secondary)
+                        .hover(|d| d.bg(colour.opacity(0.2)).text_color(t.text))
+                        .cursor_pointer()
+                        .child(Icon::new(IconName::X).xsmall())
+                        .tooltip(|window, cx| {
+                            gpui_component::tooltip::Tooltip::new("Show every entry again").build(window, cx)
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.set_finding(None, cx))),
+                )
+        });
         div()
             .h(rem_px(30.))
             .flex()

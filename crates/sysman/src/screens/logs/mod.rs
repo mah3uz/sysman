@@ -47,11 +47,11 @@ const AROUND: usize = 6;
 const LINE_CACHE: usize = 4096;
 const LINE_CHARS: usize = 400;
 
-/// A finding as a card shows it, copied out of the index.
+/// One finding, or several folded together, as a card shows it, copied out of the index.
 #[derive(Debug, Clone)]
 struct Card {
-    /// Its place in [`data::Index::findings`], which is what [`Query::finding`] takes.
-    index: usize,
+    /// Places in [`data::Index::findings`], newest first, which is what [`Query::findings`] takes.
+    members: Vec<usize>,
     kind: FindingKind,
     severity: Severity,
     title: String,
@@ -59,7 +59,7 @@ struct Card {
     count: usize,
     first_us: u64,
     last_us: u64,
-    /// The process it is about, for crashes and OOM kills.
+    /// The process it is about, for a crash or OOM kill on its own.
     pid: Option<u32>,
 }
 
@@ -88,6 +88,8 @@ struct View {
     range: (u64, u64),
     boots: Vec<BootSummary>,
     cards: Vec<Card>,
+    /// Every finding as a card of its own, by its place in [`data::Index::findings`].
+    singles: Vec<Card>,
     tallies: Vec<(FindingKind, usize)>,
     packages: Option<&'static str>,
     /// Computed after the scan's first pass, so the findings and boot ends are in.
@@ -175,6 +177,8 @@ pub struct Logs {
     lane_hover: Option<(usize, usize)>,
     entry_rec: Option<Recorded>,
     finding_rec: Option<Recorded>,
+    /// Readings before each boot end, by its time: `None` while read, `Some(None)` when history has nothing.
+    readings: HashMap<u64, Option<Option<recorded::Last>>>,
     lanes_rec: Option<Recorded>,
     pending: Option<Pending>,
     /// The copy button showing its feedback, by row.
@@ -265,6 +269,7 @@ impl Logs {
             lane_hover: None,
             entry_rec: None,
             finding_rec: None,
+            readings: HashMap::new(),
             lanes_rec: None,
             pending: None,
             copied: None,
@@ -340,7 +345,7 @@ impl Logs {
         if let Some(n) = self.dev.finding.take()
             && let Some(card) = self.view.cards.get(n)
         {
-            self.set_finding(Some(card.index), cx);
+            self.set_finding(Some(card.members.clone()), cx);
             return;
         }
         let Some(how) = self.dev.select.take() else { return };
@@ -481,12 +486,67 @@ impl Logs {
         self.refilter(cx);
     }
 
-    fn set_finding(&mut self, finding: Option<usize>, cx: &mut Context<Self>) {
+    fn set_finding(&mut self, finding: Option<Vec<usize>>, cx: &mut Context<Self>) {
         self.set_controls(|c| c.finding = finding, cx);
-        let card = finding.and_then(|f| self.view.cards.iter().find(|c| c.index == f));
-        match card.map(|c| Ask::over(secs(c.first_us), secs(c.last_us), c.pid)) {
+        match self
+            .shown_card()
+            .map(|c| Ask::over(secs(c.first_us), secs(c.last_us), c.pid))
+        {
             Some(ask) => self.record(ask, |l| &mut l.finding_rec, cx),
             None => self.finding_rec = None,
+        }
+    }
+
+    /// The card the list is narrowed to: a folded one, or a single finding picked from the inspector.
+    fn shown_card(&self) -> Option<&Card> {
+        let shown = self.controls.finding.as_ref()?;
+        self.view
+            .cards
+            .iter()
+            .find(|c| &c.members == shown)
+            .or(match shown[..] {
+                [one] => self.view.singles.get(one),
+                _ => None,
+            })
+    }
+
+    /// A boot end's evidence is what sysman last recorded before the cut, once read, as its last journal line
+    /// rarely tells why.
+    fn evidence(&self, card: &Card) -> String {
+        if card.kind != FindingKind::BootWithoutShutdown {
+            return card.evidence.clone();
+        }
+        match self.readings.get(&card.last_us) {
+            Some(Some(Some(last))) => last.line(&self.tz),
+            Some(Some(None)) => format!("Not recorded by sysman · {}", card.evidence),
+            _ => card.evidence.clone(),
+        }
+    }
+
+    fn read_readings(&mut self, cx: &mut Context<Self>) {
+        let cuts: Vec<u64> = self
+            .view
+            .cards
+            .iter()
+            .filter(|c| c.kind == FindingKind::BootWithoutShutdown && !self.readings.contains_key(&c.last_us))
+            .map(|c| c.last_us)
+            .collect();
+        for cut in cuts {
+            self.readings.insert(cut, None);
+            let next = self.view.boots.iter().map(|b| b.first_us).filter(|&f| f > cut).min();
+            let until = next.map_or(secs(cut) + 300, secs);
+            let task = cx
+                .background_executor()
+                .spawn(async move { recorded::last_before(secs(cut) - 1800, until) });
+            cx.spawn(async move |this, cx| {
+                let last = task.await;
+                this.update(cx, |this, cx| {
+                    this.readings.insert(cut, Some(last));
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
         }
     }
 
@@ -696,13 +756,11 @@ impl Logs {
         let at_end = self.list.is_scrolled_to_end().unwrap_or(true);
         let fresh_query = view.key.query != self.view.key.query;
         self.view = view;
-        if self
-            .controls
-            .finding
-            .is_some_and(|f| !self.view.cards.iter().any(|c| c.index == f))
-            && self.view.scanned
-        {
-            self.set_finding(None, cx);
+        if self.view.scanned {
+            if self.controls.finding.is_some() && self.shown_card().is_none() {
+                self.set_finding(None, cx);
+            }
+            self.read_readings(cx);
         }
         match self.selected {
             Some(row) if fresh_query => self.reveal(row),
@@ -943,23 +1001,11 @@ fn compute(scan: &Scan, search: Option<&Search>, q: &Query, span: &Span, from_us
         |b| !boots[b].current && boots[b].end != BootEnd::Running,
     );
     let findings = index.findings();
-    let cards = model::ordered(findings)
+    let cards = model::grouped(findings)
         .into_iter()
-        .map(|i| {
-            let f = &findings[i];
-            Card {
-                index: i,
-                kind: f.kind,
-                severity: f.severity,
-                title: f.title.clone(),
-                evidence: f.evidence.clone(),
-                count: f.count,
-                first_us: f.first_us,
-                last_us: f.last_us,
-                pid: victim(f),
-            }
-        })
+        .map(|members| card(findings, members))
         .collect();
+    let singles = (0..findings.len()).map(|i| card(findings, vec![i])).collect();
     let packages = index.transactions().first().map(|t| match t.manager {
         Manager::Pacman => "pacman.log",
         Manager::Dpkg => "dpkg.log",
@@ -976,8 +1022,35 @@ fn compute(scan: &Scan, search: Option<&Search>, q: &Query, span: &Span, from_us
         tallies: model::tallies(findings),
         boots,
         cards,
+        singles,
         packages,
         scanned,
+    }
+}
+
+/// `members` are newest first, as [`model::grouped`] gives them.
+fn card(findings: &[journal::findings::Finding], members: Vec<usize>) -> Card {
+    let f = &findings[members[0]];
+    let events = members.iter().map(|&i| findings[i].count).sum();
+    let folded = members.len() > 1;
+    Card {
+        kind: f.kind,
+        severity: f.severity,
+        title: if folded {
+            model::folded_title(f, members.len(), events)
+        } else {
+            f.title.clone()
+        },
+        evidence: f.evidence.clone(),
+        count: events,
+        first_us: members
+            .iter()
+            .map(|&i| findings[i].first_us)
+            .min()
+            .unwrap_or(f.first_us),
+        last_us: f.last_us,
+        pid: if folded { None } else { victim(f) },
+        members,
     }
 }
 
