@@ -11,7 +11,7 @@ const lightShots = new Set(['dashboard', 'processes', 'gpu', 'energy', 'network'
 
 // File names (such as 'gpu' or 'gpu-light') that also have a 2560×1440 {name}@2x.webp in public/shots.
 // Only a large Shot uses them, so the page itself never downloads the big files.
-const retinaShots = new Set([])
+const retinaShots = new Set([...lightShots].flatMap((id) => [id, `${id}-light`]))
 
 const theme = useTheme()
 const srcset = (name) =>
