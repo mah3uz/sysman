@@ -1,5 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -19,6 +20,11 @@ pub struct Jsonl {
 impl Jsonl {
     pub fn new(dir: PathBuf, fsync: bool, keep_days: u32) -> Result<Self> {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        // the samples name every process and its command line; other users have no business reading them
+        if std::fs::metadata(&dir)?.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("restricting {}", dir.display()))?;
+        }
         Ok(Self {
             dir,
             fsync,
@@ -38,6 +44,7 @@ impl Jsonl {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         self.file = Some(file);
@@ -99,6 +106,19 @@ mod tests {
         log.write(&json!({"a": 2})).unwrap();
         let text = std::fs::read_to_string(dir.path().join("2026-10-15.jsonl")).unwrap();
         assert_eq!(text, "{\"a\":1}\n{\"a\":2}\n");
+    }
+
+    #[test]
+    fn the_log_is_the_owners_alone() {
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("log");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut log = Jsonl::new(dir.clone(), false, 2).unwrap();
+        log.open(date(2026, 10, 15)).unwrap();
+        assert_eq!(mode(&dir), 0o700, "an older daemon's directory let every user list and read the samples");
+        assert_eq!(mode(&dir.join("2026-10-15.jsonl")), 0o600);
     }
 
     #[test]

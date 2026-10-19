@@ -12,7 +12,9 @@ use anyhow::{Result, anyhow};
 use jiff::tz::TimeZone;
 use journal::Entry;
 use journal::categories::{INDEX_FIELDS, ids};
-use journal::findings::{Detector, Finding, FindingKind};
+use journal::findings::{
+    BootEndFacts, BootEndVerdict, Detector, Finding, FindingKind, ResetKind, boot_end_verdict, decode_reset_reason,
+};
 use journal::packages::{self, Transaction};
 use journal::reader::{self, Access, Boot, Change, Fields, Filter, Journal, Seek};
 use serde::{Deserialize, Serialize};
@@ -40,6 +42,11 @@ const DAY_US: u64 = 86_400_000_000;
 const JOURNAL_DIRS: [&str; 2] = ["/var/log/journal", "/run/log/journal"];
 const ROTATED_MARGIN: Duration = Duration::from_secs(600);
 const FILES_EVERY: Duration = Duration::from_secs(60);
+const KERNEL_HEAD: usize = 8;
+const JOURNALD_WARNINGS: usize = 200;
+const KERNEL_BOOT_LINES: usize = 5000;
+// The AMD reset reason is printed during CPU setup, in the boot's first seconds.
+const RESET_REASON_US: u64 = 120_000_000;
 
 /// One row of `events`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,20 +104,19 @@ fn record(events: &[Event], state: &State, error: Option<&str>) -> Value {
 }
 
 trait Source {
+    fn set_filter(&mut self, filter: &Filter) -> Result<()>;
     fn seek(&mut self, to: Seek) -> Result<()>;
     fn next(&mut self) -> Result<Option<Entry>>;
     fn boots(&mut self) -> Result<Vec<Boot>>;
-    /// Whether `boot` logged a shutdown or the journal stopping. The read position is lost.
-    fn ended_cleanly(&mut self, boot: &str) -> Result<bool>;
 }
 
-/// Entries with one of the ids, and kernel errors, where the OOM killer's lines are: (ids or kernel) and (ids or
-/// priority 0-3).
+/// Entries with one of the ids, and kernel lines but debug: (ids or kernel) and (ids or priority 0-6). Xid lines
+/// are warnings, GPU hangs info or notice and segfaults info.
 fn stream_filter() -> Filter {
     let by_id = || STREAM_IDS.iter().map(|id| ("MESSAGE_ID", *id));
     Filter::default()
         .any(by_id().chain([("_TRANSPORT", "kernel")]))
-        .any(by_id().chain(["0", "1", "2", "3"].map(|p| ("PRIORITY", p))))
+        .any(by_id().chain(["0", "1", "2", "3", "4", "5", "6"].map(|p| ("PRIORITY", p))))
 }
 
 struct Live {
@@ -202,6 +208,10 @@ fn rotated(active: &[(PathBuf, u64)]) -> bool {
 }
 
 impl Source for Live {
+    fn set_filter(&mut self, filter: &Filter) -> Result<()> {
+        self.j.set_filter(filter)
+    }
+
     fn seek(&mut self, to: Seek) -> Result<()> {
         self.j.seek(to)
     }
@@ -213,19 +223,73 @@ impl Source for Live {
     fn boots(&mut self) -> Result<Vec<Boot>> {
         self.j.boots()
     }
+}
 
-    fn ended_cleanly(&mut self, boot: &str) -> Result<bool> {
-        let stops = Filter::default()
-            .any([("_BOOT_ID", boot)])
-            .any([("MESSAGE_ID", ids::SHUTDOWN), ("MESSAGE_ID", ids::JOURNAL_STOPPED)]);
-        self.j.set_filter(&stops)?;
-        let found = self
-            .j
-            .seek(Seek::Head)
-            .and_then(|_| self.j.next(Fields::Only(&["MESSAGE_ID"])));
-        self.j.set_filter(&stream_filter())?;
-        Ok(found?.is_some())
+/// What `boot`'s markers say about how it ended and, when they leave it abrupt, what the start of `next` says:
+/// journald finding a file left open, and the AMD reset reason. Filtered reads only, never a whole boot. The stream
+/// filter is set again after; the read position is lost.
+fn boot_end_facts(src: &mut impl Source, boot: &Boot, next: &Boot) -> Result<BootEndFacts> {
+    let facts = read_boot_end(src, boot, next);
+    src.set_filter(&stream_filter())?;
+    facts
+}
+
+fn read_boot_end(src: &mut impl Source, boot: &Boot, next: &Boot) -> Result<BootEndFacts> {
+    let mut f = BootEndFacts {
+        last_us: boot.last_us,
+        ..BootEndFacts::default()
+    };
+    let kernel = |id: &str| Filter::default().any([("_BOOT_ID", id)]).any([("_TRANSPORT", "kernel")]);
+    feed(src, &kernel(&boot.id), KERNEL_HEAD, |e| {
+        f.note(e);
+        !f.kernel_start
+    })?;
+    if !f.kernel_start {
+        return Ok(f);
     }
+    let markers = || {
+        [ids::SHUTDOWN, ids::JOURNAL_STOPPED, ids::SLEEP_START, ids::SLEEP_STOP]
+            .map(|id| ("MESSAGE_ID", id))
+            .into_iter()
+    };
+    // (a marker or multi-user.target) and (a marker or a unit stopped): that target's stop, not every unit's
+    let own = Filter::default()
+        .any([("_BOOT_ID", boot.id.as_str())])
+        .any(markers().chain([("UNIT", "multi-user.target")]))
+        .any(markers().chain([("MESSAGE_ID", ids::UNIT_STOPPED)]));
+    feed(src, &own, usize::MAX, |e| {
+        f.note(e);
+        true
+    })?;
+    if boot_end_verdict(&f) == BootEndVerdict::Clean {
+        return Ok(f);
+    }
+    let journald = Filter::default()
+        .any([("_BOOT_ID", next.id.as_str())])
+        .any([("SYSLOG_IDENTIFIER", "systemd-journald")])
+        .any(["0", "1", "2", "3", "4"].map(|p| ("PRIORITY", p)));
+    feed(src, &journald, JOURNALD_WARNINGS, |e| {
+        f.note_next(e);
+        !f.next_unclean_journal
+    })?;
+    feed(src, &kernel(&next.id), KERNEL_BOOT_LINES, |e| {
+        f.note_next(e);
+        f.next_reset_reason.is_none() && e.t_us <= next.first_us + RESET_REASON_US
+    })?;
+    Ok(f)
+}
+
+/// Gives up to `max` entries passing `filter`, oldest first, to `each` until it returns false.
+fn feed(src: &mut impl Source, filter: &Filter, max: usize, mut each: impl FnMut(&Entry) -> bool) -> Result<()> {
+    src.set_filter(filter)?;
+    src.seek(Seek::Head)?;
+    for _ in 0..max {
+        match src.next()? {
+            Some(e) if each(&e) => {}
+            _ => break,
+        }
+    }
+    Ok(())
 }
 
 struct Recorder {
@@ -239,9 +303,10 @@ struct Recorder {
 }
 
 impl Recorder {
-    fn new(state: State) -> Recorder {
+    /// Believes unit failures and restarts only from PID 1 and the user manager of `owner_uid`.
+    fn new(state: State, owner_uid: u32) -> Recorder {
         Recorder {
-            detector: Detector::new(),
+            detector: Detector::for_owner(owner_uid),
             state,
             index: 0,
             read_us: 0,
@@ -317,16 +382,10 @@ fn now_us() -> u64 {
 
 fn finding_event(f: &Finding) -> Option<Event> {
     let field = |k: &str| f.data.get(k).map(String::as_str);
+    let comm = field("comm").unwrap_or("A process");
     let (kind, summary) = match f.kind {
         // the detector numbers repeat crashes from where it started reading; the row must not depend on that
-        FindingKind::Crash => (
-            "crash",
-            format!(
-                "{} crashed ({})",
-                field("comm").unwrap_or("A process"),
-                field("signal").unwrap_or("unknown signal")
-            ),
-        ),
+        FindingKind::Crash => ("crash", crash_summary(comm, field("signal").unwrap_or("unknown signal"), 1)),
         FindingKind::OomKill => ("oom", f.title.clone()),
         FindingKind::FailedUnit => ("unit_failed", f.title.clone()),
         FindingKind::RestartLoop => ("restart_loop", f.title.clone()),
@@ -343,22 +402,40 @@ fn finding_event(f: &Finding) -> Option<Event> {
             (k.clone(), v)
         })
         .collect();
+    let mut key = f.cursor.clone().unwrap_or_else(|| f.first_us.to_string());
     match f.kind {
         FindingKind::FailedUnit => data.insert("count".into(), f.count.into()),
         FindingKind::RestartLoop => data.insert("n_restarts".into(), f.count.into()),
+        // one row per program per boot, which the database folds into; see `fold_crash`
+        FindingKind::Crash => {
+            key = comm.to_string();
+            data.insert("last_us".into(), f.first_us.into());
+            data.insert("count".into(), 1.into())
+        }
         _ => None,
     };
     Some(Event {
         t: secs(f.first_us),
         kind: kind.into(),
-        key: f.cursor.clone().unwrap_or_else(|| f.first_us.to_string()),
+        key,
         boot_id: Some(f.boot_id.clone()).filter(|b| !b.is_empty()),
         summary,
         data: data.into(),
     })
 }
 
+pub fn crash_summary(comm: &str, signal: &str, count: u64) -> String {
+    match count {
+        0 | 1 => format!("{comm} crashed ({signal})"),
+        n => format!("{comm} crashed {n} times ({signal})"),
+    }
+}
+
 fn sleep_event(e: &Entry) -> Option<Event> {
+    // systemd-sleep runs as root; any user can log the same MESSAGE_ID
+    if e.get("_UID") != Some("0") {
+        return None;
+    }
     let (kind, summary) = match e.get("MESSAGE_ID")? {
         ids::SLEEP_START => ("suspend", "Suspended"),
         ids::SLEEP_STOP => ("resume", "Resumed"),
@@ -376,7 +453,7 @@ fn sleep_event(e: &Entry) -> Option<Event> {
 
 /// A `boot` for each boot that started after the newest one recorded, and a `boot_end` for the boot before it, which
 /// has ended by then. Without the system journal there is no telling how a boot ended, so `full` false leaves
-/// `boot_end` out.
+/// `boot_end` out; so does a boot whose start was vacuumed, which reads as unknown, as a missing row does.
 fn boot_events(src: &mut impl Source, state: &mut State, from_us: u64, full: bool) -> Result<Vec<Event>> {
     let boots = src.boots()?;
     let mut out = Vec::new();
@@ -395,24 +472,39 @@ fn boot_events(src: &mut impl Source, state: &mut State, from_us: u64, full: boo
         if let Some(prev) = i.checked_sub(1).map(|p| &boots[p])
             && full
         {
-            let clean = src.ended_cleanly(&prev.id)?;
-            out.push(Event {
-                t: secs(prev.last_us),
-                kind: "boot_end".into(),
-                key: prev.id.clone(),
-                boot_id: Some(prev.id.clone()),
-                summary: if clean {
-                    "Shut down"
-                } else {
-                    "Boot ended without a shutdown"
-                }
-                .into(),
-                data: json!({ "clean": clean }),
-            });
+            out.extend(boot_end_event(prev, &boot_end_facts(src, prev, b)?));
         }
         state.boot_us = Some(b.first_us);
     }
     Ok(out)
+}
+
+fn boot_end_event(boot: &Boot, facts: &BootEndFacts) -> Option<Event> {
+    let verdict = boot_end_verdict(facts);
+    let reason = facts.next_reset_reason.as_deref().map(decode_reset_reason);
+    let suspended = facts.ended_suspended();
+    // only a hardware power cut is called a power loss; an orderly reason does not explain an abrupt end
+    let summary = match (verdict, reason) {
+        (BootEndVerdict::Unknown, _) => return None,
+        (BootEndVerdict::Clean, _) => "Shut down".to_string(),
+        (_, Some((label, ResetKind::PowerCut))) => format!("Power lost: {label}"),
+        _ if suspended => "Ended while suspended".to_string(),
+        (_, Some((label, ResetKind::Abrupt))) => format!("Ended without shutdown ({label})"),
+        _ => "Ended without shutdown".to_string(),
+    };
+    Some(Event {
+        t: secs(boot.last_us),
+        kind: "boot_end".into(),
+        key: boot.id.clone(),
+        boot_id: Some(boot.id.clone()),
+        summary,
+        data: json!({
+            "clean": verdict == BootEndVerdict::Clean,
+            "certainty": verdict.key(),
+            "reset_reason": reason.map(|(label, _)| label),
+            "suspended": suspended,
+        }),
+    })
 }
 
 struct Packages {
@@ -559,9 +651,22 @@ fn follow(out: &mut Out, events_days: u32, log_dir: &Path) -> Result<Infallible>
     }
     let mut src = Live::open()?;
     let from_us = now_us().saturating_sub(u64::from(events_days) * DAY_US);
-    let mut rec = Recorder::new(out.saved.clone());
-    let boots = boot_events(&mut src, &mut rec.state, from_us, access == Access::Full)?;
-    out.send(boots, &rec.state, None)?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let mut rec = Recorder::new(out.saved.clone(), unsafe { libc::geteuid() });
+    // without boot records the other events still matter; a later start tries the boots again
+    let mut state = rec.state.clone();
+    match boot_events(&mut src, &mut state, from_us, access == Access::Full) {
+        Ok(boots) => {
+            rec.state = state;
+            out.send(boots, &rec.state, None)?;
+        }
+        Err(e) => {
+            let msg = format!("reading boots: {e:#}");
+            eprintln!("events: {msg}");
+            out.send(Vec::new(), &rec.state, Some(&msg))?;
+            src.set_filter(&stream_filter())?;
+        }
+    }
     rec.start(&mut src, from_us)?;
     let mut packages = Packages::new(log_dir);
     let mut packages_due = Instant::now();
@@ -629,14 +734,21 @@ mod tests {
         at: usize,
         read: usize,
         boots: Vec<Boot>,
-        clean: Vec<String>,
+        filter: Filter,
     }
+
+    const OWNER: u32 = 1000;
+    const PID1: [(&str, &str); 3] = [("_PID", "1"), ("_UID", "0"), ("_COMM", "systemd")];
 
     impl Fake {
         fn add(&mut self, t_s: u64, fields: &[(&str, &str)]) {
+            self.add_in(BOOT, t_s, fields);
+        }
+
+        fn add_in(&mut self, boot: &str, t_s: u64, fields: &[(&str, &str)]) {
             let mut map: BTreeMap<String, String> =
                 fields.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            map.insert("_BOOT_ID".into(), BOOT.into());
+            map.insert("_BOOT_ID".into(), boot.into());
             map.insert("__CURSOR".into(), format!("c{}", self.entries.len()));
             self.entries.push(Entry {
                 t_us: t_s * S,
@@ -657,11 +769,27 @@ mod tests {
         }
 
         fn restart(&mut self, t_s: u64) {
-            self.add(t_s, &[("MESSAGE_ID", ids::RESTART_SCHEDULED), ("UNIT", "x.service")]);
+            self.add(
+                t_s,
+                &[[("MESSAGE_ID", ids::RESTART_SCHEDULED), ("UNIT", "x.service")].as_slice(), &PID1].concat(),
+            );
+        }
+
+        fn kernel(&mut self, boot: &str, t_s: u64, priority: &str, message: &str) {
+            self.add_in(
+                boot,
+                t_s,
+                &[("_TRANSPORT", "kernel"), ("PRIORITY", priority), ("MESSAGE", message)],
+            );
         }
     }
 
     impl Source for Fake {
+        fn set_filter(&mut self, filter: &Filter) -> Result<()> {
+            self.filter = filter.clone();
+            Ok(())
+        }
+
         fn seek(&mut self, to: Seek) -> Result<()> {
             let at = |p: Option<usize>| p.unwrap_or(self.entries.len());
             self.at = match to {
@@ -674,20 +802,22 @@ mod tests {
         }
 
         fn next(&mut self) -> Result<Option<Entry>> {
-            let e = self.entries.get(self.at).cloned();
-            if e.is_some() {
-                self.at += 1;
-                self.read += 1;
-            }
-            Ok(e)
+            let passes = |e: &Entry| {
+                self.filter.0.iter().all(|group| {
+                    group.is_empty() || group.iter().any(|(f, v)| e.get(f) == Some(v.as_str()))
+                })
+            };
+            let Some(skip) = self.entries[self.at.min(self.entries.len())..].iter().position(passes) else {
+                self.at = self.entries.len();
+                return Ok(None);
+            };
+            self.at += skip + 1;
+            self.read += 1;
+            Ok(Some(self.entries[self.at - 1].clone()))
         }
 
         fn boots(&mut self) -> Result<Vec<Boot>> {
             Ok(self.boots.clone())
-        }
-
-        fn ended_cleanly(&mut self, boot: &str) -> Result<bool> {
-            Ok(self.clean.iter().any(|b| b == boot))
         }
     }
 
@@ -702,7 +832,8 @@ mod tests {
 
     /// One run of the thread's read loop up to the end of the journal, resuming from what the database holds.
     fn run(db: &mut Db, src: &mut Fake, now_s: u64) {
-        let mut rec = Recorder::new(State::from_rows(&db.events_state().unwrap()));
+        let mut rec = Recorder::new(State::from_rows(&db.events_state().unwrap()), OWNER);
+        src.filter = stream_filter();
         src.read = 0;
         rec.start(src, 0).unwrap();
         loop {
@@ -737,10 +868,13 @@ mod tests {
                 ("MESSAGE_ID", ids::UNIT_FAILURE),
                 ("UNIT", "backup.service"),
                 ("UNIT_RESULT", "exit-code"),
+                PID1[0],
+                PID1[1],
+                PID1[2],
             ],
         );
-        src.add(400, &[("MESSAGE_ID", ids::SLEEP_START)]);
-        src.add(500, &[("MESSAGE_ID", ids::SLEEP_STOP)]);
+        src.add(400, &[("MESSAGE_ID", ids::SLEEP_START), ("_UID", "0")]);
+        src.add(500, &[("MESSAGE_ID", ids::SLEEP_STOP), ("_UID", "0")]);
         let dir = tempfile::tempdir().unwrap();
         let mut db = open(&dir);
         run(&mut db, &mut src, 10_000);
@@ -779,17 +913,19 @@ mod tests {
         run(&mut db, &mut src, 3000);
         let rows = rows(&db);
         let kinds: Vec<_> = rows.iter().map(|r| r.1.as_str()).collect();
-        assert_eq!(kinds, ["crash", "restart_loop", "crash"], "one loop, not one per read");
+        assert_eq!(kinds, ["crash", "restart_loop"], "one loop, not one per read; one row per program's crashes");
         let data: Value = serde_json::from_str(&rows[1].4).unwrap();
         assert_eq!(data["n_restarts"], 4, "the row grows with the loop");
         assert_eq!((rows[1].0, rows[1].2.as_str()), (1000, "c1"));
+        let crash: Value = serde_json::from_str(&rows[0].4).unwrap();
+        assert_eq!((rows[0].3.as_str(), &crash["count"]), ("waybar crashed 2 times (SIGSEGV)", &json!(2)));
 
         run(&mut db, &mut src, 4000);
         assert_eq!(
             src.read, 1,
             "nothing open: only the last entry is seen again, and skipped"
         );
-        assert_eq!(self::rows(&db).len(), 3);
+        assert_eq!(self::rows(&db).len(), 2);
     }
 
     #[test]
@@ -827,47 +963,173 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_boot_that_shut_down_ends_clean_and_one_that_lost_power_does_not() {
+    const LINUX: &str = "Linux version 6.9.0 (builder@host) #1 SMP PREEMPT_DYNAMIC";
+
+    /// Six boots, each ended a different way, with noise the filtered reads must not wade through.
+    fn ended_boots() -> Fake {
         let mut src = Fake {
-            boots: vec![boot("a", 100, 200), boot("b", 300, 400), boot("c", 500, 600)],
-            clean: vec!["a".into()],
+            boots: ["a", "b", "c", "d", "e", "f"]
+                .iter()
+                .enumerate()
+                .map(|(i, id)| boot(id, 1000 * i as u64 + 100, 1000 * i as u64 + 900))
+                .collect(),
             ..Fake::default()
         };
+        for (i, id) in ["a", "b", "c", "d", "e", "f"].iter().enumerate() {
+            if *id != "e" {
+                src.kernel(id, 1000 * i as u64 + 100, "5", LINUX);
+            }
+        }
+        for t in 0..500 {
+            src.add_in("b", 1200 + t, &[("MESSAGE", "noise"), ("PRIORITY", "6"), ("_UID", "1000")]);
+        }
+        // a: PID 1 stopping multi-user.target is a shutdown whoever started it, logind or not
+        src.add_in(
+            "a",
+            890,
+            &[[("MESSAGE_ID", ids::UNIT_STOPPED), ("UNIT", "multi-user.target")].as_slice(), &PID1].concat(),
+        );
+        // b: a forged shutdown, and PID 1 stopping some other unit, are not shutdowns; c's journald says why
+        src.add_in("b", 1890, &[("MESSAGE_ID", ids::SHUTDOWN), ("_UID", "1000")]);
+        src.add_in(
+            "b",
+            1895,
+            &[[("MESSAGE_ID", ids::UNIT_STOPPED), ("UNIT", "x.service")].as_slice(), &PID1].concat(),
+        );
+        src.add_in(
+            "c",
+            2110,
+            &[
+                ("SYSLOG_IDENTIFIER", "systemd-journald"),
+                ("PRIORITY", "4"),
+                ("_UID", "0"),
+                (
+                    "MESSAGE",
+                    "File /var/log/journal/0123/system.journal corrupted or uncleanly shut down, renaming and replacing.",
+                ),
+            ],
+        );
+        // c: d's kernel names a thermal trip
+        src.kernel(
+            "d",
+            3101,
+            "6",
+            "x86/amd: Previous system reset reason [0x00000001]: thermal pin BP_THERMTRIP_L was tripped",
+        );
+        // d: its last sleep event is a suspend
+        src.add_in("d", 3800, &[("MESSAGE_ID", ids::SLEEP_START), ("_UID", "0")]);
+        // e: its start was vacuumed away
+        src.add_in("e", 4800, &[("MESSAGE", "late"), ("PRIORITY", "6")]);
+        src.entries.sort_by_key(|e| e.t_us);
+        src
+    }
+
+    #[test]
+    fn each_ended_boot_is_judged_on_its_markers_and_the_next_boots_evidence() {
+        let mut src = ended_boots();
         let mut state = State::default();
         let events = boot_events(&mut src, &mut state, 0, true).unwrap();
-        let got: Vec<_> = events
+        let ends: Vec<_> = events
             .iter()
-            .map(|e| (e.kind.as_str(), e.key.as_str(), e.t, e.data.get("clean").cloned()))
+            .filter(|e| e.kind == "boot_end")
+            .map(|e| (e.key.as_str(), e.summary.as_str(), e.data["clean"].clone(), e.data["certainty"].clone()))
             .collect();
         assert_eq!(
-            got,
+            ends,
             [
-                ("boot", "a", 100, None),
-                ("boot", "b", 300, None),
-                ("boot_end", "a", 200, Some(true.into())),
-                ("boot", "c", 500, None),
-                ("boot_end", "b", 400, Some(false.into())),
+                ("a", "Shut down", json!(true), json!("clean")),
+                ("b", "Ended without shutdown", json!(false), json!("confirmed")),
+                ("c", "Power lost: thermal trip", json!(false), json!("confirmed")),
+                ("d", "Ended while suspended", json!(false), json!("ended_while_suspended")),
             ],
-            "the running boot has not ended"
+            "e's start is gone, so how it ended is unknown and gets no row; f is running"
         );
-        assert!(boot_events(&mut src, &mut state, 0, true).unwrap().is_empty());
-
-        src.boots.push(boot("d", 700, 800));
-        let next = boot_events(&mut src, &mut state, 0, true).unwrap();
-        let got: Vec<_> = next.iter().map(|e| (e.kind.as_str(), e.key.as_str())).collect();
-        assert_eq!(
-            got,
-            [("boot", "d"), ("boot_end", "c")],
-            "decided once the next boot runs"
-        );
+        let c = events.iter().find(|e| e.kind == "boot_end" && e.key == "c").unwrap();
+        assert_eq!((&c.data["reset_reason"], &c.data["suspended"]), (&json!("thermal trip"), &json!(false)));
+        assert_eq!(events.iter().filter(|e| e.kind == "boot").count(), 6);
+        assert!(src.read < 50, "read {} entries: only markers and boot starts, never b's noise", src.read);
+        assert_eq!(src.filter, stream_filter(), "the stream reads on with its own filter");
+        assert!(boot_events(&mut src, &mut state, 0, true).unwrap().is_empty(), "each boot is judged once");
 
         let mut own = State::default();
-        let events = boot_events(&mut src, &mut own, 0, false).unwrap();
+        let events = boot_events(&mut ended_boots(), &mut own, 0, false).unwrap();
         assert!(
             events.iter().all(|e| e.kind == "boot"),
             "without the system journal every boot would look abrupt"
         );
+    }
+
+    #[test]
+    fn a_unit_failure_forged_by_another_user_writes_no_event() {
+        let mut src = Fake::default();
+        let failure = |uid| {
+            [
+                ("MESSAGE_ID", ids::UNIT_FAILURE),
+                ("UNIT", "backup.service"),
+                ("UNIT_RESULT", "exit-code"),
+                ("_PID", "4242"),
+                ("_COMM", "systemd"),
+                ("_UID", uid),
+            ]
+        };
+        src.add(100, &failure("1001"));
+        src.add(200, &[("MESSAGE_ID", ids::SLEEP_START), ("_UID", "1001")]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        run(&mut db, &mut src, 10_000);
+        assert!(rows(&db).is_empty(), "another user can log any MESSAGE_ID and UNIT");
+
+        src.add(300, &failure("1000"));
+        run(&mut db, &mut src, 10_000);
+        let kinds: Vec<_> = rows(&db).into_iter().map(|r| r.1).collect();
+        assert_eq!(kinds, ["unit_failed"], "the owner's own user manager is believed");
+    }
+
+    #[test]
+    fn a_kernel_segfault_at_info_priority_reaches_the_detector_and_debug_lines_are_not_read() {
+        let mut src = Fake::default();
+        src.kernel(
+            BOOT,
+            100,
+            "6",
+            "Hyprland[4242]: segfault at 0 ip 00007fef17a2d5e1 sp 00007fffd7cfb4e0 error 4 in libfoo.so.0[bc5e1,7fef1799c000+e3000]",
+        );
+        for t in 0..20 {
+            src.kernel(BOOT, 110 + t, "7", "debug chatter");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        run(&mut db, &mut src, 10_000);
+        let rows = rows(&db);
+        assert_eq!(rows.len(), 1, "with no core dump the kernel's line is the only sign of the crash");
+        let data: Value = serde_json::from_str(&rows[0].4).unwrap();
+        assert_eq!((rows[0].3.as_str(), &data["source"]), ("Hyprland crashed (SIGSEGV)", &json!("kernel")));
+        assert_eq!(src.read, 1, "debug lines are filtered out by the journal, not read");
+    }
+
+    #[test]
+    fn a_crash_loop_is_one_row_whose_count_grows_and_a_reread_does_not_count_twice() {
+        let mut src = Fake::default();
+        for t in 0..10 {
+            src.crash(100 + 40 * t, "Hyprland");
+        }
+        src.crash(600, "waybar");
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        run(&mut db, &mut src, 10_000);
+        let first = rows(&db);
+        let got: Vec<_> = first.iter().map(|r| (r.0, r.3.as_str())).collect();
+        assert_eq!(got, [(100, "Hyprland crashed 10 times (SIGSEGV)"), (600, "waybar crashed (SIGSEGV)")]);
+
+        db.write(&json!({"type": "events", "t": 1.0, "events": [], "state": State::default().rows()}))
+            .unwrap();
+        run(&mut db, &mut src, 10_000);
+        assert_eq!(rows(&db), first, "crashes read again are not new crashes");
+
+        src.crash(2000, "Hyprland");
+        run(&mut db, &mut src, 10_000);
+        let data: Value = serde_json::from_str(&rows(&db)[0].4).unwrap();
+        assert_eq!(data["count"], 11);
     }
 
     #[test]
