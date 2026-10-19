@@ -104,6 +104,8 @@ pub const INDEX_FIELDS: &[&str] = &[
     "SYSLOG_IDENTIFIER",
     "SYSLOG_FACILITY",
     "_COMM",
+    "_PID",
+    "_UID",
     "COREDUMP_PID",
     "COREDUMP_COMM",
     "COREDUMP_SIGNAL_NAME",
@@ -115,6 +117,7 @@ pub mod ids {
     pub const OOMD_KILL: &str = "d989611b15e44c9dbf31e3c81256e4ed";
     pub const UNIT_OOM: &str = "fe6faa94e7774663a0da52717891d8ef";
     pub const UNIT_FAILURE: &str = "d9b373ed55a64feb8242e02dbe79a49c";
+    pub const UNIT_STOPPED: &str = "9d1aaa27d60140bd96365438aad20286";
     pub const RESTART_SCHEDULED: &str = "5eb03494b6584870a536b337290809b3";
     pub const SHUTDOWN: &str = "98268866d1d54a499c4e98921d93bc40";
     pub const JOURNAL_STOPPED: &str = "d93fb3c9c24d451a97cea615ce59c00b";
