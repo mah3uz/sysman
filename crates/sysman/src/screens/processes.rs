@@ -18,7 +18,7 @@ use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{Icon, Sizable, Size, WindowExt};
+use gpui_component::{Disableable, Icon, Sizable, Size, WindowExt};
 use gpui_kit_assets::IconName;
 use schema::Sample;
 use schema::cpu::CpuMeta;
@@ -692,7 +692,7 @@ impl TableDelegate for ProcessTable {
     fn render_tr(&mut self, row_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> Stateful<Div> {
         let row_key = self.model.process(row_ix).map(key);
         let selected = row_key.is_some() && row_key == self.model.selected;
-        let tint = theme(cx).selection;
+        let tint = theme(cx).row_selected;
         div()
             .id(("row", row_ix))
             .when(selected, |d| d.bg(tint))
@@ -1739,7 +1739,7 @@ impl Processes {
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let hierarchy = self.delegate(cx).model.hierarchy;
-        let collapsed = self.panel.collapsed;
+        let (selected, open) = (self.inspected.is_some(), self.inspector_open());
         let this = cx.entity().downgrade();
         let search = self.search.as_ref().map(|search| {
             div()
@@ -1815,16 +1815,17 @@ impl Processes {
             .child(
                 button("inspector-toggle")
                     .w(CONTROL_HEIGHT)
-                    .icon(Icon::new(if collapsed {
-                        IconName::PanelRightOpen
-                    } else {
+                    .icon(Icon::new(if open {
                         IconName::PanelRightClose
-                    }))
-                    .when(!collapsed, |b| b.bg(t.strip_active).border_color(t.strip_border))
-                    .tooltip(if collapsed {
-                        "Show details of the selected process"
                     } else {
-                        "Hide details"
+                        IconName::PanelRightOpen
+                    }))
+                    .when(open, |b| b.bg(t.strip_active).border_color(t.strip_border))
+                    .disabled(!selected)
+                    .tooltip(match (open, selected) {
+                        (true, _) => "Hide details",
+                        (false, true) => "Show details of the selected process",
+                        (false, false) => "Select a process to see its details",
                     })
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx))),
             )

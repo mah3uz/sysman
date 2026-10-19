@@ -122,6 +122,8 @@ pub struct Theme {
     pub hairline_width: Pixels,
     pub tooltip: Hsla,
     pub selection: Hsla,
+    /// A selected table row, tinted so it stands apart from the zebra and hover washes.
+    pub row_selected: Hsla,
     /// The title bar's tab strip and its raised active segment.
     pub strip: Hsla,
     pub strip_border: Hsla,
@@ -240,6 +242,7 @@ impl Theme {
             hairline_width: px(0.5),
             tooltip: rgb(0x2D2F3B).into(),
             selection: white(0.13),
+            row_selected: Hsla::from(rgb(0x0A84FF)).opacity(0.28),
             strip: white(0.06),
             strip_border: white(0.10),
             strip_active: white(0.14),
@@ -300,6 +303,7 @@ impl Theme {
             hairline: black(0.10),
             tooltip: rgb(0xFFFFFF).into(),
             selection: black(0.08),
+            row_selected: Hsla::from(rgb(0x0A6CF0)).opacity(0.16),
             strip: black(0.05),
             strip_border: black(0.06),
             strip_active: rgb(0xFFFFFF).into(),
@@ -372,8 +376,8 @@ pub fn install(appearance: Appearance, size: TextSize, cx: &mut App) {
         table_head = clear,
         table_row_border = clear,
         table_even = theme.wash.opacity(0.03),
-        table_hover = theme.wash.opacity(0.05),
-        table_active = theme.selection,
+        table_hover = theme.wash.opacity(0.08),
+        table_active = theme.row_selected,
         // the default dialog backdrop is too faint to read as dimmed
         overlay = theme.scrim
     );
@@ -597,6 +601,7 @@ mod tests {
                 t.hairline,
                 t.tooltip,
                 t.selection,
+                t.row_selected,
                 t.strip,
                 t.strip_border,
                 t.strip_active,
