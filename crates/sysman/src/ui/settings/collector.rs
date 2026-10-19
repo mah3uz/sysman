@@ -419,6 +419,14 @@ impl CollectorForm {
                 window,
                 cx,
             ),
+            self.number(
+                "Events (days)",
+                p("retention", "events_days"),
+                r.events_days.into(),
+                1,
+                window,
+                cx,
+            ),
         ];
         vec![
             group_title("Sampling", cx).into_any_element(),
@@ -432,7 +440,8 @@ impl CollectorForm {
             group_title("History", cx).into_any_element(),
             group(retention, cx).into_any_element(),
             footnote(
-                "How long each resolution is kept before it is pruned. Longer keeps more history on disk.",
+                "How long each resolution, and the events (crashes, OOM kills, failed units, boots), is kept before it is \
+                 pruned. Longer keeps more history on disk.",
                 cx,
             )
             .into_any_element(),

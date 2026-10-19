@@ -443,6 +443,7 @@ mod tests {
             count,
             entries: vec![],
             boot_id: String::new(),
+            cursor: None,
             data: Default::default(),
         }
     }
