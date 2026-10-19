@@ -1,6 +1,6 @@
 use gpui::{
-    AnyElement, Context, Div, ElementId, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
-    Styled, div, prelude::FluentBuilder, px,
+    AnyElement, Context, Div, ElementId, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
 use gpui_component::Sizable;
 use gpui_component::input::Textarea;
@@ -80,14 +80,19 @@ impl Logs {
                     .font_weight(t.weight_semibold)
                     .child(priority_label(priority)),
             )
-            .child(div().min_w_0().truncate().text_color(t.text_secondary).child(format!("· {from}")))
-            .child(div().flex_1())
             .child(
                 div()
-                    .flex_shrink_0()
+                    .min_w_0()
+                    .truncate()
                     .text_color(t.text_secondary)
-                    .child(model::clock(t_us, "%b %-d %H:%M:%S%.3f", &self.tz)),
-            );
+                    .child(format!("· {from}")),
+            )
+            .child(div().flex_1())
+            .child(div().flex_shrink_0().text_color(t.text_secondary).child(model::clock(
+                t_us,
+                "%b %-d %H:%M:%S%.3f",
+                &self.tz,
+            )));
         let message = match (inspected, &self.message) {
             (Some(_), Some(state)) => div()
                 .font_family(t.mono.clone())
@@ -126,7 +131,13 @@ impl Logs {
     /// The entries just before and after, unfiltered, with this one in its place.
     fn around(&self, i: &Inspected, t: &Theme) -> impl IntoElement + use<> {
         let line = |id: ElementId, e: &Entry, me: bool| {
-            let message: String = model::plain(e.message()).lines().next().unwrap_or("").chars().take(200).collect();
+            let message: String = model::plain(e.message())
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(200)
+                .collect();
             div()
                 .id(id)
                 .flex()
@@ -152,7 +163,11 @@ impl Logs {
                         .min_w_0()
                         .truncate()
                         .font_family(t.mono.clone())
-                        .text_color(if e.priority() >= 6 && !me { t.text.opacity(0.72) } else { t.text })
+                        .text_color(if e.priority() >= 6 && !me {
+                            t.text.opacity(0.72)
+                        } else {
+                            t.text
+                        })
                         .child(message),
                 )
                 .tooltip({
@@ -167,9 +182,21 @@ impl Logs {
             .flex_col()
             .gap(px(1.))
             .child(div().pb(rem_px(4.)).child(heading("Around this entry", t)))
-            .children(i.around.before.iter().enumerate().map(|(n, e)| line(("before", n).into(), e, false)))
+            .children(
+                i.around
+                    .before
+                    .iter()
+                    .enumerate()
+                    .map(|(n, e)| line(("before", n).into(), e, false)),
+            )
             .children(me.map(|e| line("this".into(), e, true)))
-            .children(i.around.after.iter().enumerate().map(|(n, e)| line(("after", n).into(), e, false)))
+            .children(
+                i.around
+                    .after
+                    .iter()
+                    .enumerate()
+                    .map(|(n, e)| line(("after", n).into(), e, false)),
+            )
     }
 }
 
@@ -193,6 +220,12 @@ fn fields(e: &Entry, t: &Theme) -> impl IntoElement + use<> {
                         .truncate()
                         .text_color(t.text_secondary),
                 )
-                .child(mono(v.clone(), t).text_size(t.small_caption).flex_1().min_w_0().truncate())
+                .child(
+                    mono(v.clone(), t)
+                        .text_size(t.small_caption)
+                        .flex_1()
+                        .min_w_0()
+                        .truncate(),
+                )
         }))
 }

@@ -41,7 +41,13 @@ fn group(title: &'static str, t: &Theme) -> impl IntoElement + use<> {
         .child(title.to_uppercase())
 }
 
-fn item(id: impl Into<SharedString>, icon: IconName, label: SharedString, selected: bool, t: &Theme) -> gpui::Stateful<gpui::Div> {
+fn item(
+    id: impl Into<SharedString>,
+    icon: IconName,
+    label: SharedString,
+    selected: bool,
+    t: &Theme,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(gpui::ElementId::Name(id.into()))
         .flex_shrink_0()
@@ -118,7 +124,11 @@ impl Logs {
                 .child("Reading boots…")
                 .into_any_element();
         }
-        let shown = if self.boots_all { boots.len() } else { boots.len().min(RECENT_BOOTS) };
+        let shown = if self.boots_all {
+            boots.len()
+        } else {
+            boots.len().min(RECENT_BOOTS)
+        };
         let oldest_shown = boots.len() - shown;
         let mut rows: Vec<AnyElement> = vec![];
         for i in (oldest_shown..boots.len()).rev() {
@@ -166,7 +176,12 @@ impl Logs {
                     cx.notify();
                 }))
         });
-        div().flex().flex_col().child(column).children(toggle).into_any_element()
+        div()
+            .flex()
+            .flex_col()
+            .child(column)
+            .children(toggle)
+            .into_any_element()
     }
 
     fn boot(&self, i: usize, cx: &Context<Self>) -> impl IntoElement {
@@ -186,15 +201,31 @@ impl Logs {
         };
         let hms = |us| model::clock(us, "%H:%M:%S", &self.tz);
         let end = if b.current { "now".to_string() } else { hms(b.last_us) };
-        let last = if b.current { crate::data::logs::now_us() } else { b.last_us };
+        let last = if b.current {
+            crate::data::logs::now_us()
+        } else {
+            b.last_us
+        };
+        // the summaries also mark the running boot as covered when a past boot is scanned, though its findings
+        // were never read, so only boots inside the scope get an ending and a tally
+        let in_scope = match &self.span {
+            Span::Boot(id) => *id == b.id,
+            Span::ThisBoot => b.current,
+            Span::Last(_) => b.last_us >= self.view.range.0,
+        };
         let (state, state_colour) = match b.end {
+            _ if !in_scope => (None, t.text_secondary),
             BootEnd::Running => (Some("Running"), t.text_secondary),
             BootEnd::Clean => (Some("Clean shutdown"), t.text_secondary),
             BootEnd::Abrupt => (Some("Ended without shutdown"), t.red),
             BootEnd::Unknown => (None, t.text_secondary),
         };
-        let tally = tally(b);
-        let target = if b.current { Span::ThisBoot } else { Span::Boot(b.id.clone()) };
+        let tally = in_scope.then(|| tally(b)).flatten();
+        let target = if b.current {
+            Span::ThisBoot
+        } else {
+            Span::Boot(b.id.clone())
+        };
         div()
             .id(("logs-boot", i))
             .flex()
@@ -204,7 +235,9 @@ impl Logs {
             .py(rem_px(6.))
             .rounded(t.sub_radius)
             .cursor_pointer()
-            .when(abrupt, |d| d.bg(t.red.opacity(0.07)).border_1().border_color(t.red.opacity(0.25)))
+            .when(abrupt, |d| {
+                d.bg(t.red.opacity(0.07)).border_1().border_color(t.red.opacity(0.25))
+            })
             .when(selected && !abrupt, |d| d.bg(t.selection))
             .when(selected && abrupt, |d| d.bg(t.red.opacity(0.14)))
             .when(!selected, |d| d.hover(|d| d.bg(t.card)))
@@ -251,13 +284,11 @@ impl Logs {
                             .child(div().flex_1())
                             .child(model::clock(b.first_us, "%b %-d", &self.tz)),
                     )
-                    .child(
-                        div().truncate().child(format!(
-                            "{} → {end} · {}",
-                            hms(b.first_us),
-                            model::span(last.saturating_sub(b.first_us))
-                        )),
-                    )
+                    .child(div().truncate().child(format!(
+                        "{} → {end} · {}",
+                        hms(b.first_us),
+                        model::span(last.saturating_sub(b.first_us))
+                    )))
                     .children(state.map(|s| {
                         div()
                             .text_color(state_colour)
@@ -325,23 +356,29 @@ impl Logs {
             None => {
                 let can = !self.text.trim().is_empty();
                 out.push(
-                    item("logs-save-current", IconName::Plus, "Save current search".into(), false, t)
-                        .text_color(if can { t.text_secondary } else { t.text_tertiary })
-                        .when(!can, |d| d.cursor_default().opacity(0.6))
-                        .tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(if can {
-                                "Keep what the search field holds, under a name"
-                            } else {
-                                "Type a search first"
-                            })
-                            .build(window, cx)
+                    item(
+                        "logs-save-current",
+                        IconName::Plus,
+                        "Save current search".into(),
+                        false,
+                        t,
+                    )
+                    .text_color(if can { t.text_secondary } else { t.text_tertiary })
+                    .when(!can, |d| d.cursor_default().opacity(0.6))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(if can {
+                            "Keep what the search field holds, under a name"
+                        } else {
+                            "Type a search first"
                         })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if can {
-                                this.start_naming(window, cx);
-                            }
-                        }))
-                        .into_any_element(),
+                        .build(window, cx)
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if can {
+                            this.start_naming(window, cx);
+                        }
+                    }))
+                    .into_any_element(),
                 );
             }
         }
@@ -416,12 +453,11 @@ fn gap_row(older: &BootSummary, newer: &BootSummary, t: &Theme) -> impl IntoElem
         .px(rem_px(8.))
         .py(px(1.))
         .child(
-            div()
-                .w(rem_px(RAIL))
-                .flex_shrink_0()
-                .flex()
-                .justify_center()
-                .child(Icon::new(if lost { IconName::Zap } else { IconName::Pause }).xsmall().text_color(colour)),
+            div().w(rem_px(RAIL)).flex_shrink_0().flex().justify_center().child(
+                Icon::new(if lost { IconName::Zap } else { IconName::Pause })
+                    .xsmall()
+                    .text_color(colour),
+            ),
         )
         .child(
             div()

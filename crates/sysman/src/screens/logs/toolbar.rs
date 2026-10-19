@@ -82,7 +82,8 @@ impl Logs {
             {
                 let this = cx.entity().downgrade();
                 move |level, _, cx| {
-                    this.update(cx, |this, cx| this.set_controls(|c| c.level = level, cx)).ok();
+                    this.update(cx, |this, cx| this.set_controls(|c| c.level = level, cx))
+                        .ok();
                 }
             },
             cx,
@@ -183,10 +184,11 @@ impl Logs {
             .child(Icon::new(IconName::Search).small().text_color(t.text_secondary))
             .children(finding)
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .children(self.input.as_ref().map(|s| Input::new(s).appearance(false).small().cleanable(true))),
+                div().flex_1().min_w_0().children(
+                    self.input
+                        .as_ref()
+                        .map(|s| Input::new(s).appearance(false).small().cleanable(true)),
+                ),
             )
     }
 
@@ -274,7 +276,11 @@ impl Logs {
         };
         let tallies = self.view.tallies.iter().take(5).map(|&(kind, n)| {
             let colour = severity_colour(kind.severity(), t);
-            let colour = if kind == FindingKind::PackageChange { t.text_tertiary } else { colour };
+            let colour = if kind == FindingKind::PackageChange {
+                t.text_tertiary
+            } else {
+                colour
+            };
             rule(colour, model::tally_label(kind, n))
         });
         let backend = match (self.scan.backend(), self.status.and_then(|s| s.backend)) {

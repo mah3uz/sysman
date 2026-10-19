@@ -15,6 +15,8 @@ use crate::data::logs::{BootEnd, BootSummary};
 use crate::ui::theme::{Theme, rem_px, theme};
 
 const ROW: f32 = 22.;
+
+type Action = Box<dyn Fn(&mut Logs, &mut Context<Logs>)>;
 const TIME_WIDTH: f32 = 56.;
 const DATED_TIME_WIDTH: f32 = 96.;
 const SOURCE_WIDTH: f32 = 120.;
@@ -51,7 +53,10 @@ pub(super) fn priority_mark(p: u8, t: &Theme) -> Div {
 }
 
 pub(super) fn mono(text: impl Into<SharedString>, t: &Theme) -> Div {
-    div().font_family(t.mono.clone()).text_size(rem_px(11.)).child(text.into())
+    div()
+        .font_family(t.mono.clone())
+        .text_size(rem_px(11.))
+        .child(text.into())
 }
 
 /// What one list row needs from the index, read while its lock is held only briefly.
@@ -71,14 +76,23 @@ impl Logs {
                 IconName::TriangleAlert,
                 "The journal could not be read".into(),
                 e.to_string(),
-                Some(("Try again", Box::new(|this: &mut Self, cx: &mut Context<Self>| this.retry(cx)))),
+                Some((
+                    "Try again",
+                    Box::new(|this: &mut Self, cx: &mut Context<Self>| this.retry(cx)),
+                )),
                 cx,
             );
         }
         let items = self.view.items.clone();
         if items.is_empty() {
             if !self.view.key.settled {
-                return self.empty(IconName::FileText, "Reading the journal…".into(), String::new(), None, cx);
+                return self.empty(
+                    IconName::FileText,
+                    "Reading the journal…".into(),
+                    String::new(),
+                    None,
+                    cx,
+                );
             }
             let filtered = !self.query.is_empty();
             return self.empty(
@@ -96,8 +110,7 @@ impl Logs {
                 filtered.then(|| {
                     (
                         "Clear filters",
-                        Box::new(|this: &mut Self, cx: &mut Context<Self>| this.clear_filters(cx))
-                            as Box<dyn Fn(&mut Self, &mut Context<Self>)>,
+                        Box::new(|this: &mut Self, cx: &mut Context<Self>| this.clear_filters(cx)) as Action,
                     )
                 }),
                 cx,
@@ -219,7 +232,11 @@ impl Logs {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_color(if line.priority >= 6 { t.text.opacity(0.72) } else { t.text }),
+                    .text_color(if line.priority >= 6 {
+                        t.text.opacity(0.72)
+                    } else {
+                        t.text
+                    }),
                 None => div()
                     .flex_1()
                     .min_w_0()
@@ -283,7 +300,7 @@ impl Logs {
         icon: IconName,
         title: String,
         detail: String,
-        action: Option<(&'static str, Box<dyn Fn(&mut Self, &mut Context<Self>)>)>,
+        action: Option<(&'static str, Action)>,
         cx: &Context<Self>,
     ) -> AnyElement {
         let t = theme(cx);
@@ -297,7 +314,12 @@ impl Logs {
             .gap(rem_px(8.))
             .px(rem_px(24.))
             .child(Icon::new(icon).size_6().text_color(t.text_tertiary))
-            .child(div().text_size(t.panel_title).font_weight(t.weight_semibold).child(title))
+            .child(
+                div()
+                    .text_size(t.panel_title)
+                    .font_weight(t.weight_semibold)
+                    .child(title),
+            )
             .when(!detail.is_empty(), |d| {
                 d.child(
                     div()

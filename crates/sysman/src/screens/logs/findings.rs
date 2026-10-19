@@ -40,9 +40,15 @@ impl Logs {
         let cards = &self.view.cards;
         let width = window.viewport_size().width - self.left.read(cx).width() - self.right.read(cx).width();
         let rem = f32::from(window.rem_size()) / 16.;
-        let cols = ((f32::from(width) - 28.) / (CARD_MIN_WIDTH * rem)).floor().clamp(1., 4.) as usize;
+        let cols = ((f32::from(width) - 28.) / (CARD_MIN_WIDTH * rem))
+            .floor()
+            .clamp(1., 4.) as usize;
         let fits = cols * ROWS;
-        let shown = if self.findings_all { cards.len() } else { cards.len().min(fits) };
+        let shown = if self.findings_all {
+            cards.len()
+        } else {
+            cards.len().min(fits)
+        };
         let collapsed = self.findings_collapsed;
         let caption = match cards.len() {
             0 => format!("Nothing stands out in {}", self.scope_name()),
@@ -128,7 +134,11 @@ impl Logs {
                             }
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let next = if this.controls.finding == Some(index) { None } else { Some(index) };
+                            let next = if this.controls.finding == Some(index) {
+                                None
+                            } else {
+                                Some(index)
+                            };
                             this.set_finding(next, cx);
                         }))
                         .child(

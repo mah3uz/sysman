@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use gpui::{
-    AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, UniformListScrollHandle, Window, div,
+    AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Styled, UniformListScrollHandle, Window,
+    div,
 };
 use gpui_component::input::{InputEvent, InputState, TextareaState};
 use jiff::tz::TimeZone;
@@ -246,9 +247,18 @@ impl Logs {
             }
         }
         if let Some(back) = var("BOOT").and_then(|b| b.trim_start_matches('-').parse::<usize>().ok()) {
-            let boots = journal::reader::Journal::open().and_then(|mut j| j.boots()).unwrap_or_default();
+            let boots = journal::reader::Journal::open()
+                .and_then(|mut j| j.boots())
+                .unwrap_or_default();
             if let Some(b) = boots.len().checked_sub(back + 1).and_then(|i| boots.get(i)) {
-                self.set_span(if back == 0 { Span::ThisBoot } else { Span::Boot(b.id.clone()) }, cx);
+                self.set_span(
+                    if back == 0 {
+                        Span::ThisBoot
+                    } else {
+                        Span::Boot(b.id.clone())
+                    },
+                    cx,
+                );
             }
         }
         if let Some(text) = var("QUERY") {
@@ -285,7 +295,10 @@ impl Logs {
             Ok(back) => rows.len().checked_sub(back + 1).map(|i| rows[i]),
             Err(_) => {
                 let index = self.scan.index();
-                rows.iter().rev().copied().find(|&r| index.row(r).is_some_and(|r| r.priority <= 3))
+                rows.iter()
+                    .rev()
+                    .copied()
+                    .find(|&r| index.row(r).is_some_and(|r| r.priority <= 3))
             }
         };
         if let Some(row) = row {
@@ -423,7 +436,10 @@ impl Logs {
         self.query = self.controls.apply(self.parsed.clone());
         self.search = self.logs.search(&self.query);
         let boots = std::mem::take(&mut self.view.boots);
-        self.view = View { boots, ..View::default() };
+        self.view = View {
+            boots,
+            ..View::default()
+        };
         self.stick = true;
         self.recompute(cx);
         self.watch(cx);
@@ -501,7 +517,12 @@ impl Logs {
         let at_end = self.list.is_scrolled_to_end().unwrap_or(true);
         let fresh_query = view.key.query != self.view.key.query;
         self.view = view;
-        if self.controls.finding.is_some_and(|f| !self.view.cards.iter().any(|c| c.index == f)) && self.view.scanned {
+        if self
+            .controls
+            .finding
+            .is_some_and(|f| !self.view.cards.iter().any(|c| c.index == f))
+            && self.view.scanned
+        {
             self.set_finding(None, cx);
         }
         match self.selected {
@@ -762,7 +783,11 @@ fn compute(scan: &Scan, search: Option<&Search>, q: &Query, span: &Span, from_us
     }
 }
 
-fn with_fetcher<T>(scan: Arc<Scan>, fetcher: &Mutex<Option<Fetcher>>, f: impl FnOnce(&mut Fetcher) -> T) -> anyhow::Result<T> {
+fn with_fetcher<T>(
+    scan: Arc<Scan>,
+    fetcher: &Mutex<Option<Fetcher>>,
+    f: impl FnOnce(&mut Fetcher) -> T,
+) -> anyhow::Result<T> {
     let mut slot = fetcher.lock().unwrap_or_else(PoisonError::into_inner);
     if slot.is_none() {
         *slot = Some(Fetcher::new(scan)?);
@@ -774,10 +799,19 @@ fn read_lines(scan: Arc<Scan>, fetcher: &Mutex<Option<Fetcher>>, rows: &[u32]) -
     let packages: Vec<(u32, String)> = {
         let index = scan.index();
         rows.iter()
-            .filter_map(|&r| index.row(r).and_then(|row| index.transaction(row)).map(|t| (r, model::transaction_line(t))))
+            .filter_map(|&r| {
+                index
+                    .row(r)
+                    .and_then(|row| index.transaction(row))
+                    .map(|t| (r, model::transaction_line(t)))
+            })
             .collect()
     };
-    let journal: Vec<u32> = rows.iter().copied().filter(|r| !packages.iter().any(|(p, _)| p == r)).collect();
+    let journal: Vec<u32> = rows
+        .iter()
+        .copied()
+        .filter(|r| !packages.iter().any(|(p, _)| p == r))
+        .collect();
     let mut out: Vec<(u32, SharedString)> = packages.into_iter().map(|(r, s)| (r, s.into())).collect();
     let read = with_fetcher(scan, fetcher, |f| {
         journal
@@ -794,7 +828,11 @@ fn read_lines(scan: Arc<Scan>, fetcher: &Mutex<Option<Fetcher>>, rows: &[u32]) -
     });
     match read {
         Ok(lines) => out.extend(lines),
-        Err(e) => out.extend(journal.iter().map(|&r| (r, format!("(could not open the journal: {e})").into()))),
+        Err(e) => out.extend(
+            journal
+                .iter()
+                .map(|&r| (r, format!("(could not open the journal: {e})").into())),
+        ),
     }
     out
 }
@@ -824,7 +862,9 @@ fn read_entry(scan: Arc<Scan>, fetcher: &Mutex<Option<Fetcher>>, row: u32) -> In
     if out.transaction.is_some() {
         return out;
     }
-    let read = with_fetcher(scan, fetcher, |f| -> anyhow::Result<_> { Ok((f.entry(row)?, f.around(row, AROUND)?)) });
+    let read = with_fetcher(scan, fetcher, |f| -> anyhow::Result<_> {
+        Ok((f.entry(row)?, f.around(row, AROUND)?))
+    });
     match read.and_then(|r| r) {
         Ok((entry, around)) => {
             out.entry = entry;

@@ -121,7 +121,10 @@ pub fn items(rows: &[Visible], boot_of: impl Fn(u32) -> Option<usize>, finished:
 
 /// "Current boot", "Boot −1", … counted back from the running boot. `boots` is oldest first.
 pub fn boot_label(i: usize, boots: &[BootSummary]) -> String {
-    let current = boots.iter().position(|b| b.current).unwrap_or(boots.len().saturating_sub(1));
+    let current = boots
+        .iter()
+        .position(|b| b.current)
+        .unwrap_or(boots.len().saturating_sub(1));
     match current.checked_sub(i) {
         Some(0) if boots.get(i).is_some_and(|b| b.current) => "Current boot".into(),
         Some(n) => format!("Boot −{n}"),
@@ -141,11 +144,7 @@ pub fn off_time(older: &BootSummary, newer: &BootSummary) -> String {
 /// A duration in microseconds, in seconds while under two minutes.
 pub fn span(us: u64) -> String {
     let s = us / 1_000_000;
-    if s < 120 {
-        format!("{s} s")
-    } else {
-        format::duration(s)
-    }
+    if s < 120 { format!("{s} s") } else { format::duration(s) }
 }
 
 /// Indexes into `findings`, most severe first and the latest first within a severity.
@@ -367,7 +366,11 @@ mod tests {
         };
         let q = controls.apply(typed);
         assert_eq!(q.max_priority, Some(3), "prio:err stays stricter than Warning+");
-        assert_eq!((q.since_us, q.until_us), (Some(100), Some(200)), "the slice intersects since:");
+        assert_eq!(
+            (q.since_us, q.until_us),
+            (Some(100), Some(200)),
+            "the slice intersects since:"
+        );
         let q = Controls {
             level: Level::Notice,
             ..Controls::default()
@@ -380,10 +383,10 @@ mod tests {
     fn a_finished_boot_gets_one_divider_after_its_last_row_and_the_running_one_none() {
         // rows 0-1 in boot 0 (finished), 2-3 in boot 1 (running), then a package row filed under boot 0
         let rows = [row(0), row(1), row(2), row(3), row(4)];
-        let boot_of = |r: u32| Some(if r >= 2 && r < 4 { 1 } else { 0 });
-        let items = items(&rows, boot_of, |b| b == 0);
+        let boot_of = |r: u32| Some(if (2..4).contains(&r) { 1 } else { 0 });
+        let shown = items(&rows, boot_of, |b| b == 0);
         assert_eq!(
-            items,
+            shown,
             vec![
                 Item::Entry(row(0)),
                 Item::Entry(row(1)),
@@ -394,7 +397,11 @@ mod tests {
             ]
         );
         let past = items(&[row(7), row(8)], |_| Some(0), |_| true);
-        assert_eq!(past.last(), Some(&Item::BootEnd(0)), "a past boot read alone still says how it ended");
+        assert_eq!(
+            past.last(),
+            Some(&Item::BootEnd(0)),
+            "a past boot read alone still says how it ended"
+        );
     }
 
     #[test]

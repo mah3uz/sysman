@@ -112,11 +112,20 @@ impl Logs {
             let mut s = if self.query.is_empty() {
                 format!("{} entries in {}", thousands(shown), self.scope_name())
             } else {
-                format!("{} of {} entries in {}", thousands(shown), thousands(total), self.scope_name())
+                format!(
+                    "{} of {} entries in {}",
+                    thousands(shown),
+                    thousands(total),
+                    self.scope_name()
+                )
             };
             let (from, to) = self.view.range;
             if to > from {
-                let pattern = if model::same_day(from, to, &self.tz) { "%H:%M:%S" } else { "%b %-d %H:%M" };
+                let pattern = if model::same_day(from, to, &self.tz) {
+                    "%H:%M:%S"
+                } else {
+                    "%b %-d %H:%M"
+                };
                 s.push_str(&format!(
                     " · {} – {}",
                     model::clock(from, pattern, &self.tz),
