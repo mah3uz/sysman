@@ -64,8 +64,8 @@ crates/sysman/src/
 
 ## 4. Visual tokens
 
-Dark only for now; every token lives in `ui/theme.rs`, so a light theme is
-another constructor.
+Dark and light, with System following the desktop; every token lives in
+`ui/theme.rs`. The table gives the dark values.
 
 | Token | Dark |
 | --- | --- |
@@ -341,19 +341,10 @@ slowdowns.
 1. Shell, theme, data layer, `TrendChart`, Dashboard. Done.
 2. Processes (table, inspector, actions). Done.
 3. GPU, Network, Disk. Done.
-4. Energy, Hardware.
-5. Explorer, Insights, Groups.
-6. Disk Map.
+4. Energy, Hardware. Done.
+5. Explorer, Insights, Groups. Done.
+6. Disk Map. Done.
+7. Logs and event markers on charts. Done.
 
 Each milestone ends with the screen running against the real daemon and
 checked by screenshot.
-
-## 9. Collector changes the app needs
-
-- Events (DESIGN.md, "Logs and events"): Dashboard and Explorer charts mark
-  crashes, OOM kills, failed units, boot starts and ends, and package
-  changes from the `events` table — a thin rule with a small glyph at the
-  top, a tooltip with the event's summary, and a click that opens Logs at
-  that time.
-
-- `power`: add `energy_full_design` / `charge_full_design` (battery health).

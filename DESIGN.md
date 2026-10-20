@@ -19,7 +19,6 @@ GPUI app (`sysman`) that shows them live and as history.
 | Verification | This machine for AMD CPU, NVIDIA and amdgpu. Fixtures built from kernel docs for the rest, marked unverified on hardware. |
 | Sensors | Super I/O chips (nct67xx) read every 10 s, everything else every 2 s. |
 | App design | `docs/APP-DESIGN.md`. v1 has every screen, Disk Map included. |
-| Menu bar | A DankMaterialShell bar widget reading the socket, after the app's v1. |
 | Alerts | Evaluated in `sysmand` (so they fire with the app closed), freedesktop notifications; after the app's core screens. |
 
 ## Non-negotiables
@@ -34,12 +33,14 @@ GPUI app (`sysman`) that shows them live and as history.
 ```
 Cargo.toml                 workspace
 crates/schema              record types (serde), shared by daemon and app
+crates/config              config.toml types, paths, and comment-preserving edits, shared by daemon and app
 crates/journal             systemd journal reader, log categories and findings, package history parsers
 crates/sysmand             daemon: config, collectors, scheduler, JSONL, SQLite, socket
 crates/sysman-helper       optional privileged helper: RAPL, /proc I/O, SMART, eBPF network
-crates/sysman              GPUI app (not started)
+crates/sysman              GPUI app
 dist/sysmand.service       systemd user unit
 dist/sysman-helper.service systemd system unit for the helper (not enabled)
+dist/arch, dist/deb        Arch and Debian packaging; dist/install.sh for other distributions
 ```
 
 | What | Path |
@@ -402,9 +403,9 @@ daemon at startup with a message naming them.
 ## Status and next steps
 
 1. ~~Collector: core, modules, SQLite, socket, per-process history.~~ Done.
-2. The app (`docs/APP-DESIGN.md`): Dashboard, Processes, GPU, Network and Disk
-   done; Energy, Hardware, Explorer, Insights, Groups and Disk Map to come.
-3. Alerts in `sysmand`; DMS bar widget.
+2. ~~The app (`docs/APP-DESIGN.md`): every screen, Logs and event markers.~~
+   Done, released as 0.2.0.
+3. Alerts in `sysmand`.
 
 ## Not in scope yet
 
