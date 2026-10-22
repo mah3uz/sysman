@@ -21,7 +21,7 @@ provides=('sysman')
 conflicts=('sysman')
 install=sysman.install
 source_x86_64=("$url/releases/download/v$pkgver/sysman-$pkgver-arch-x86_64.tar.gz")
-sha256sums_x86_64=('SKIP')
+sha256sums_x86_64=('6a51d1ad4d64a3476ca1eb2783fc2de77572aedbac71cbd7439efdcb722667d1')
 
 package() {
   cp -a "sysman-$pkgver-arch-x86_64/usr" "$pkgdir/"
