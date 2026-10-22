@@ -11,6 +11,7 @@ pub mod fs;
 pub mod gpu;
 pub mod helper;
 pub mod hwmon;
+pub mod listeners;
 pub mod memory;
 pub mod net;
 pub mod netinfo;

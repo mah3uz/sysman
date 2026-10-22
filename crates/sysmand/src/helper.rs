@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use schema::helper::{Reading, Request, Status};
+use schema::helper::{Reading, Request, Sockets, Status};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -54,6 +54,10 @@ impl HelperClient {
 
     pub fn status(&self) -> Result<Status> {
         self.request(Request::Status)
+    }
+
+    pub fn sockets(&self) -> Result<Sockets> {
+        self.request(Request::Sockets)
     }
 
     fn request<T: DeserializeOwned>(&self, request: Request) -> Result<T> {

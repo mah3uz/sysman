@@ -167,13 +167,22 @@ per line, one response per line; errors are `{"error": "…"}`.
 | `{"cmd":"latest"}` | latest sample's envelope plus each module's most recent value (includes `processes.table`) |
 | `{"cmd":"subscribe"}` | meta, then every record as produced; a client 32 lines behind is disconnected |
 | `{"cmd":"processes"}` | full process table now, CPU relative to this client's previous request (first answer takes ~0.5 s) |
-| `{"cmd":"listeners"}` | every listening TCP and bound UDP socket now: protocol, local address and port, owning uid, and the holding process (pid, start time, comm) where known |
+| `{"cmd":"listeners"}` | every listening TCP and bound UDP socket now: protocol, local address and port, owning uid, and the holding processes (pid, start time, comm) where known |
 
 `listeners` is answered on request only, never per tick. Sockets come from
-`/proc/net/{tcp,tcp6,udp,udp6}` (any user may read them); the holder is found
-by matching socket inodes in `/proc/<pid>/fd`, which the daemon can read for
-its own user's processes and asks the helper's `sockets` for the rest. A
-socket with no known holder keeps its uid.
+`/proc/net/{tcp,tcp6,udp,udp6}` (any user may read them): TCP in LISTEN, UDP
+bound to a port and unconnected; a v4-mapped IPv6 address is given as IPv4. The
+holder is found by matching socket inodes in `/proc/<pid>/fd`, which the daemon
+can read for its own user's processes and asks the helper's `sockets` for the
+rest (inodes still unmatched, 500 ms limit). A socket has every process
+instance holding it (`holders`, by pid; workers, or PID 1 or a user `systemd`
+for a socket unit beside its service); a holder is read from its `stat`
+before and after its links, and a helper answer is kept only while the pid's
+`start_ticks` still match, so a reused pid is never named. A socket with no
+known holder keeps its uid. The reply is
+`{"type":"listeners","t":…,"listeners":[{"protocol":"tcp","address":"127.0.0.1","port":631,"uid":0,"inode":…,"holders":[{"pid":…,"start_time":…,"comm":"cupsd"}]}]}`
+(`schema::listeners::Listener`). Only the daemon's network namespace is
+listed: ports bound inside a container's own namespace are not.
 
 A second daemon is refused when the socket answers; any other socket failure
 leaves the daemon logging without it. History is not served over the socket:
@@ -218,10 +227,13 @@ these and nothing else.
   (`read_bytes`, `write_bytes`, `fds`, eBPF `net_rx_bytes`, `net_tx_bytes`,
   keyed by pid and `start_ticks`, field 22 of `stat`), and the latest SMART
   readings by block device;
-  `{"cmd":"sockets"}` → for every process (pid and `start_ticks`), the inodes
-  of the sockets it holds, read from `/proc/<pid>/fd`, so `sysmand` can name
-  the holder of another user's listening socket. A field whose source is off is absent. The types
-  are `schema::helper::{Request, Status, Reading}`. Rates are computed in
+  `{"cmd":"sockets"}` → for every process holding a socket (pid and
+  `start_ticks`), the inodes of its `socket:[N]` links in `/proc/<pid>/fd` and
+  no other fd target, so `sysmand` can name the holder of another user's
+  listening socket. It needs the same access to other users' `/proc/<pid>/fd`
+  as `fds`, so `proc_io` covers it and there is no feature key of its own. A
+  field whose source is off is absent. The types are
+  `schema::helper::{Request, Status, Reading, Sockets}`. Rates are computed in
   `sysmand` with its usual `Deltas`; RAPL power reuses the collector's own
   wrap-aware step.
 - **Sources.** Each is optional: one that fails is `false` in `features` and

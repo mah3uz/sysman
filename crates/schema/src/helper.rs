@@ -9,7 +9,8 @@ pub struct Helper {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// `rapl`, `proc_io`, `smart`, `net` → whether that source works on this machine.
+    /// `rapl`, `proc_io`, `smart`, `net` → whether that source works on this machine. `proc_io` also covers
+    /// `sockets`, which reads the same `/proc/<pid>/fd` under the same permission.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub features: BTreeMap<String, bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -22,6 +23,7 @@ pub struct Helper {
 pub enum Request {
     Status,
     Read,
+    Sockets,
 }
 
 /// The helper's answer to `status`.
@@ -46,6 +48,23 @@ pub struct Reading {
     /// Keyed by block device name, as in `storage.smart`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub smart: BTreeMap<String, crate::storage::Smart>,
+}
+
+/// The helper's answer to `sockets`: socket inodes and nothing else, so no other open file is revealed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Sockets {
+    /// Only processes holding at least one socket.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processes: Vec<ProcSockets>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProcSockets {
+    pub pid: u32,
+    /// As in [`ProcCounters::start_ticks`].
+    pub start_ticks: u64,
+    /// The `N` of each `socket:[N]` link in `/proc/<pid>/fd`, sorted, each once.
+    pub inodes: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
