@@ -176,12 +176,12 @@ means" and "How it is calculated". Panels without a chart have no arrow.
     | --- | --- | --- |
     | System or user service | `….service` in the cgroup; unit `UnitFileState`, `WantedBy` | "System service *OpenSSH Daemon* (sshd.service), enabled at boot." |
     | Socket-activated | unit `TriggeredBy` a `.socket` | "Started when something connected to port 631 (cups.socket)." |
-    | Timer | `TriggeredBy` a `.timer` | "Started by the timer man-db.timer; it exits when done." |
+    | Timer | `TriggeredBy` a `.timer`; the timer's `LastTriggerUSec`, `NextElapseUSecRealtime` | "Started by the timer man-db.timer at 03:00; next run 03:00 tomorrow." |
     | D-Bus activated | unit `BusName` and nothing wants it | "Started on demand for org.freedesktop.UDisks2." |
     | Login autostart | `app-…@autostart.service`, unit `SourcePath` | "Starts when you log in, from ~/.config/autostart/x.desktop." |
     | App | `app-…<desktop id>….scope`, name from the `.desktop` file | "You opened *Firefox* at 09:12." |
     | Terminal | the parent chain reaches a terminal or shell | "Run in a terminal: kitty → zsh → cargo." |
-    | Orphan | parent is PID 1 or a subreaper, cgroup not its own unit | "Started by a terminal or script that has since exited." |
+    | Orphan | parent is PID 1 or a subreaper, cgroup not its own unit, and its session leader (`stat` field 6) no longer runs | "Started by a terminal or script that has since exited." |
     | Login session | `session-N.scope`; logind `Type`, `Remote`, `RemoteHost` | "Part of mahfuz's SSH login from 192.168.1.5." |
     | Container | `docker-<id>`, `libpod-<id>`, `kubepods`, `machine.slice` | "Runs in Docker container 3f2a9c…" (name when readable) |
     | Flatpak or Snap | `app-flatpak-<id>-…`, `snap.<name>.…` | "Flatpak app com.discordapp.Discord." |
@@ -190,7 +190,11 @@ means" and "How it is calculated". Panels without a chart have no arrow.
     | Unknown | none match | "sysman can't tell why: <reason>." |
 
     cgroup v1 hybrids use the `name=systemd` line; without systemd the
-    parent chain alone gives the answer.
+    parent chain alone gives the answer. Terminal multiplexers (tmux,
+    screen) are named only on an exact `comm` match. One fact line is added
+    under the sentence when it holds: the program file was replaced or
+    removed since it started (`/proc/<pid>/exe` ends in " (deleted)"), "Running
+    an older copy of this program; restart it to use the installed one."
   - *Details* for the selected process only: unit properties over D-Bus
     (system bus for system units, session bus for user units), the logind
     session, the `.desktop` name, the container name (podman's
