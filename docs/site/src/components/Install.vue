@@ -113,7 +113,8 @@ const helper = `sudo systemctl enable --now sysman-helper`
           <h3 v-reveal="60" class="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">Turn on the helper for the last few readings.</h3>
           <p v-reveal="120" class="mt-4 leading-relaxed text-muted">
             Without root, Linux hides SMART drive health, CPU package power on most systems, other users’
-            disk I/O and open files, and per-process network traffic. <span class="font-mono text-[0.92em] text-ink">sysman-helper</span>
+            disk I/O and open files, per-process network traffic, and which of another user’s processes holds
+            a listening port. <span class="font-mono text-[0.92em] text-ink">sysman-helper</span>
             reads exactly these and nothing else. It runs as a confined system service with no network,
             answers only on a socket that administrators can open, and never runs anything a client sends.
           </p>
