@@ -7,6 +7,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result, bail};
+use schema::listeners::Listener;
 use schema::processes::Table;
 use serde::Deserialize;
 
@@ -15,6 +17,8 @@ use crate::data::live::Conn;
 const BACKOFF_START: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 const PAUSED_POLL: Duration = Duration::from_millis(250);
+/// The daemon's scan plus up to half a second waiting on the helper; past this the daemon is stuck.
+const LISTENERS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum Event {
@@ -92,6 +96,27 @@ fn parse(line: &str) -> Event {
     match (serde_json::from_str::<Stamp>(line), serde_json::from_str::<Table>(line)) {
         (Ok(Stamp { t }), Ok(table)) => Event::Table { t, table },
         _ => Event::Skipped,
+    }
+}
+
+/// Every listening socket now, asked once on a connection of its own; blocks while the daemon scans.
+pub fn listeners(path: &Path) -> Result<Vec<Listener>> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Reply {
+        Listeners { listeners: Vec<Listener> },
+        Error { error: String },
+    }
+    let mut stream = UnixStream::connect(path).with_context(|| format!("connecting to {}", path.display()))?;
+    stream.set_read_timeout(Some(LISTENERS_TIMEOUT))?;
+    stream.write_all(b"{\"cmd\":\"listeners\"}\n")?;
+    let mut line = String::new();
+    if BufReader::new(stream).read_line(&mut line)? == 0 {
+        bail!("the daemon closed the connection");
+    }
+    match serde_json::from_str(&line).context("the daemon's answer does not fit the schema")? {
+        Reply::Listeners { listeners } => Ok(listeners),
+        Reply::Error { error } => bail!("{error}"),
     }
 }
 
@@ -176,6 +201,42 @@ mod tests {
             parse(r#"{"count": 0, "threads": 0, "states": {}, "rows": []}"#),
             Event::Skipped
         ));
+    }
+
+    /// Answers one `listeners` request with `reply`.
+    fn answer_listeners(reply: serde_json::Value) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sysman.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert_eq!(request, "{\"cmd\":\"listeners\"}\n");
+            writeln!(stream, "{reply}").unwrap();
+        });
+        (dir, path)
+    }
+
+    #[test]
+    fn listeners_reads_holders_and_reports_a_daemon_error_as_an_error() {
+        let (_dir, path) = answer_listeners(json!({"type": "listeners", "t": 1.0, "listeners": [
+            {"protocol": "tcp6", "address": "::", "port": 22, "uid": 0, "inode": 9,
+             "holders": [{"pid": 1, "start_time": 5, "comm": "systemd"}]},
+            {"protocol": "udp", "address": "127.0.0.53", "port": 53, "uid": 991, "inode": 10}
+        ]}));
+        let got = listeners(&path).unwrap();
+        assert_eq!((got[0].port, got[0].holders[0].comm.as_str()), (22, "systemd"));
+        assert!(
+            got[1].holders.is_empty(),
+            "a socket with no known holder still arrives, with its uid"
+        );
+        assert_eq!(got[1].uid, 991);
+
+        let (_dir, path) = answer_listeners(json!({"error": "reading /proc/net/tcp: Permission denied"}));
+        assert!(listeners(&path).unwrap_err().to_string().contains("Permission denied"));
     }
 
     #[test]

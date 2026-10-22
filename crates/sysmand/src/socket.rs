@@ -112,9 +112,10 @@ fn client(stream: UnixStream, hub: &Hub, sys: Sys) -> Result<()> {
                 }
             }
             Some("processes") => processes(&mut scanner, &sys).unwrap_or_else(|e| error(&format!("{e:#}"))),
+            Some("listeners") => listeners(&sys).unwrap_or_else(|e| error(&format!("{e:#}"))),
             Some("subscribe") => return stream_records(hub, &mut out),
             Some(other) => error(&format!(
-                "unknown command {other:?}; known: meta, latest, subscribe, processes"
+                "unknown command {other:?}; known: meta, latest, subscribe, processes, listeners"
             )),
             None => error(r#"expected a JSON object like {"cmd":"latest"}"#),
         };
@@ -152,6 +153,16 @@ fn processes(scanner: &mut Option<ProcessScanner>, sys: &Sys) -> Result<String> 
     reply["type"] = "processes".into();
     reply["t"] = json!((unix_now() * 1000.0).round() / 1000.0);
     Ok(reply.to_string())
+}
+
+fn listeners(sys: &Sys) -> Result<String> {
+    let listeners = crate::listeners::scan(sys)?;
+    Ok(json!({
+        "type": "listeners",
+        "t": (unix_now() * 1000.0).round() / 1000.0,
+        "listeners": listeners,
+    })
+    .to_string())
 }
 
 fn error(msg: &str) -> String {
@@ -253,6 +264,30 @@ mod tests {
             rows.iter().any(|r| r["pid"].as_u64() == Some(me)),
             "the full table, not a top N, includes this test process"
         );
+    }
+
+    #[test]
+    fn listeners_name_this_process_as_holder_of_the_ports_it_bound() {
+        // read from the real kernel tables, so their byte order and layout are checked too
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let hub = Arc::new(Hub::default());
+        let (_dir, path) = start(&hub);
+        let reply = ask(&path, "listeners");
+        let listeners: Vec<schema::listeners::Listener> =
+            serde_json::from_value(reply["listeners"].clone()).expect("listeners fit the schema");
+        let me = std::process::id();
+        for (protocol, port) in [
+            (schema::listeners::Protocol::Tcp, tcp.local_addr().unwrap().port()),
+            (schema::listeners::Protocol::Udp, udp.local_addr().unwrap().port()),
+        ] {
+            let l = listeners
+                .iter()
+                .find(|l| l.protocol == protocol && l.port == port)
+                .unwrap_or_else(|| panic!("{protocol:?} {port} not listed"));
+            assert_eq!(l.address, std::net::IpAddr::from([127, 0, 0, 1]));
+            assert!(l.holders.iter().any(|h| h.pid == me), "{l:?}");
+        }
     }
 
     #[test]
