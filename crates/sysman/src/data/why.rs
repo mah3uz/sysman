@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::net::IpAddr;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -554,6 +555,71 @@ fn binds_to(bus: &zbus::blocking::Connection, name: &str) -> Vec<String> {
         .ok()
         .and_then(|mut p| take(&mut p, "BindsTo"))
         .unwrap_or_default()
+}
+
+/// The port of a TCP or UDP `Listen` entry of a socket unit (`0.0.0.0:631`, `[::]:631`, `[fe80::1%eth0]:53`);
+/// `None` for a path, netlink, vsock or any other kind.
+fn listen_port(kind: &str, address: &str) -> Option<u16> {
+    if kind != "Stream" && kind != "Datagram" {
+        return None;
+    }
+    let (host, port) = address.rsplit_once(':')?;
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    let host = host.split_once('%').map_or(host, |(h, _)| h);
+    host.parse::<IpAddr>().ok()?;
+    port.parse().ok()
+}
+
+/// The first of `units` (name, `Listen` entries) listening on `port`.
+pub fn socket_on_port(units: &[(String, Vec<(String, String)>)], port: u16) -> Option<&str> {
+    units
+        .iter()
+        .find(|(_, listen)| listen.iter().any(|(kind, addr)| listen_port(kind, addr) == Some(port)))
+        .map(|(name, _)| name.as_str())
+}
+
+/// The loaded `.socket` unit of the system or session manager listening on `port`, and the units it starts.
+pub fn socket_unit(system: bool, port: u16) -> Result<Option<(String, Vec<String>)>, String> {
+    type Listed = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        zbus::zvariant::OwnedObjectPath,
+        u32,
+        String,
+        zbus::zvariant::OwnedObjectPath,
+    );
+    const SYSTEMD: &str = "org.freedesktop.systemd1";
+    let bus = bus(system)?;
+    let listed: Vec<Listed> = bus
+        .call_method(
+            Some(SYSTEMD),
+            "/org/freedesktop/systemd1",
+            Some("org.freedesktop.systemd1.Manager"),
+            "ListUnitsByPatterns",
+            &(Vec::<&str>::new(), vec!["*.socket"]),
+        )
+        .and_then(|m| m.body().deserialize())
+        .map_err(|e| e.to_string())?;
+    let units: Vec<(String, Vec<(String, String)>)> = listed
+        .iter()
+        .filter_map(|u| {
+            let mut p = get_all(&bus, SYSTEMD, u.6.as_str(), "org.freedesktop.systemd1.Socket").ok()?;
+            Some((u.0.clone(), take(&mut p, "Listen")?))
+        })
+        .collect();
+    let Some(name) = socket_on_port(&units, port) else {
+        return Ok(None);
+    };
+    let path = &listed.iter().find(|u| u.0 == name).expect("listed above").6;
+    let triggers = get_all(&bus, SYSTEMD, path.as_str(), "org.freedesktop.systemd1.Unit")
+        .ok()
+        .and_then(|mut p| take(&mut p, "Triggers"))
+        .unwrap_or_default();
+    Ok(Some((name.to_owned(), triggers)))
 }
 
 impl Probe for Live {
@@ -1270,6 +1336,35 @@ mod tests {
 
     fn chain(links: &[(u32, &str)]) -> Vec<Link> {
         links.iter().map(|(p, c)| link(*p, c)).collect()
+    }
+
+    #[test]
+    fn a_waiting_port_is_traced_to_the_socket_unit_listening_on_it_over_ip_only() {
+        let unit = |name: &str, listen: &[(&str, &str)]| {
+            let listen = listen.iter().map(|(k, a)| (k.to_string(), a.to_string())).collect();
+            (name.to_owned(), listen)
+        };
+        let units = vec![
+            // a unix path that happens to end in the port number is not that port
+            unit("odd.socket", &[("Stream", "/run/odd:631")]),
+            unit("vsock.socket", &[("Stream", "vsock:2:631")]),
+            unit("ssh.socket", &[("Stream", "[::]:22"), ("Stream", "0.0.0.0:2222")]),
+            unit(
+                "cups.socket",
+                &[("Stream", "/run/cups/cups.sock"), ("Stream", "[::]:631")],
+            ),
+            unit("mdns.socket", &[("Datagram", "[fe80::1%eth0]:5353")]),
+            unit("fifo.socket", &[("FIFO", "0.0.0.0:7000")]),
+        ];
+        assert_eq!(socket_on_port(&units, 631), Some("cups.socket"));
+        assert_eq!(socket_on_port(&units, 2222), Some("ssh.socket"));
+        assert_eq!(
+            socket_on_port(&units, 5353),
+            Some("mdns.socket"),
+            "UDP and a scoped link-local address count"
+        );
+        assert_eq!(socket_on_port(&units, 7000), None, "a FIFO has no port");
+        assert_eq!(socket_on_port(&units, 80), None);
     }
 
     fn plain() -> Vec<Link> {
