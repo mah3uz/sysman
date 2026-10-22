@@ -189,8 +189,11 @@ fn scope_id(comp: &str, prefixes: &[&str]) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The `app-` unit's `[<launcher>-]<ApplicationID>` part with its random suffix removed, still escaped. systemd names
+/// scopes `app-[<launcher>-]<ID>-<RANDOM>.scope` and services `app-[<launcher>-]<ID>@<RANDOM>.service`.
 fn app_desktop_id(unit: &str) -> String {
     let stem = unit.strip_prefix("app-").unwrap_or(unit);
+    let scope = stem.ends_with(".scope");
     let stem = stem
         .strip_suffix(".service")
         .or_else(|| stem.strip_suffix(".scope"))
@@ -199,9 +202,19 @@ fn app_desktop_id(unit: &str) -> String {
         return id.to_owned();
     }
     match stem.rsplit_once('-') {
-        Some((id, n)) if !id.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => id.to_owned(),
+        Some((id, random)) if scope && !id.is_empty() && !random.is_empty() => id.to_owned(),
         _ => stem.to_owned(),
     }
+}
+
+/// Desktop ids to try for an app unit's raw id: as is, and without a leading launcher segment. A real id's own dashes
+/// are escaped, so a bare dash separates the launcher.
+fn desktop_candidates(raw: &str) -> Vec<String> {
+    let mut out = vec![unescape(raw)];
+    if let Some((_, rest)) = raw.split_once('-') {
+        out.push(unescape(rest));
+    }
+    out
 }
 
 fn user_manager_uid(comp: &str) -> Option<u32> {
@@ -329,6 +342,11 @@ fn under_cron(chain: &[Link]) -> bool {
 /// because an orphan is adopted by PID 1 or a subreaper, so the parent chain alone misleads. Whether a service was
 /// socket-, timer- or D-Bus-activated needs its unit properties, which `explain` adds.
 pub fn classify(cgroup: &str, chain: &[Link]) -> Cause {
+    classify_with(cgroup, chain, false)
+}
+
+/// `leader_runs`: the process's session leader is still alive, so an adopted process is no orphan.
+fn classify_with(cgroup: &str, chain: &[Link], leader_runs: bool) -> Cause {
     let pid = chain.first().map_or(0, |l| l.pid);
     if chain.iter().any(|l| l.pid == 2) {
         return Cause::Kernel;
@@ -351,7 +369,7 @@ pub fn classify(cgroup: &str, chain: &[Link]) -> Cause {
             let parent = chain.get(1);
             let adopted = parent.is_some_and(|p| p.pid == 1 || p.comm == "systemd");
             match (shape, path) {
-                (Shape::Generic, _) if adopted => Cause::Orphan,
+                (Shape::Generic, _) if adopted && !leader_runs => Cause::Orphan,
                 (Shape::Generic, Some(p)) => Cause::Unknown {
                     reason: format!(
                         "its cgroup {p} names no service or app, and its parents show no terminal or cron job"
@@ -388,6 +406,11 @@ pub struct UnitProps {
     pub bus_name: String,
     /// Microseconds since the Unix epoch.
     pub active_enter: Option<u64>,
+    /// Stopping the unit stops a unit that BindsTo `graphical-session.target`, which is how a compositor ends the session.
+    pub holds_session: bool,
+    /// A timer's `LastTriggerUSec` and `NextElapseUSecRealtime`; zero is `None`.
+    pub last_trigger: Option<u64>,
+    pub next_elapse: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -408,14 +431,33 @@ pub trait Probe {
     fn unit(&self, unit: &Unit) -> Result<UnitProps, String>;
     fn session(&self, id: &str) -> Result<Session, String>;
     fn docker_name(&self, id: &str) -> Result<String, String>;
+    /// Where `/proc/<pid>/exe` points; only readable for the user's own processes.
+    fn exe_link(&self, pid: u32) -> Option<String>;
     /// "at 09:12", or "on Oct 20 at 09:12" for another day.
     fn clock(&self, unix: u64) -> String {
+        self.phrase(unix, clock_phrase)
+    }
+    /// "at 03:00", "03:00 tomorrow", or "on Oct 24 at 03:00".
+    fn next_run(&self, unix: u64) -> String {
+        self.phrase(unix, next_phrase)
+    }
+    fn phrase(&self, unix: u64, f: fn(&jiff::Zoned, &jiff::Zoned) -> String) -> String {
         let tz = jiff::tz::TimeZone::system();
         let Ok(ts) = jiff::Timestamp::from_second(unix as i64) else {
             return String::new();
         };
-        let (start, now) = (ts.to_zoned(tz.clone()), jiff::Timestamp::now().to_zoned(tz));
-        clock_phrase(&start, &now)
+        f(&ts.to_zoned(tz.clone()), &jiff::Timestamp::now().to_zoned(tz))
+    }
+}
+
+fn next_phrase(at: &jiff::Zoned, now: &jiff::Zoned) -> String {
+    let time = at.strftime("%H:%M");
+    if at.date() == now.date() {
+        format!("at {time}")
+    } else if now.date().tomorrow().is_ok_and(|d| d == at.date()) {
+        format!("{time} tomorrow")
+    } else {
+        at.strftime("on %b %-d at %H:%M").to_string()
     }
 }
 
@@ -485,7 +527,41 @@ fn object_path(
         .map_err(|e| e.to_string())
 }
 
+const SESSION_TARGET: &str = "graphical-session.target";
+
+/// Whether stopping a unit takes the graphical session down: among the units that stop with it (`RequiredBy`,
+/// `BoundBy`) is the session target itself or a unit that BindsTo it. `PartOf` alone never counts.
+fn holds_session(stopped_with: &[String], binds_to: impl Fn(&str) -> Vec<String>) -> bool {
+    stopped_with.iter().any(|n| n == SESSION_TARGET)
+        || stopped_with
+            .iter()
+            .take(8)
+            .any(|name| binds_to(name).iter().any(|n| n == SESSION_TARGET))
+}
+
+fn binds_to(bus: &zbus::blocking::Connection, name: &str) -> Vec<String> {
+    let Ok(path) = object_path(
+        bus,
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "GetUnit",
+        name,
+    ) else {
+        return Vec::new();
+    };
+    get_all(bus, "org.freedesktop.systemd1", &path, "org.freedesktop.systemd1.Unit")
+        .ok()
+        .and_then(|mut p| take(&mut p, "BindsTo"))
+        .unwrap_or_default()
+}
+
 impl Probe for Live {
+    fn exe_link(&self, pid: u32) -> Option<String> {
+        let link = std::fs::read_link(self.proc_root.join(pid.to_string()).join("exe")).ok()?;
+        Some(link.to_string_lossy().into_owned())
+    }
+
     fn proc_file(&self, pid: u32, name: &str) -> io::Result<String> {
         std::fs::read_to_string(self.proc_root.join(pid.to_string()).join(name))
     }
@@ -520,7 +596,26 @@ impl Probe for Live {
             "org.freedesktop.systemd1.Service",
         )
         .unwrap_or_default();
+        let mut t = if unit.name.ends_with(".timer") {
+            get_all(
+                &bus,
+                "org.freedesktop.systemd1",
+                &path,
+                "org.freedesktop.systemd1.Timer",
+            )
+            .unwrap_or_default()
+        } else {
+            Props::new()
+        };
+        let stopped_with: Vec<String> = ["RequiredBy", "BoundBy"]
+            .iter()
+            .flat_map(|k| take::<Vec<String>>(&mut u, k).unwrap_or_default())
+            .collect();
+        let nonzero = |v: Option<u64>| v.filter(|v| *v > 0);
         Ok(UnitProps {
+            holds_session: holds_session(&stopped_with, |n| binds_to(&bus, n)),
+            last_trigger: nonzero(take(&mut t, "LastTriggerUSec")),
+            next_elapse: nonzero(take(&mut t, "NextElapseUSecRealtime")),
             id: take(&mut u, "Id").unwrap_or_default(),
             description: take(&mut u, "Description").unwrap_or_default(),
             fragment_path: take(&mut u, "FragmentPath").unwrap_or_default(),
@@ -585,6 +680,25 @@ fn parse_stat(stat: &str) -> Option<(String, u32)> {
     Some((stat[open + 1..close].to_owned(), ppid))
 }
 
+/// The session id (field 6), start time (field 22) and state of a `/proc/<pid>/stat` line.
+fn parse_session(stat: &str) -> Option<(u32, u64, char)> {
+    let rest: Vec<&str> = stat.get(stat.rfind(')')? + 2..)?.split(' ').collect();
+    Some((
+        rest.get(3)?.parse().ok()?,
+        rest.get(19)?.parse().ok()?,
+        rest.first()?.chars().next()?,
+    ))
+}
+
+/// Whether another process that leads this one's session is still alive. A reused pid starts after the process.
+fn session_leader_runs(probe: &dyn Probe, pid: u32) -> bool {
+    let read = |p| probe.proc_file(p, "stat").ok().and_then(|s| parse_session(&s));
+    let Some((sid, start, _)) = read(pid) else {
+        return false;
+    };
+    sid != 0 && sid != pid && read(sid).is_some_and(|(_, leader_start, state)| state != 'Z' && leader_start <= start)
+}
+
 fn build_chain(probe: &dyn Probe, pid: u32, table: &[Process]) -> Vec<Link> {
     let mut chain = Vec::new();
     let mut cur = pid;
@@ -623,6 +737,8 @@ pub struct Why {
     pub if_you_end: Option<String>,
     pub evidence: Vec<(String, String)>,
     pub notes: Vec<String>,
+    /// Extra facts under the sentence.
+    pub facts: Vec<String>,
     pub actions: Actions,
 }
 
@@ -637,6 +753,7 @@ struct Facts {
     session: Option<Session>,
     desktop: Option<(String, PathBuf)>,
     container_name: Option<String>,
+    timer: Option<UnitProps>,
 }
 
 pub fn explain_with(probe: &dyn Probe, pid: u32, start_time: u64, table: &[Process]) -> Why {
@@ -653,6 +770,7 @@ pub fn explain_with(probe: &dyn Probe, pid: u32, start_time: u64, table: &[Proce
             if_you_end: None,
             evidence: Vec::new(),
             notes: Vec::new(),
+            facts: Vec::new(),
             actions: Actions::default(),
         }
     };
@@ -674,7 +792,10 @@ pub fn explain_with(probe: &dyn Probe, pid: u32, start_time: u64, table: &[Proce
             String::new()
         }
     };
-    let mut cause = classify(&cgroup, &chain);
+    let mut cause = classify_with(&cgroup, &chain, false);
+    if cause == Cause::Orphan && session_leader_runs(probe, pid) {
+        cause = classify_with(&cgroup, &chain, true);
+    }
     let mut facts = Facts::default();
 
     if let Some(unit) = unit_of(&cause).filter(|u| u.name.ends_with(".service")) {
@@ -691,6 +812,14 @@ pub fn explain_with(probe: &dyn Probe, pid: u32, start_time: u64, table: &[Proce
         cause = refine(cause, props);
     }
     match &cause {
+        Cause::Timer { unit, timer } => {
+            facts.timer = probe
+                .unit(&Unit {
+                    name: timer.clone(),
+                    uid: unit.uid,
+                })
+                .ok()
+        }
         Cause::Session { id } => match probe.session(id) {
             Ok(s) => facts.session = Some(s),
             Err(e) => unavailable(&mut notes, format!("login session ({e})")),
@@ -701,7 +830,7 @@ pub fn explain_with(probe: &dyn Probe, pid: u32, start_time: u64, table: &[Proce
                 .as_ref()
                 .map(|p| p.source_path.as_str())
                 .filter(|s| !s.is_empty());
-            facts.desktop = desktop_entry(probe, desktop_id, source);
+            facts.desktop = desktop_entry(probe, &desktop_candidates(desktop_id), source);
             if facts.desktop.is_none() {
                 unavailable(
                     &mut notes,
@@ -709,7 +838,7 @@ pub fn explain_with(probe: &dyn Probe, pid: u32, start_time: u64, table: &[Proce
                 );
             }
         }
-        Cause::Flatpak { app } => facts.desktop = desktop_entry(probe, app, None),
+        Cause::Flatpak { app } => facts.desktop = desktop_entry(probe, std::slice::from_ref(app), None),
         Cause::Container { runtime, id: Some(id) } => match container_name(probe, *runtime, id) {
             Ok(n) => facts.container_name = n,
             Err(e) => unavailable(&mut notes, format!("container name ({e})")),
@@ -720,7 +849,12 @@ pub fn explain_with(probe: &dyn Probe, pid: u32, start_time: u64, table: &[Proce
     let me = chain
         .first()
         .map_or_else(String::new, |l| format!("{} {}", l.comm, l.pid));
+    let replaced = probe.exe_link(pid).is_some_and(|e| e.ends_with(" (deleted)"));
     Why {
+        facts: replaced
+            .then(|| "Running an older copy of this program; restart it to use the installed one.".to_owned())
+            .into_iter()
+            .collect(),
         sentence: sentence(&cause, &facts, probe, start_time),
         chain: chain_lines(&cause, &facts, &chain, &me),
         if_you_end: if_you_end(&cause, facts.props.as_ref(), pid),
@@ -782,17 +916,12 @@ fn desktop_name(text: &str) -> Option<String> {
     None
 }
 
-/// The entry's `Name=`, from the unit's own source file when it has one, else by desktop id. A launcher prefix on the
-/// id (`Hyprland-firefox`) is dropped one dash at a time until a file matches.
-fn desktop_entry(probe: &dyn Probe, id: &str, source: Option<&str>) -> Option<(String, PathBuf)> {
-    let id = unescape(id);
+/// The entry's `Name=`, from the unit's own source file when it has one, else by the first desktop id that exists.
+fn desktop_entry(probe: &dyn Probe, candidates: &[String], source: Option<&str>) -> Option<(String, PathBuf)> {
     let read = |path: PathBuf| probe.read(&path).ok().and_then(|t| desktop_name(&t)).map(|n| (n, path));
     if let Some(found) = source.and_then(|s| read(PathBuf::from(s))) {
         return Some(found);
     }
-    let candidates: Vec<&str> = std::iter::once(id.as_str())
-        .chain(id.match_indices('-').map(|(i, _)| &id[i + 1..]))
-        .collect();
     let dirs = probe.data_dirs();
     candidates.iter().find_map(|c| {
         dirs.iter()
@@ -834,7 +963,6 @@ fn enabled_phrase(state: &str, user: bool) -> &'static str {
         "enabled" | "enabled-runtime" if user => ", enabled for your logins",
         "enabled" | "enabled-runtime" => ", enabled at boot",
         "static" => ", with no install section (static)",
-        "disabled" => ", not enabled (something else started it)",
         "transient" => ", a temporary unit",
         "generated" => ", generated at boot",
         _ => "",
@@ -856,10 +984,35 @@ fn sentence(cause: &Cause, f: &Facts, probe: &dyn Probe, start_time: u64) -> Str
             let name = unit.display();
             let label = props.and_then(desc).map_or(name.clone(), |d| format!("{d} ({name})"));
             let state = props.map_or("", |p| enabled_phrase(&p.unit_file_state, unit.uid.is_some()));
-            format!("{who} {label}{state}.")
+            match props.filter(|p| p.unit_file_state == "disabled") {
+                Some(p) => {
+                    let started = p
+                        .active_enter
+                        .map(|t| format!(", started {}", probe.clock(t / 1_000_000)));
+                    format!(
+                        "{who} {label}{}. It is not set to start automatically.",
+                        started.unwrap_or_default()
+                    )
+                }
+                None => format!("{who} {label}{state}."),
+            }
         }
         Cause::Socket { socket, .. } => format!("Started when something connected to {}.", unescape(socket)),
-        Cause::Timer { timer, .. } => format!("Started by the timer {}.", unescape(timer)),
+        Cause::Timer { timer, .. } => {
+            let (last, next) = f
+                .timer
+                .as_ref()
+                .map_or((None, None), |t| (t.last_trigger, t.next_elapse));
+            let mut out = format!("Started by the timer {}", unescape(timer));
+            if let Some(last) = last {
+                out += &format!(" {}", probe.clock(last / 1_000_000));
+            }
+            if let Some(next) = next {
+                let sep = if last.is_some() { ";" } else { "" };
+                out += &format!("{sep} next run {}", probe.next_run(next / 1_000_000));
+            }
+            out + "."
+        }
         Cause::DBus { bus_name, .. } => format!("Started on demand for {bus_name}."),
         Cause::Autostart { desktop_id, .. } => match props.map(|p| p.source_path.as_str()).filter(|s| !s.is_empty()) {
             Some(src) => format!("Starts when you log in, from {}.", tilde(src)),
@@ -1000,32 +1153,33 @@ fn if_you_end(cause: &Cause, props: Option<&UnitProps>, pid: u32) -> Option<Stri
         return None;
     }
     let p = props?;
+    if p.holds_session && p.main_pid.is_none_or(|m| m == 0 || m == pid) {
+        return Some("Ending it ends your desktop session.".into());
+    }
     let main = p.main_pid.filter(|m| *m != 0)?;
     if main != pid {
         return Some(format!(
             "systemd does not restart the service when this process ends; only its main process, PID {main}, counts."
         ));
     }
-    let mut parts = Vec::new();
-    match p.restart.as_str() {
-        "always" => parts.push("systemd starts it again, after End or Force end.".to_owned()),
+    let until = match cause {
+        Cause::Autostart { .. } => " until your next login".to_owned(),
+        Cause::Socket { socket, .. } => format!(" until something connects to {}", unescape(socket)),
+        Cause::DBus { bus_name, .. } => format!(" until something asks for {bus_name}"),
+        _ => String::new(),
+    };
+    Some(match p.restart.as_str() {
+        "always" => "systemd starts it again right away.".to_owned(),
         "on-failure" | "on-abnormal" | "on-abort" => {
-            parts.push("systemd starts it again after Force end only; End is a clean exit.".to_owned());
+            let again = if until.is_empty() { "" } else { " right away" };
+            format!("After End it stays stopped{until}. After Force end, systemd starts it again{again}.")
         }
-        "on-success" => parts.push("systemd starts it again after End only; Force end is not a clean exit.".to_owned()),
-        _ => {}
-    }
-    match cause {
-        Cause::Autostart { .. } => parts.push("It comes back at the next login.".into()),
-        Cause::Socket { .. } => parts.push("It starts again on the next connection.".into()),
-        Cause::DBus { bus_name, .. } => parts.push(format!("It starts again when something asks for {bus_name}.")),
-        _ => {}
-    }
-    if parts.is_empty() {
-        let restart = if p.restart.is_empty() { "no" } else { &p.restart };
-        parts.push(format!("systemd does not start it again (Restart={restart})."));
-    }
-    Some(parts.join(" "))
+        "on-success" => {
+            format!("After End, systemd starts it again right away. After Force end it stays stopped{until}.")
+        }
+        _ if !until.is_empty() => format!("It stays stopped{until}."),
+        _ => "systemd does not start it again.".to_owned(),
+    })
 }
 
 fn evidence(cause: &Cause, f: &Facts, cgroup: &str, chain: &[Link], probe: &dyn Probe) -> Vec<(String, String)> {
@@ -1084,7 +1238,8 @@ fn actions(cause: &Cause, f: &Facts, probe: &dyn Probe, container: Option<(Runti
         return Actions::default();
     };
     let mine = unit.uid.is_none_or(|u| u == probe.uid());
-    let valid = mine && restartable_unit(&unit.name);
+    let holds_session = f.props.as_ref().is_some_and(|p| p.holds_session);
+    let valid = mine && restartable_unit(&unit.name) && !holds_session;
     let enabled = f
         .props
         .as_ref()
@@ -1444,21 +1599,27 @@ mod tests {
     #[test]
     fn an_always_restart_service_comes_back_after_end_and_force_end() {
         let s = ending(&service(), &props("always", 10));
-        assert!(s.contains("after End or Force end"), "{s}");
+        assert_eq!(s, "systemd starts it again right away.");
     }
 
     #[test]
     fn a_sigterm_does_not_bring_back_an_on_failure_service() {
         for restart in ["on-failure", "on-abnormal", "on-abort"] {
             let s = ending(&service(), &props(restart, 10));
-            assert!(s.contains("after Force end only"), "{restart}: {s}");
+            assert_eq!(
+                s, "After End it stays stopped. After Force end, systemd starts it again.",
+                "{restart}"
+            );
         }
     }
 
     #[test]
     fn a_sigkill_does_not_bring_back_an_on_success_service() {
         let s = ending(&service(), &props("on-success", 10));
-        assert!(s.contains("after End only"), "{s}");
+        assert_eq!(
+            s,
+            "After End, systemd starts it again right away. After Force end it stays stopped."
+        );
     }
 
     #[test]
@@ -1477,7 +1638,7 @@ mod tests {
     #[test]
     fn a_restart_no_service_says_nothing_starts_it_again() {
         let s = ending(&service(), &props("no", 10));
-        assert!(s.contains("does not start it again (Restart=no)"), "{s}");
+        assert_eq!(s, "systemd does not start it again.");
     }
 
     #[test]
@@ -1486,7 +1647,7 @@ mod tests {
             unit: unit("x.service", None),
             socket: "x.socket".into(),
         };
-        assert!(ending(&socket, &props("no", 10)).contains("next connection"));
+        assert!(ending(&socket, &props("no", 10)).contains("connects to x.socket"));
         let dbus = Cause::DBus {
             unit: unit("x.service", None),
             bus_name: "org.x.Y".into(),
@@ -1506,7 +1667,11 @@ mod tests {
             socket: "x.socket".into(),
         };
         let s = ending(&socket, &props("on-failure", 10));
-        assert!(s.contains("Force end only") && s.contains("next connection"), "{s}");
+        assert_eq!(
+            s,
+            "After End it stays stopped until something connects to x.socket. \
+             After Force end, systemd starts it again right away."
+        );
     }
 
     #[test]
@@ -1529,6 +1694,12 @@ mod tests {
         units: HashMap<String, UnitProps>,
         sessions: HashMap<String, Session>,
         docker: Option<String>,
+    }
+
+    impl Fake {
+        fn put(&mut self, path: &str, text: &str) {
+            self.files.insert(path.into(), text.into());
+        }
     }
 
     impl Probe for Fake {
@@ -1563,8 +1734,16 @@ mod tests {
             self.docker.clone().ok_or_else(|| "permission denied".into())
         }
 
+        fn exe_link(&self, pid: u32) -> Option<String> {
+            self.files.get(&format!("/proc/{pid}/exe")).cloned()
+        }
+
         fn clock(&self, _: u64) -> String {
             "at 09:12".into()
+        }
+
+        fn next_run(&self, _: u64) -> String {
+            "03:00 tomorrow".into()
         }
     }
 
@@ -1612,7 +1791,12 @@ mod tests {
             w.chain,
             ["multi-user.target", "sshd.service · restarted 0 times", "sshd 812"]
         );
-        assert!(w.if_you_end.as_deref().unwrap().contains("Force end only"));
+        assert!(
+            w.if_you_end
+                .as_deref()
+                .unwrap()
+                .contains("After Force end, systemd starts it again")
+        );
         assert!(w.notes.is_empty(), "{:?}", w.notes);
         assert_eq!(
             w.actions,
@@ -1638,7 +1822,7 @@ mod tests {
         f.units.get_mut("sshd.service").unwrap().triggered_by = vec!["sshd.socket".into()];
         let w = explain_with(&f, 812, 100, &table());
         assert_eq!(w.sentence, "Started when something connected to sshd.socket.");
-        assert!(w.if_you_end.unwrap().contains("next connection"));
+        assert!(w.if_you_end.unwrap().contains("connects to sshd.socket"));
     }
 
     #[test]
@@ -1857,6 +2041,221 @@ mod tests {
         assert_eq!(
             clock_phrase(&at("2026-10-20T09:12:00Z"), &at("2026-10-22T18:00:00Z")),
             "on Oct 20 at 09:12"
+        );
+    }
+
+    const HOME_APPS: &str = "/usr/share/applications";
+
+    fn app_probe(unit: &str) -> Fake {
+        let mut f = Fake::default();
+        f.put(
+            "/proc/812/cgroup",
+            &v2(&format!(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/{unit}"
+            )),
+        );
+        f
+    }
+
+    #[test]
+    fn random_scope_suffixes_resolve_to_the_real_desktop_id() {
+        for (unit, file, name) in [
+            ("app-Hyprland-chromium-ff69785e.scope", "chromium", "Chromium"),
+            (
+                "app-Hyprland-google\\x2dchrome-0a1b2c.scope",
+                "google-chrome",
+                "Google Chrome",
+            ),
+            ("app-firefox-1234.scope", "firefox", "Firefox"),
+            ("app-org.gnome.Nautilus-zzzz.scope", "org.gnome.Nautilus", "Files"),
+            ("app-foo-bar-77.scope", "foo-bar", "Foo Bar"),
+            ("app-Hyprland-firefox@a1b2.service", "firefox", "Firefox"),
+        ] {
+            let mut f = app_probe(unit);
+            f.put(
+                &format!("{HOME_APPS}/{file}.desktop"),
+                &format!("[Desktop Entry]\nName={name}\n"),
+            );
+            let w = explain_with(&f, 812, 100, &table());
+            assert_eq!(w.sentence, format!("You opened {name} at 09:12."), "{unit}");
+        }
+    }
+
+    #[test]
+    fn the_scope_suffix_is_dropped_whatever_it_looks_like() {
+        assert_eq!(
+            app_desktop_id("app-Hyprland-chromium-ff69785e.scope"),
+            "Hyprland-chromium"
+        );
+        assert_eq!(app_desktop_id("app-chromium-12345.scope"), "chromium");
+        assert_eq!(
+            app_desktop_id("app-gnome-nm\\x2dapplet@autostart.service"),
+            "gnome-nm\\x2dapplet"
+        );
+    }
+
+    fn wm_probe(holds_session: bool) -> Fake {
+        let mut f = Fake::default();
+        f.put(
+            "/proc/812/cgroup",
+            &v2("/user.slice/user-1000.slice/user@1000.service/session.slice/wayland-wm@hyprland.desktop.service"),
+        );
+        f.units.insert(
+            "wayland-wm@hyprland.desktop.service".into(),
+            UnitProps {
+                unit_file_state: "enabled".into(),
+                restart: "no".into(),
+                main_pid: Some(812),
+                holds_session,
+                ..UnitProps::default()
+            },
+        );
+        f
+    }
+
+    #[test]
+    fn the_unit_that_holds_the_desktop_session_offers_no_way_to_stop_it() {
+        let w = explain_with(&wm_probe(true), 812, 100, &table());
+        let a = &w.actions;
+        assert!(!a.stop && !a.restart && !a.disable);
+        assert_eq!(a.unit.as_deref(), Some("wayland-wm@hyprland.desktop.service"));
+        assert_eq!(w.if_you_end.as_deref(), Some("Ending it ends your desktop session."));
+    }
+
+    #[test]
+    fn a_bar_that_is_only_part_of_the_session_is_still_stoppable() {
+        let w = explain_with(&wm_probe(false), 812, 100, &table());
+        assert!(w.actions.stop && w.actions.restart && w.actions.disable);
+        assert_eq!(w.if_you_end.as_deref(), Some("systemd does not start it again."));
+    }
+
+    #[test]
+    fn a_unit_holds_the_session_only_when_stopping_it_stops_a_unit_that_binds_the_session() {
+        let binds = |n: &str| match n {
+            "wayland-session@hyprland.desktop.target" => vec!["graphical-session.target".to_owned()],
+            _ => vec!["basic.target".to_owned()],
+        };
+        let units = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(holds_session(
+            &units(&["wayland-session@hyprland.desktop.target"]),
+            binds
+        ));
+        assert!(holds_session(&units(&["graphical-session.target"]), binds));
+        assert!(!holds_session(&units(&["some.target"]), binds));
+        assert!(!holds_session(&[], binds), "PartOf alone never reaches this list");
+    }
+
+    fn disabled_probe(active_enter: Option<u64>) -> Fake {
+        let mut f = sshd_probe("no");
+        let p = f.units.get_mut("sshd.service").unwrap();
+        p.unit_file_state = "disabled".into();
+        p.active_enter = active_enter;
+        f
+    }
+
+    #[test]
+    fn a_running_service_that_is_disabled_says_when_it_started_and_that_nothing_starts_it() {
+        let w = explain_with(&disabled_probe(Some(1_000_000)), 812, 100, &table());
+        assert_eq!(
+            w.sentence,
+            "System service OpenSSH Daemon (sshd.service), started at 09:12. It is not set to start automatically."
+        );
+        let w = explain_with(&disabled_probe(None), 812, 100, &table());
+        assert_eq!(
+            w.sentence,
+            "System service OpenSSH Daemon (sshd.service). It is not set to start automatically."
+        );
+    }
+
+    fn stat(pid: u32, sid: u32, start: u64) -> String {
+        format!("{pid} (x) S 1 {sid} {sid} 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 {start} 0 0")
+    }
+
+    fn orphan_probe(leader: Option<(u32, u64)>) -> Fake {
+        let mut f = Fake::default();
+        f.put(
+            "/proc/950/cgroup",
+            &v2("/user.slice/user-1000.slice/user@1000.service/app.slice/run-r1a2b.scope"),
+        );
+        f.put("/proc/950/stat", &stat(950, 700, 500));
+        if let Some((sid, start)) = leader {
+            f.put(&format!("/proc/{sid}/stat"), &stat(sid, sid, start));
+        }
+        f
+    }
+
+    fn orphan_table() -> Vec<Process> {
+        vec![row(1, 0, "systemd"), row(950, 1, "server")]
+    }
+
+    #[test]
+    fn a_process_whose_session_leader_is_gone_is_an_orphan() {
+        let w = explain_with(&orphan_probe(None), 950, 100, &orphan_table());
+        assert_eq!(w.cause, Cause::Orphan);
+    }
+
+    #[test]
+    fn a_process_whose_session_leader_still_runs_is_no_orphan() {
+        let w = explain_with(&orphan_probe(Some((700, 400))), 950, 100, &orphan_table());
+        assert!(matches!(w.cause, Cause::Unknown { .. }), "{:?}", w.cause);
+    }
+
+    #[test]
+    fn a_session_leader_pid_reused_by_a_newer_process_does_not_count_as_running() {
+        let w = explain_with(&orphan_probe(Some((700, 900))), 950, 100, &orphan_table());
+        assert_eq!(w.cause, Cause::Orphan);
+    }
+
+    fn timer_probe(last: Option<u64>, next: Option<u64>) -> Fake {
+        let mut f = sshd_probe("no");
+        f.units.get_mut("sshd.service").unwrap().triggered_by = vec!["man-db.timer".into()];
+        f.units.insert(
+            "man-db.timer".into(),
+            UnitProps {
+                last_trigger: last,
+                next_elapse: next,
+                ..UnitProps::default()
+            },
+        );
+        f
+    }
+
+    #[test]
+    fn a_timer_sentence_gives_the_last_start_and_the_next_run_when_known() {
+        let at = Some(1_000_000);
+        let said = |l, n| explain_with(&timer_probe(l, n), 812, 100, &table()).sentence;
+        assert_eq!(
+            said(at, at),
+            "Started by the timer man-db.timer at 09:12; next run 03:00 tomorrow."
+        );
+        assert_eq!(said(at, None), "Started by the timer man-db.timer at 09:12.");
+        assert_eq!(
+            said(None, at),
+            "Started by the timer man-db.timer next run 03:00 tomorrow."
+        );
+        assert_eq!(said(None, None), "Started by the timer man-db.timer.");
+    }
+
+    #[test]
+    fn the_next_run_names_the_day_only_when_it_is_not_today_or_tomorrow() {
+        let tz = jiff::tz::TimeZone::UTC;
+        let at = |s: &str| s.parse::<jiff::Timestamp>().unwrap().to_zoned(tz.clone());
+        let now = at("2026-10-22T18:00:00Z");
+        assert_eq!(next_phrase(&at("2026-10-22T23:30:00Z"), &now), "at 23:30");
+        assert_eq!(next_phrase(&at("2026-10-23T03:00:00Z"), &now), "03:00 tomorrow");
+        assert_eq!(next_phrase(&at("2026-10-25T03:00:00Z"), &now), "on Oct 25 at 03:00");
+    }
+
+    #[test]
+    fn a_program_replaced_since_it_started_says_so_and_an_unreadable_exe_says_nothing() {
+        let mut f = sshd_probe("no");
+        assert!(explain_with(&f, 812, 100, &table()).facts.is_empty());
+        f.put("/proc/812/exe", "/usr/bin/sshd");
+        assert!(explain_with(&f, 812, 100, &table()).facts.is_empty());
+        f.put("/proc/812/exe", "/usr/bin/sshd (deleted)");
+        assert_eq!(
+            explain_with(&f, 812, 100, &table()).facts,
+            ["Running an older copy of this program; restart it to use the installed one."]
         );
     }
 

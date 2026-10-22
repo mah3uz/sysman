@@ -396,6 +396,10 @@ impl Probe for Quick {
         self.0.uid()
     }
 
+    fn exe_link(&self, pid: u32) -> Option<String> {
+        self.0.exe_link(pid)
+    }
+
     fn unit(&self, _: &why::Unit) -> Result<why::UnitProps, String> {
         Err("asked next".into())
     }
@@ -430,7 +434,7 @@ fn accept(current: &mut Option<Explained>, key: Key, why: Why, complete: bool) -
 
 /// Whether "If you end it" warns that the process returns, for the End process confirmation.
 fn comes_back(if_you_end: &str) -> bool {
-    ["starts it again", "starts again", "comes back"]
+    ["starts it again", "stays stopped until"]
         .iter()
         .any(|p| if_you_end.contains(p))
 }
@@ -2404,6 +2408,7 @@ impl Processes {
         Some(
             section
                 .child(div().text_size(t.panel_title).child(why.sentence.clone()))
+                .children(why.facts.iter().map(|f| caption(f.clone(), cx)))
                 .child(div().flex().flex_col().gap(rem_px(2.)).children(chain))
                 .children(ending)
                 .children(notes.into_iter().map(|n| caption(n, cx)))
@@ -3061,6 +3066,7 @@ mod tests {
             if_you_end: None,
             evidence: Vec::new(),
             notes: Vec::new(),
+            facts: Vec::new(),
             actions: why::Actions::default(),
         }
     }
@@ -3195,6 +3201,10 @@ mod tests {
 
         fn docker_name(&self, _: &str) -> Result<String, String> {
             Err("none".into())
+        }
+
+        fn exe_link(&self, _: u32) -> Option<String> {
+            None
         }
     }
 
