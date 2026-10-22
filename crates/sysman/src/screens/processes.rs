@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, PoisonError};
@@ -24,6 +25,7 @@ use gpui_component::{Disableable, Icon, Sizable, Size, WindowExt};
 use gpui_kit_assets::IconName;
 use schema::Sample;
 use schema::cpu::CpuMeta;
+use schema::listeners::{Holder, Listener, Listeners, Protocol};
 use schema::processes::Process;
 use serde::{Deserialize, Serialize};
 
@@ -34,9 +36,9 @@ use crate::charts::trend::{ChartState, TrendChart, YScale, clock};
 use crate::data::desktop::IconIndex;
 use crate::data::helper;
 use crate::data::history::{Bucket, History, ProcField, bucket_width, db_path};
-use crate::data::live::Live;
+use crate::data::live::{Live, socket_path};
 use crate::data::prefs::{Prefs, prefs};
-use crate::data::process::ProcessFeed;
+use crate::data::process::{ProcessFeed, listeners};
 use crate::data::source::{Combine, Source, top_up};
 use crate::data::systemd::{Runner, System};
 use crate::data::why::{self, Probe, Why};
@@ -63,6 +65,8 @@ const INSPECTOR_KEY: &str = "processes.inspector";
 const WHY_KEY: &str = "processes.why";
 /// How long the cgroup-only answer waits for the full one before it shows, so a quick D-Bus reply does not flicker.
 const QUICK_AFTER: Duration = Duration::from_millis(150);
+/// A `port:` search asks the daemon once typing pauses, not per keystroke.
+const PORT_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Room the table leaves for its vertical scrollbar.
 const SCROLLBAR: f32 = 16.;
 const CELL_PAD: f32 = 6.;
@@ -432,6 +436,122 @@ fn accept(current: &mut Option<Explained>, key: Key, why: Why, complete: bool) -
     }
 }
 
+/// The listening sockets of one process instance, asked once when it is selected.
+struct Listening {
+    key: Key,
+    answer: Option<Result<Listeners, String>>,
+}
+
+fn ask_listeners() -> Result<Listeners, String> {
+    let path = socket_path().ok_or("XDG_RUNTIME_DIR is not set")?;
+    listeners(&path).map_err(|e| format!("{e:#}"))
+}
+
+/// Who can reach a socket, by its bound address. A bound UDP socket is often a client's (DNS, QUIC), so it is not
+/// called a service.
+fn reach(protocol: Protocol, address: IpAddr) -> &'static str {
+    if address.to_canonical().is_loopback() {
+        "this machine only"
+    } else if is_tcp(protocol) {
+        "reachable from the network"
+    } else {
+        "can receive from the network"
+    }
+}
+
+fn is_tcp(protocol: Protocol) -> bool {
+    matches!(protocol, Protocol::Tcp | Protocol::Tcp6)
+}
+
+/// The sockets this instance holds, by port; sockets that read the same (one per interface, or IPv4 in both
+/// tables) are listed once.
+fn held_by(l: &Listeners, selected: Key) -> Vec<&Listener> {
+    let mut held: Vec<&Listener> = l
+        .listeners
+        .iter()
+        .filter(|s| s.holders.iter().any(|h| (h.pid, h.start_time) == selected))
+        .collect();
+    held.sort_by_key(|s| (s.port, !is_tcp(s.protocol), s.address));
+    held.dedup_by_key(|s| (s.port, is_tcp(s.protocol), s.address));
+    held
+}
+
+/// A socket unit and the units it starts.
+type SocketUnit = (String, Vec<String>);
+
+/// What a `port:` search found.
+#[derive(Debug, PartialEq)]
+enum PortFound {
+    Process(Holder),
+    /// Only PID 1 or a user `systemd` holds it: a socket unit whose service is not running yet.
+    Waiting {
+        system: bool,
+    },
+    /// Opened by the kernel itself (NFS, WireGuard).
+    Kernel,
+    /// No holder could be read; `helper` is why, when the helper's part is missing.
+    Unknown {
+        uid: u32,
+        helper: Option<String>,
+    },
+    Nothing,
+}
+
+/// The holder of `port`, preferring a real process over PID 1 or a user `systemd` keeping a socket unit's port.
+fn port_holder(port: u16, l: &Listeners) -> PortFound {
+    let on: Vec<&Listener> = l.listeners.iter().filter(|s| s.port == port).collect();
+    let Some(first) = on.first() else {
+        return PortFound::Nothing;
+    };
+    let holders = || on.iter().flat_map(|s| &s.holders);
+    let manager = |h: &&Holder| h.pid == 1 || h.comm == "systemd";
+    if let Some(h) = holders().filter(|h| !manager(h)).min_by_key(|h| h.pid) {
+        return PortFound::Process(h.clone());
+    }
+    if let Some(h) = holders().find(manager) {
+        return PortFound::Waiting { system: h.pid == 1 };
+    }
+    if on.iter().all(|s| s.inode == 0) {
+        return PortFound::Kernel;
+    }
+    PortFound::Unknown {
+        uid: first.uid,
+        helper: l.holders_error.clone(),
+    }
+}
+
+/// The line under the search field for a `port:` search; `unit` is the socket unit and what it starts.
+fn port_line(port: u16, found: &PortFound, unit: Option<&SocketUnit>, owner: &str) -> String {
+    match found {
+        PortFound::Process(h) => format!("Port {port} is held by {} (PID {}).", h.comm, h.pid),
+        PortFound::Waiting { .. } => match unit {
+            Some((socket, starts)) => match starts.first() {
+                Some(service) => {
+                    format!("Port {port} is held by {socket}; {service} starts on the next connection.")
+                }
+                None => format!("Port {port} is held by {socket}; its service starts on the next connection."),
+            },
+            None => {
+                format!("Port {port} is held by systemd for a socket unit; its service starts on the next connection.")
+            }
+        },
+        PortFound::Kernel => format!("Port {port} is held by the Linux kernel, not by a process."),
+        PortFound::Unknown { helper: Some(_), .. } => {
+            format!("Port {port} is open, held by {owner}; enable the helper to see which process.")
+        }
+        PortFound::Unknown { helper: None, .. } => {
+            format!("Port {port} is open, held by {owner}; sysman can't see which process.")
+        }
+        PortFound::Nothing => format!("Nothing is listening on port {port}."),
+    }
+}
+
+/// A `port:` search: the line to show once answered, and whether it needs the helper's "Enable…".
+struct PortSearch {
+    port: u16,
+    line: Option<(String, bool)>,
+}
+
 /// Whether "If you end it" warns that the process returns, for the End process confirmation.
 fn comes_back(if_you_end: &str) -> bool {
     ["starts it again", "stays stopped until"]
@@ -600,10 +720,16 @@ fn started(start: u64, now: f64) -> String {
     }
 }
 
-/// Case-insensitive substring of the name or command line, or the exact pid.
+/// `port:<n>` typed into the filter; any other text filters by name, command line or PID.
+pub fn port_query(query: &str) -> Option<u16> {
+    query.trim().strip_prefix("port:")?.parse().ok().filter(|&p| p > 0)
+}
+
+/// Case-insensitive substring of the name or command line, or the exact pid; a `port:` search lists everything
+/// and selects the holder instead.
 pub fn matches(p: &Process, query: &str) -> bool {
     let query = query.trim();
-    if query.is_empty() {
+    if query.is_empty() || port_query(query).is_some() {
         return true;
     }
     let query = query.to_lowercase();
@@ -784,9 +910,13 @@ fn send(p: &Process, signal: Signal) -> Result<(), String> {
 }
 
 fn current_user() -> Option<String> {
+    user_name(unsafe { libc::getuid() })
+}
+
+fn user_name(uid: u32) -> Option<String> {
     // SAFETY: getpwuid returns null or a pointer to static storage, read here before any other call can reuse it.
     unsafe {
-        let pw = libc::getpwuid(libc::getuid());
+        let pw = libc::getpwuid(uid);
         if pw.is_null() {
             return None;
         }
@@ -1291,6 +1421,10 @@ pub struct Processes {
     panel: InspectorPref,
     why: Option<Explained>,
     why_pref: WhyPref,
+    listening: Option<Listening>,
+    port_search: Option<PortSearch>,
+    /// Counts edits of the search field, so only the last `port:` typed is asked.
+    typed: u64,
     /// The last unit action from Why it's running.
     unit_action: Option<(Key, UnitVerb, Outcome)>,
     /// A unit action succeeded: explain this process again once the next scan is in.
@@ -1371,6 +1505,9 @@ impl Processes {
             panel,
             why: None,
             why_pref,
+            listening: None,
+            port_search: None,
+            typed: 0,
             unit_action: None,
             rerun: None,
             inspector,
@@ -1429,6 +1566,10 @@ impl Processes {
                 .find(|r| r.label().eq_ignore_ascii_case(&name))
                 .unwrap_or(this.proc_range);
         }
+        #[cfg(debug_assertions)]
+        if let Ok(query) = std::env::var("SYSMAN_DEV_PROC_QUERY") {
+            this.set_query(query, cx);
+        }
         this.on_feed(cx);
         this
     }
@@ -1447,7 +1588,12 @@ impl Processes {
                 self.attempt
                     .is_some_and(|(range, key, _)| range == self.proc_range && key == selected)
                     && self.why.as_ref().is_some_and(|e| e.key == selected && e.complete)
+                    && self
+                        .listening
+                        .as_ref()
+                        .is_some_and(|l| l.key == selected && l.answer.is_some())
             })
+            && self.port_search.as_ref().is_none_or(|s| s.line.is_some())
     }
 
     fn delegate<'a>(&'a self, cx: &'a App) -> &'a ProcessTable {
@@ -1547,7 +1693,105 @@ impl Processes {
         }
         self.sync_inspector(cx);
         self.explain(cx);
+        self.listen(cx);
         self.refresh(cx);
+    }
+
+    /// Asks which sockets the inspected process listens on, once per instance.
+    fn listen(&mut self, cx: &mut Context<Self>) {
+        let selected = self.inspected.as_ref().map(key);
+        if self.listening.as_ref().map(|l| l.key) == selected {
+            return;
+        }
+        let Some(selected) = selected else {
+            self.listening = None;
+            return;
+        };
+        self.listening = Some(Listening {
+            key: selected,
+            answer: None,
+        });
+        let task = cx.background_executor().spawn(async { ask_listeners() });
+        cx.spawn(async move |this, cx| {
+            let answer = task.await;
+            this.update(cx, |this, cx| {
+                if let Some(l) = this.listening.as_mut().filter(|l| l.key == selected) {
+                    l.answer = Some(answer);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
+        self.typed += 1;
+        self.port_search = port_query(&query).map(|port| PortSearch { port, line: None });
+        self.with_table(cx, |table| {
+            table.model.filter = query;
+            table.model.rebuild();
+        });
+        let Some(port) = self.port_search.as_ref().map(|s| s.port) else {
+            return;
+        };
+        let typed = self.typed;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PORT_DEBOUNCE).await;
+            if !this.update(cx, |this, _| this.typed == typed).unwrap_or(false) {
+                return;
+            }
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    let l = ask_listeners()?;
+                    let found = port_holder(port, &l);
+                    let unit = match found {
+                        PortFound::Waiting { system } => why::socket_unit(system, port).ok().flatten(),
+                        _ => None,
+                    };
+                    Ok::<_, String>((found, unit))
+                })
+                .await;
+            this.update(cx, |this, cx| this.port_found(typed, port, found, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn port_found(
+        &mut self,
+        typed: u64,
+        port: u16,
+        found: Result<(PortFound, Option<SocketUnit>), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.typed != typed {
+            return;
+        }
+        let line = match found {
+            Err(e) => (format!("Couldn't look up port {port}: {e}."), false),
+            Ok((found, unit)) => {
+                if let PortFound::Process(h) = &found {
+                    self.focus = Some(Focus::Process {
+                        comm: h.comm.clone(),
+                        instance: Some((h.pid, h.start_time)),
+                    });
+                    // before the first table the next feed applies it
+                    if !self.delegate(cx).model.table.is_empty() {
+                        self.apply_focus(cx);
+                        self.sync_selection(cx);
+                    }
+                }
+                let owner = match &found {
+                    PortFound::Unknown { uid, .. } => user_name(*uid).unwrap_or_else(|| format!("uid {uid}")),
+                    _ => String::new(),
+                };
+                let hint = matches!(found, PortFound::Unknown { helper: Some(_), .. });
+                (port_line(port, &found, unit.as_ref(), &owner), hint)
+            }
+        };
+        self.port_search = Some(PortSearch { port, line: Some(line) });
+        cx.notify();
     }
 
     /// Works out why the inspected process runs, once per instance: the cgroup-only answer if D-Bus is slow, then
@@ -2419,6 +2663,65 @@ impl Processes {
         )
     }
 
+    /// The sockets the inspected process listens on; for another user's process whose sockets the daemon could not
+    /// match, why. `None` when it holds none, or before the answer.
+    fn listening_section(&self, p: &Process, cx: &App) -> Option<Div> {
+        let l = self.listening.as_ref().filter(|l| l.key == key(p))?;
+        let Some(Ok(answer)) = &l.answer else {
+            return None;
+        };
+        let t = theme(cx);
+        let section = div()
+            .flex()
+            .flex_col()
+            .gap(rem_px(8.))
+            .child(heading(IconName::Radio, "Listening on", cx));
+        let held = held_by(answer, l.key);
+        if held.is_empty() {
+            let theirs = p.user.is_none() || p.user != self.delegate(cx).me;
+            let reason = answer.holders_error.as_ref().filter(|_| theirs)?;
+            return Some(section.child(helper_hint(
+                "listening-enable",
+                format!("Its ports can't be seen: {reason}."),
+                cx,
+            )));
+        }
+        let rows = held.into_iter().enumerate().map(|(i, s)| {
+            let protocol = if is_tcp(s.protocol) { "TCP" } else { "UDP" };
+            let address = SharedString::from(SocketAddr::new(s.address, s.port).to_string());
+            div()
+                .id(("listening", i))
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .gap(rem_px(8.))
+                .text_size(t.caption)
+                .child(
+                    div()
+                        .w(rem_px(30.))
+                        .flex_shrink_0()
+                        .text_color(t.text_secondary)
+                        .child(protocol),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(t.mono.clone())
+                        .child(address.clone()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(t.text_secondary)
+                        .child(reach(s.protocol, s.address)),
+                )
+                .tooltip(move |window, cx| Tooltip::new(address.clone()).build(window, cx))
+        });
+        Some(section.child(details_card(cx).children(rows)))
+    }
+
     fn inspector(&self, cx: &mut Context<Self>) -> AnyElement {
         let this = cx.entity().downgrade();
         let close = this.clone();
@@ -2547,6 +2850,7 @@ impl Processes {
         )
         .children(why)
         .child(details)
+        .children(self.listening_section(p, cx))
         .when_some(status, |d, s| d.child(caption(s, cx).text_color(t.orange)))
         .child(range_picker(
             self.proc_range,
@@ -2632,14 +2936,16 @@ impl Processes {
     /// Builds what needs a window: the table and the search field.
     fn ensure_widgets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search.is_none() {
-            let search = cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name"));
+            let query = self.delegate(cx).model.filter.clone();
+            let search = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Filter by name or port:N")
+                    .default_value(query)
+            });
             cx.subscribe(&search, |this, search, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     let query = search.read(cx).value().to_string();
-                    this.with_table(cx, |table| {
-                        table.model.filter = query;
-                        table.model.rebuild();
-                    });
+                    this.set_query(query, cx);
                 }
             })
             .detach();
@@ -2733,6 +3039,18 @@ impl Render for Processes {
                     .flex_col()
                     .child(self.header(sample.as_deref(), cx))
                     .child(toolbar)
+                    .children(self.port_search.as_ref().map(|search| {
+                        let strip = div()
+                            .px(rem_px(12.))
+                            .py(rem_px(3.))
+                            .border_b_1()
+                            .border_color(t.hairline);
+                        match &search.line {
+                            None => strip.child(caption(format!("Looking up port {}…", search.port), cx)),
+                            Some((line, true)) => strip.child(helper_hint("port-enable", line.clone(), cx)),
+                            Some((line, false)) => strip.child(caption(line.clone(), cx)),
+                        }
+                    }))
                     .when(!helper_running, |d| {
                         d.child(
                             div()
@@ -3045,6 +3363,172 @@ mod tests {
             shown(&model),
             [(2, 0)],
             "a match whose parent is filtered out becomes a root"
+        );
+    }
+
+    #[test]
+    fn only_an_exact_port_search_leaves_the_name_filter() {
+        assert_eq!(port_query("port:631"), Some(631));
+        assert_eq!(port_query(" port:22 "), Some(22));
+        for typed in [
+            "port:",
+            "port:abc",
+            "port:70000",
+            "port:0",
+            "port: 631",
+            "port:631x",
+            "sport:631",
+            "Port",
+        ] {
+            assert_eq!(port_query(typed), None, "{typed:?} is not a port search");
+        }
+
+        // while it is asked, every process stays listed so its holder can be selected and scrolled to
+        let p = proc(4242, 1, "firefox", 1);
+        assert!(matches(&p, "port:631"));
+        // a half-typed or mistyped port filters by name as before
+        assert!(!matches(&p, "port:"));
+        assert!(!matches(&p, "port:abc"));
+        let mut q = proc(7, 1, "port:watch", 1);
+        q.cmdline = "/usr/bin/port:watch".into();
+        assert!(matches(&q, "port:w"), "a name containing port: still matches");
+    }
+
+    fn socket(protocol: Protocol, address: &str, port: u16, inode: u64, holders: &[(u32, &str)]) -> Listener {
+        Listener {
+            protocol,
+            address: address.parse().unwrap(),
+            port,
+            uid: 0,
+            inode,
+            holders: holders
+                .iter()
+                .map(|&(pid, comm)| Holder {
+                    pid,
+                    start_time: 100 + pid as u64,
+                    comm: comm.into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn loopback_stays_on_this_machine_and_udp_is_never_called_a_service() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        for local in ["127.0.0.1", "127.0.0.53", "::1", "::ffff:127.0.0.1"] {
+            assert_eq!(reach(Protocol::Tcp6, ip(local)), "this machine only", "{local}");
+            assert_eq!(reach(Protocol::Udp6, ip(local)), "this machine only", "{local}");
+        }
+        for open in ["0.0.0.0", "::", "192.168.1.5", "::ffff:192.168.1.5", "fe80::1"] {
+            assert_eq!(reach(Protocol::Tcp, ip(open)), "reachable from the network", "{open}");
+        }
+        // a DNS or QUIC client's ephemeral socket is bound like a server's: say only what the address allows
+        assert_eq!(reach(Protocol::Udp, ip("0.0.0.0")), "can receive from the network");
+    }
+
+    #[test]
+    fn the_listening_section_lists_only_this_instance_by_port() {
+        let l = Listeners {
+            listeners: vec![
+                socket(Protocol::Tcp6, "::1", 631, 1, &[(812, "cupsd")]),
+                socket(Protocol::Tcp, "127.0.0.1", 631, 2, &[(812, "cupsd")]),
+                socket(Protocol::Udp, "224.0.0.251", 53, 3, &[(812, "cupsd")]),
+                socket(Protocol::Udp, "224.0.0.251", 53, 5, &[(812, "cupsd")]),
+                socket(Protocol::Tcp6, "127.0.0.1", 631, 6, &[(812, "cupsd")]),
+                socket(Protocol::Tcp, "0.0.0.0", 22, 4, &[(900, "sshd")]),
+            ],
+            holders_error: None,
+        };
+        let held: Vec<_> = held_by(&l, (812, 912))
+            .iter()
+            .map(|s| (s.port, s.protocol, s.address.to_string()))
+            .collect();
+        // one row per thing the reader can tell apart: per-interface copies and a v4 socket in tcp6 read the same
+        assert_eq!(
+            held,
+            [
+                (53, Protocol::Udp, "224.0.0.251".into()),
+                (631, Protocol::Tcp, "127.0.0.1".into()),
+                (631, Protocol::Tcp6, "::1".into())
+            ]
+        );
+        assert!(held_by(&l, (812, 1)).is_empty(), "a reused pid is another process");
+    }
+
+    #[test]
+    fn a_port_search_selects_the_service_not_the_manager_keeping_its_socket() {
+        let l = |listeners: Vec<Listener>, error: Option<&str>| Listeners {
+            listeners,
+            holders_error: error.map(str::to_owned),
+        };
+        let running = l(
+            vec![
+                socket(
+                    Protocol::Tcp,
+                    "0.0.0.0",
+                    22,
+                    1,
+                    &[(1, "systemd"), (950, "sshd"), (900, "sshd")],
+                ),
+                socket(Protocol::Tcp6, "::", 22, 2, &[(1, "systemd")]),
+            ],
+            None,
+        );
+        match port_holder(22, &running) {
+            PortFound::Process(h) => assert_eq!((h.pid, h.comm.as_str()), (900, "sshd")),
+            other => panic!("{other:?}"),
+        }
+
+        let waiting = l(vec![socket(Protocol::Tcp, "0.0.0.0", 631, 1, &[(1, "systemd")])], None);
+        assert_eq!(port_holder(631, &waiting), PortFound::Waiting { system: true });
+        let user = l(
+            vec![socket(Protocol::Tcp, "127.0.0.1", 8080, 1, &[(1500, "systemd")])],
+            None,
+        );
+        assert_eq!(port_holder(8080, &user), PortFound::Waiting { system: false });
+
+        let hidden = l(
+            vec![socket(Protocol::Tcp, "0.0.0.0", 5432, 7, &[])],
+            Some("sysman-helper is not running"),
+        );
+        assert_eq!(
+            port_holder(5432, &hidden),
+            PortFound::Unknown {
+                uid: 0,
+                helper: Some("sysman-helper is not running".into())
+            }
+        );
+        let kernel = l(vec![socket(Protocol::Udp, "0.0.0.0", 51820, 0, &[])], Some("off"));
+        assert_eq!(
+            port_holder(51820, &kernel),
+            PortFound::Kernel,
+            "no helper would find a holder"
+        );
+        assert_eq!(port_holder(80, &running), PortFound::Nothing);
+    }
+
+    #[test]
+    fn a_waiting_port_names_its_socket_unit_and_what_starts() {
+        let unit = ("cups.socket".to_owned(), vec!["cups.service".to_owned()]);
+        assert_eq!(
+            port_line(631, &PortFound::Waiting { system: true }, Some(&unit), ""),
+            "Port 631 is held by cups.socket; cups.service starts on the next connection."
+        );
+        assert_eq!(
+            port_line(
+                5432,
+                &PortFound::Unknown {
+                    uid: 0,
+                    helper: Some("off".into())
+                },
+                None,
+                "root"
+            ),
+            "Port 5432 is open, held by root; enable the helper to see which process."
+        );
+        assert_eq!(
+            port_line(9, &PortFound::Nothing, None, ""),
+            "Nothing is listening on port 9."
         );
     }
 
