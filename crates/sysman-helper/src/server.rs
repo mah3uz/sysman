@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use schema::helper::{Reading, Request, Status};
+use schema::helper::{Reading, Request, Sockets, Status};
 use serde_json::json;
 
 use crate::net::Net;
@@ -80,6 +80,12 @@ impl Sources {
             smart: self.smart.lock().expect("smart lock").drives.clone(),
         }
     }
+
+    pub fn sockets(&self) -> Result<Sockets, String> {
+        Ok(Sockets {
+            processes: procs::sockets(&self.root)?,
+        })
+    }
 }
 
 /// Spaces a client's answers at least `MIN_GAP` apart.
@@ -141,7 +147,11 @@ fn answer(line: &str, sources: &Sources) -> String {
     let reply = match serde_json::from_str::<Request>(line) {
         Ok(Request::Status) => serde_json::to_value(sources.status()),
         Ok(Request::Read) => serde_json::to_value(sources.read()),
-        Err(_) => Ok(json!({"error": r#"expected {"cmd":"status"} or {"cmd":"read"}"#})),
+        Ok(Request::Sockets) => match sources.sockets() {
+            Ok(s) => serde_json::to_value(s),
+            Err(e) => Ok(json!({ "error": e })),
+        },
+        Err(_) => Ok(json!({"error": r#"expected {"cmd":"status"}, {"cmd":"read"} or {"cmd":"sockets"}"#})),
     };
     reply.unwrap_or_else(|e| json!({"error": e.to_string()})).to_string()
 }
@@ -194,5 +204,37 @@ mod tests {
         assert!(reply["error"].as_str().unwrap().contains("status"));
         let reply: Value = serde_json::from_str(&answer("{\"cmd\":\"status\"}\n", &s)).unwrap();
         assert_eq!(reply["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn sockets_answer_carries_pid_start_and_inodes_and_nothing_else() {
+        // the socket's group may read this; any extra field widens what the helper reveals as root
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path().join("proc/9");
+        std::fs::create_dir_all(p.join("fd")).unwrap();
+        std::fs::write(
+            p.join("stat"),
+            "9 (x) S 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 555 1 1 0\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("socket:[31337]", p.join("fd/3")).unwrap();
+        std::os::unix::fs::symlink("/etc/shadow", p.join("fd/4")).unwrap();
+        let ask =
+            || -> Value { serde_json::from_str(&answer("{\"cmd\":\"sockets\"}\n", &sources(root.path()))).unwrap() };
+        assert!(
+            ask()["error"].as_str().unwrap().contains("proc/1/net"),
+            "without the host's tables to filter by there is no answer"
+        );
+        let net = root.path().join("proc/1/net");
+        std::fs::create_dir_all(&net).unwrap();
+        std::fs::write(
+            net.join("tcp"),
+            "  sl  local_address rem_address   st\n   0: 00000000:0016 00000000:0000 0A 0:0 0:0 0 0 0 31337 1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ask(),
+            serde_json::json!({"processes": [{"pid": 9, "start_ticks": 555, "inodes": [31337]}]})
+        );
     }
 }

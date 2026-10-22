@@ -126,7 +126,7 @@ impl IconIndex {
     }
 }
 
-fn data_dirs() -> Vec<PathBuf> {
+pub fn data_dirs() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     let user = match std::env::var_os("XDG_DATA_HOME") {
         Some(dir) if Path::new(&dir).is_absolute() => PathBuf::from(dir),

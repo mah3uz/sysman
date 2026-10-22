@@ -4,8 +4,8 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use schema::db::SCHEMA;
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use schema::db::{ADDED_COLUMNS, AFTER_ADDED, SCHEMA};
 use schema::processes::Process;
 use serde::Deserialize;
 use serde_json::Value;
@@ -146,11 +146,11 @@ impl Db {
             side.push(suffix);
             owner_only(Path::new(&side), false)?;
         }
-        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         // crash evidence lives in the fsync'd JSONL; the database may lose its last commits on power loss
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.execute_batch(SCHEMA)?;
+        migrate(&mut conn).context("updating the database schema")?;
         let series = conn
             .prepare("SELECT path, id FROM series")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -351,6 +351,23 @@ fn fold_crash(tx: &Transaction, e: &Event) -> Result<()> {
     Ok(())
 }
 
+/// Creates what is missing: tables, then the columns added since, which `CREATE TABLE IF NOT EXISTS` leaves out of a
+/// table that exists. One transaction, so a failure leaves the database as it was.
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(SCHEMA)?;
+    let mut has = tx.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?;
+    for (table, column, kind) in ADDED_COLUMNS {
+        if !has.exists([table, column])? {
+            tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+        }
+    }
+    drop(has);
+    tx.execute_batch(AFTER_ADDED)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Creates `path` (when `create`) or narrows an existing one to mode 0600.
 fn owner_only(path: &Path, create: bool) -> Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -388,11 +405,17 @@ fn write_procs(
     t: i64,
     rows: Vec<Process>,
 ) -> Result<()> {
-    let mut touch = tx.prepare_cached("UPDATE procs SET last_t = ?2 WHERE id = ?1")?;
+    // a row recorded before ppid and cgroup were gets them once, from the first sample after the upgrade that has them
+    let mut touch = tx.prepare_cached(
+        "UPDATE procs SET last_t = ?2, ppid = coalesce(ppid, ?3), cgroup_id = coalesce(cgroup_id, ?4) WHERE id = ?1",
+    )?;
     // the conflict branch covers an instance whose id was not loaded into the map at open
     let mut insert = tx.prepare_cached(
-        "INSERT INTO procs (pid, start_time, comm, cmdline, user, first_t, last_t) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-         ON CONFLICT (pid, start_time) DO UPDATE SET last_t = excluded.last_t RETURNING id",
+        "INSERT INTO procs (pid, start_time, comm, cmdline, user, first_t, last_t, ppid, cgroup_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8)
+         ON CONFLICT (pid, start_time) DO UPDATE SET last_t = excluded.last_t,
+           ppid = coalesce(ppid, excluded.ppid), cgroup_id = coalesce(cgroup_id, excluded.cgroup_id)
+         RETURNING id",
     )?;
     let mut point = tx.prepare_cached(
         "INSERT OR REPLACE INTO proc_points (proc_id, t, cpu_pct, rss_bytes, threads, fds, read_bps, write_bps)
@@ -400,15 +423,19 @@ fn write_procs(
     )?;
     for r in rows {
         let key = (i64::from(r.pid), r.start_time as i64);
+        let cgroup = r.cgroup.as_deref().map(|p| intern_cgroup(tx, p)).transpose()?;
         let id = match procs.get_mut(&key) {
             Some((id, last)) => {
-                touch.execute(params![*id, t])?;
+                touch.execute(params![*id, t, r.ppid, cgroup])?;
                 *last = t;
                 *id
             }
             None => {
                 let cmdline = Some(r.cmdline.as_str()).filter(|c| !c.is_empty());
-                let id = insert.query_row(params![key.0, key.1, r.comm, cmdline, r.user, t], |row| row.get(0))?;
+                let id = insert.query_row(
+                    params![key.0, key.1, r.comm, cmdline, r.user, t, r.ppid, cgroup],
+                    |row| row.get(0),
+                )?;
                 procs.insert(key, (id, t));
                 id
             }
@@ -434,6 +461,19 @@ fn write_procs(
         add_proc_point(minute, id, t, p);
     }
     Ok(())
+}
+
+fn intern_cgroup(tx: &Transaction, path: &str) -> Result<i64> {
+    let found = tx
+        .prepare_cached("SELECT id FROM cgroups WHERE path = ?1")?
+        .query_row([path], |r| r.get(0))
+        .optional()?;
+    if let Some(id) = found {
+        return Ok(id);
+    }
+    tx.prepare_cached("INSERT INTO cgroups (path) VALUES (?1)")?
+        .execute([path])?;
+    Ok(tx.last_insert_rowid())
 }
 
 fn add_proc_point(minute: &mut HashMap<(i64, i64), ProcAcc>, id: i64, t: i64, p: ProcPoint) {
@@ -603,7 +643,13 @@ fn prune_procs(tx: &Transaction, r: &Retention, now: i64) -> Result<()> {
         points.execute(params![id, i64::MAX])?;
         rollups.execute(params![id, i64::MAX])?;
     }
-    tx.execute("DELETE FROM procs WHERE last_t < ?1", params![cutoff])?;
+    if tx.execute("DELETE FROM procs WHERE last_t < ?1", params![cutoff])? > 0 {
+        // probes the procs_cgroup index once per distinct path
+        tx.execute(
+            "DELETE FROM cgroups WHERE NOT EXISTS (SELECT 1 FROM procs WHERE cgroup_id = cgroups.id)",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -902,6 +948,189 @@ mod tests {
             (1, 1, 1)
         );
         assert_eq!(db.procs.len(), 1, "the in-memory map is bounded too");
+    }
+
+    /// A row as the collector hands it over on the sample that first reports the instance.
+    fn first_seen(pid: u32, start: u64, ppid: u32, cgroup: &str) -> Value {
+        let mut row = proc_row(pid, start, 1.0);
+        row["ppid"] = ppid.into();
+        row["cgroup"] = cgroup.into();
+        row
+    }
+
+    /// (ppid, cgroup path) of the instance.
+    fn origin(db: &Db, pid: u32, start: i64) -> (Option<i64>, Option<String>) {
+        db.conn
+            .query_row(
+                "SELECT p.ppid, c.path FROM procs p LEFT JOIN cgroups c ON c.id = p.cgroup_id
+                 WHERE p.pid = ?1 AND p.start_time = ?2",
+                params![pid, start],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_new_instance_keeps_the_cgroup_and_parent_it_was_first_seen_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        db.write(&proc_sample(
+            100,
+            vec![first_seen(7, 50, 300, "/system.slice/a.service")],
+        ))
+        .unwrap();
+        // later samples carry no cgroup, and the parent may have exited and left the process to init
+        let mut reparented = proc_row(7, 50, 1.0);
+        reparented["ppid"] = 1.into();
+        db.write(&proc_sample(110, vec![reparented])).unwrap();
+        assert_eq!(
+            origin(&db, 7, 50),
+            (Some(300), Some("/system.slice/a.service".into())),
+            "why it ran is answered by how it started"
+        );
+    }
+
+    #[test]
+    fn instances_in_the_same_cgroup_share_one_path_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        let unit = "/user.slice/user-1000.slice/user@1000.service/app.slice/a.service";
+        db.write(&proc_sample(
+            100,
+            vec![first_seen(7, 50, 1, unit), first_seen(8, 51, 7, unit)],
+        ))
+        .unwrap();
+        db.write(&proc_sample(110, vec![first_seen(9, 52, 7, unit)])).unwrap();
+        assert_eq!(
+            count(&db, "cgroups"),
+            1,
+            "a path is stored once, however many processes ran in it"
+        );
+        let ids: i64 = db
+            .conn
+            .query_row("SELECT count(DISTINCT cgroup_id) FROM procs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((count(&db, "procs"), ids), (3, 1));
+    }
+
+    #[test]
+    fn retention_drops_paths_no_process_refers_to_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        db.write(&proc_sample(
+            100,
+            vec![
+                first_seen(7, 50, 1, "/system.slice/gone.service"),
+                first_seen(8, 51, 1, "/system.slice/shared.service"),
+            ],
+        ))
+        .unwrap();
+        let later = 100 + 2 * 86400;
+        db.write(&proc_sample(
+            later,
+            vec![
+                first_seen(9, 60, 1, "/system.slice/shared.service"),
+                first_seen(10, 61, 1, "/system.slice/live.service"),
+            ],
+        ))
+        .unwrap();
+        // 8 days on: pids 7 and 8 are past the 7 days of process history, 9 and 10 are not
+        db.write(&proc_sample(100 + 8 * 86400, vec![])).unwrap();
+        let paths: Vec<String> = db
+            .conn
+            .prepare("SELECT path FROM cgroups ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(paths, ["/system.slice/live.service", "/system.slice/shared.service"]);
+        assert_eq!(origin(&db, 9, 60).1.as_deref(), Some("/system.slice/shared.service"));
+    }
+
+    /// `procs` as the release before cgroups were recorded created it.
+    const OLD_PROCS: &str = "
+        CREATE TABLE procs (
+            id INTEGER PRIMARY KEY, pid INTEGER NOT NULL, start_time INTEGER NOT NULL, comm TEXT NOT NULL,
+            cmdline TEXT, user TEXT, first_t INTEGER NOT NULL, last_t INTEGER NOT NULL,
+            UNIQUE (pid, start_time));
+        CREATE INDEX procs_comm ON procs (comm);
+        CREATE INDEX procs_last ON procs (last_t);
+        INSERT INTO procs (pid, start_time, comm, cmdline, user, first_t, last_t)
+            VALUES (7, 50, 'old', 'old --x', 'me', 100, 200);";
+
+    #[test]
+    fn an_existing_database_is_migrated_in_place_keeping_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        Connection::open(dir.path().join("h.db"))
+            .unwrap()
+            .execute_batch(OLD_PROCS)
+            .unwrap();
+        let mut db = open(&dir);
+        let row: (String, i64, i64, Option<i64>, Option<i64>) = db
+            .conn
+            .query_row(
+                "SELECT comm, first_t, last_t, ppid, cgroup_id FROM procs WHERE pid = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("old".into(), 100, 200, None, None),
+            "history recorded before the upgrade is kept, with nothing invented for it"
+        );
+        db.write(&proc_sample(300, vec![first_seen(8, 60, 1, "/init.scope")]))
+            .unwrap();
+        drop(db);
+        // every start runs the migration; a second must change nothing and lose nothing
+        let db = open(&dir);
+        assert_eq!(count(&db, "procs"), 2);
+        assert_eq!(origin(&db, 8, 60), (Some(1), Some("/init.scope".into())));
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let shape = |db: &Db| -> Vec<(String, String)> {
+            db.conn
+                .prepare("SELECT name, type FROM pragma_table_info('procs')")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(shape(&db), shape(&open(&fresh_dir)), "the app reads both the same way");
+    }
+
+    #[test]
+    fn a_process_running_across_the_upgrade_gets_its_cgroup_from_the_first_sample_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        Connection::open(dir.path().join("h.db"))
+            .unwrap()
+            .execute_batch(OLD_PROCS)
+            .unwrap();
+        let mut db = open(&dir);
+        // a restarted collector reports every running instance as first seen
+        db.write(&proc_sample(
+            300,
+            vec![first_seen(7, 50, 1, "/system.slice/old.service")],
+        ))
+        .unwrap();
+        assert_eq!(origin(&db, 7, 50), (Some(1), Some("/system.slice/old.service".into())));
+        db.write(&proc_sample(310, vec![first_seen(7, 50, 99, "/elsewhere")]))
+            .unwrap();
+        assert_eq!(
+            origin(&db, 7, 50),
+            (Some(1), Some("/system.slice/old.service".into())),
+            "a recorded origin is never overwritten"
+        );
+    }
+
+    #[test]
+    fn an_instance_whose_cgroup_could_not_be_read_is_stored_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        db.write(&proc_sample(100, vec![proc_row(7, 50, 1.0)])).unwrap();
+        assert_eq!(origin(&db, 7, 50), (Some(1), None));
+        assert_eq!(count(&db, "cgroups"), 0);
     }
 
     #[test]

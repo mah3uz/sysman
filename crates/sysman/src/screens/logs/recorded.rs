@@ -1,10 +1,11 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, Div, ElementId, Hsla, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder, px,
-    relative,
+    AnyElement, Context, Div, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, Sizable};
 use gpui_kit_assets::IconName;
 
@@ -13,6 +14,7 @@ use super::{Logs, model};
 use crate::charts::format::{bytes, temperature};
 use crate::charts::sparkline::Sparkline;
 use crate::data::history::{Bucket, History, ProcField, bucket_width, db_path};
+use crate::data::why;
 use crate::ui::shell::{Focus, Tab, navigate};
 use crate::ui::theme::{Theme, rem_px, theme};
 
@@ -67,6 +69,7 @@ pub(super) struct Read {
     mem: Vec<Bucket>,
     temp: Vec<Bucket>,
     process: Option<(String, Vec<Bucket>)>,
+    why: Option<String>,
 }
 
 pub(super) fn read(ask: &Ask) -> Read {
@@ -75,6 +78,7 @@ pub(super) fn read(ask: &Ask) -> Read {
     };
     let (from, to) = ask.span;
     let series = |path: &str| history.series(path, from, to, ask.points).unwrap_or_default();
+    let mut why = None;
     let process = ask.pid.and_then(|pid| {
         let at = ask.at();
         let procs = history.procs_between(at - 2 * AROUND_S, at + 5).ok()?;
@@ -83,13 +87,21 @@ pub(super) fn read(ask: &Ask) -> Read {
             .filter(|p| p.pid == i64::from(pid) && p.first_t <= at)
             .max_by_key(|p| p.first_t)?;
         let rss = history.proc_series(p.id, ProcField::Rss, from, to, ask.points).ok()?;
-        (!rss.is_empty()).then(|| (format!("{} memory", p.comm), rss))
+        if rss.is_empty() {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        why = Some(why::recorded_line(&history, &p, now));
+        Some((format!("{} memory", p.comm), rss))
     });
     Read {
         cpu: series("/cpu/total_pct"),
         mem: series("/memory/used_pct"),
         temp: series("/cpu/temp_c"),
         process,
+        why,
     }
 }
 
@@ -163,6 +175,7 @@ pub(super) struct Data {
     pub mem: Rc<[Bucket]>,
     pub temp: Rc<[Bucket]>,
     pub process: Option<(String, Rc<[Bucket]>)>,
+    pub why: Option<String>,
 }
 
 impl Recorded {
@@ -178,6 +191,7 @@ impl Recorded {
             mem: read.mem.into(),
             temp: read.temp.into(),
             process: read.process.map(|(l, d)| (l, d.into())),
+            why: read.why,
         });
     }
 
@@ -362,12 +376,30 @@ pub(super) fn charts(id: &'static str, recorded: &Recorded, wide: bool, height: 
             t,
         ));
     }
-    div()
+    let grid = div()
         .grid()
         .grid_cols(if wide { items.len() as u16 } else { 2 })
         .gap_x(rem_px(14.))
         .gap_y(rem_px(10.))
-        .children(items)
+        .children(items);
+    let Some(why) = data.why.clone() else {
+        return grid.into_any_element();
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(rem_px(8.))
+        .child(grid)
+        .child(
+            div()
+                .id((id, 4usize))
+                .min_w_0()
+                .truncate()
+                .text_size(t.small_caption)
+                .text_color(t.text_secondary)
+                .child(format!("Why it ran: {why}"))
+                .tooltip(move |window, cx| Tooltip::new(why.clone()).build(window, cx)),
+        )
         .into_any_element()
 }
 

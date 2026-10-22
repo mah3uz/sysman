@@ -121,6 +121,8 @@ pub enum Focus {
     Time { t: i64 },
     /// The log entry nearest this time, in microseconds since the epoch.
     LogEntry { t_us: u64 },
+    /// Search text for the Logs search field, such as `unit:sshd.service`.
+    LogQuery(String),
 }
 
 struct Navigator(WeakEntity<Shell>);

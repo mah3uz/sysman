@@ -19,6 +19,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::popover::Popover;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{Disableable, Icon, Selectable, Sizable, WindowExt};
 use gpui_kit_assets::IconName;
 
@@ -31,6 +32,7 @@ use crate::data::events::{self, Event};
 use crate::data::history::{Bucket, History, Proc, ProcPoint, bucket_width, db_path};
 use crate::data::live::Live;
 use crate::data::source::Source;
+use crate::data::why;
 use crate::ui::shell::{Focus, take_focus};
 use crate::ui::theme::{Theme, rem_px, theme};
 use crate::ui::widgets::hint::helper_hint;
@@ -209,6 +211,8 @@ pub struct Explorer {
     filter_text: String,
     search: Option<Entity<InputState>>,
     results: Vec<Proc>,
+    /// Why each compared process ran, by `procs` id; absent while it is being read.
+    why: HashMap<i64, SharedString>,
     searched: Option<String>,
     top: Vec<(Proc, ProcPoint)>,
     top_at: Option<i64>,
@@ -261,6 +265,7 @@ impl Explorer {
             filter_text: String::new(),
             search: None,
             results: Vec::new(),
+            why: HashMap::new(),
             searched: None,
             top: Vec::new(),
             top_at: None,
@@ -520,13 +525,39 @@ impl Explorer {
 
     fn toggle_proc(&mut self, proc: Proc, cx: &mut Context<Self>) {
         if let Some(i) = self.selected.iter().position(|s| s.proc.id == proc.id) {
-            self.selected.remove(i);
+            self.why.remove(&self.selected.remove(i).proc.id);
         } else {
             let used: Vec<usize> = self.selected.iter().map(|s| s.slot).collect();
             let Some(slot) = model::free_slot(&used) else { return };
+            self.load_why(&proc, cx);
             self.selected.push(Selected { proc, slot });
         }
         self.refresh(cx);
+    }
+
+    fn load_why(&self, proc: &Proc, cx: &mut Context<Self>) {
+        let now = self.now(cx) as i64;
+        let proc = proc.clone();
+        let task = cx.background_executor().spawn({
+            let proc = proc.clone();
+            async move {
+                match History::open(&db_path()) {
+                    Ok(h) => why::recorded_line(&h, &proc, now),
+                    Err(_) => why::NOT_RECORDED.into(),
+                }
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let line = task.await;
+            this.update(cx, |this, cx| {
+                if this.selected.iter().any(|s| s.proc.id == proc.id) {
+                    this.why.insert(proc.id, line.into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn change_view(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut View, f64)) {
@@ -1086,24 +1117,41 @@ impl Explorer {
                         .map(|d| hairline_bottom(d, t))
                         .children(self.selected.iter().map(|s| {
                             let proc = s.proc.clone();
+                            let why = self.why.get(&s.proc.id).cloned();
                             div()
                                 .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(rem_px(6.))
-                                .text_size(t.caption)
-                                .child(dot(Hue::PROCESSES[s.slot].color(t), 7.))
-                                .child(div().flex_1().min_w_0().truncate().child(s.label()))
+                                .flex_col()
                                 .child(
-                                    Button::new(("remove", s.proc.id as u64))
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(Icon::new(IconName::X))
-                                        .tooltip("Remove from comparison")
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| this.toggle_proc(proc.clone(), cx)),
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(rem_px(6.))
+                                        .text_size(t.caption)
+                                        .child(dot(Hue::PROCESSES[s.slot].color(t), 7.))
+                                        .child(div().flex_1().min_w_0().truncate().child(s.label()))
+                                        .child(
+                                            Button::new(("remove", s.proc.id as u64))
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(Icon::new(IconName::X))
+                                                .tooltip("Remove from comparison")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.toggle_proc(proc.clone(), cx)
+                                                })),
                                         ),
                                 )
+                                .children(why.map(|why| {
+                                    div()
+                                        .id(("why", s.proc.id as u64))
+                                        .pl(rem_px(13.))
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(t.small_caption)
+                                        .text_color(t.text_secondary)
+                                        .child(why.clone())
+                                        .tooltip(move |window, cx| Tooltip::new(why.clone()).build(window, cx))
+                                }))
                         })),
                 )
             })

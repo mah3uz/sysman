@@ -147,21 +147,93 @@ means" and "How it is calculated". Panels without a chart have no arrow.
 - Header cards: CPU USAGE (user/sys split, peak), CORES, LOAD AVERAGE, CPU
   TEMPERATURE; each opens its detail sheet.
 - Table, from socket `processes` every refresh (the full table). Columns,
-  chosen from a Columns menu and remembered: Process (icon from the `.desktop`
+  chosen from a Columns menu and remembered: PID, Process (icon from the `.desktop`
   file matched by executable, else a generic glyph), Command, Path, Memory
   (RSS, shared pages counted in full), Mem % (two decimals below 1%, "<0.01%"
   below that), Virtual, CPU % (of one core), CPU time, Threads, FDs, Read/s,
-  Write/s, Net ↓, Net ↑, User, State, Nice, Priority, Started, PID, PPID.
+  Write/s, Net ↓, Net ↑, User, State, Nice, Priority, Started, PPID.
   Default sort Memory descending; the whole header cell sorts. Search filter;
   Hierarchy toggle (tree by ppid, flattened into rows); selection kept by
   pid + start time across re-sorts.
-- Inspector (resizable, collapsible): name, PID, user, start time, command
-  line; range picker; charts Memory, CPU, File descriptors, Disk I/O from
-  `proc_points` / `proc_rollup_1m`, sharing a cursor. Earlier runs of the same
-  command (same name and command line, started before this one) are summed and
-  drawn as dashed lines on the Memory, CPU and FD charts.
+- Inspector (resizable, collapsible), top to bottom: name and PID; **Why it's
+  running** (below); details (user, start time, state, command line);
+  **Listening on** (below); range picker; charts Memory, CPU, File
+  descriptors, Disk I/O from `proc_points` / `proc_rollup_1m`, sharing a
+  cursor. Earlier runs of the same command (same name and command line,
+  started before this one) are summed and drawn as dashed lines on the
+  Memory, CPU and FD charts.
+- **Why it's running**: one plain sentence naming the cause of the selected
+  running process, the chain that leads to it, and what ending it would do.
+  Worked out only for the selected process, once per selection (pid + start
+  time), never per row and never stored. Facts only: every cause names its
+  evidence, and what cannot be known is said ("sysman can't tell why: …").
+  - *Cause* from `/proc/<pid>/cgroup` (any user may read it) and the parent
+    chain, classified by a pure function in `data/why.rs`. The cgroup comes
+    first because an orphan is re-parented to PID 1 or a subreaper, so the
+    parent chain alone misleads. Kinds and their sentences:
+
+    | Kind | Evidence | Sentence |
+    | --- | --- | --- |
+    | System or user service | `….service` in the cgroup; unit `UnitFileState`, `WantedBy` | "System service *OpenSSH Daemon* (sshd.service), enabled at boot." |
+    | Socket-activated | unit `TriggeredBy` a `.socket` | "Started when something connected to port 631 (cups.socket)." |
+    | Timer | `TriggeredBy` a `.timer`; the timer's `LastTriggerUSec`, `NextElapseUSecRealtime` | "Started by the timer man-db.timer at 03:00; next run 03:00 tomorrow." |
+    | D-Bus activated | unit `BusName` and nothing wants it | "Started on demand for org.freedesktop.UDisks2." |
+    | Login autostart | `app-…@autostart.service`, unit `SourcePath` | "Starts when you log in, from ~/.config/autostart/x.desktop." |
+    | App | `app-…<desktop id>….scope`, name from the `.desktop` file | "You opened *Firefox* at 09:12." |
+    | Terminal | the parent chain reaches a terminal or shell | "Run in a terminal: kitty → zsh → cargo." |
+    | Orphan | parent is PID 1 or a subreaper, cgroup not its own unit, and its session leader (`stat` field 6) no longer runs | "Started by a terminal or script that has since exited." |
+    | Login session | `session-N.scope`; logind `Type`, `Remote`, `RemoteHost` | "Part of mahfuz's SSH login from 192.168.1.5." |
+    | Container | `docker-<id>`, `libpod-<id>`, `kubepods`, `machine.slice` | "Runs in Docker container 3f2a9c…" (name when readable) |
+    | Flatpak or Snap | `app-flatpak-<id>-…`, `snap.<name>.…` | "Flatpak app com.discordapp.Discord." |
+    | Cron | the parent chain passes `crond` or `cron` | "Started by cron." |
+    | Kernel | pid 2 or ppid 2 | "Part of the Linux kernel; it can't be ended." |
+    | Unknown | none match | "sysman can't tell why: <reason>." |
+
+    cgroup v1 hybrids use the `name=systemd` line; without systemd the
+    parent chain alone gives the answer. Terminal multiplexers (tmux,
+    screen) are named only on an exact `comm` match. One fact line is added
+    under the sentence when it holds: the program file was replaced or
+    removed since it started (`/proc/<pid>/exe` ends in " (deleted)"), "Running
+    an older copy of this program; restart it to use the installed one."
+  - *Details* for the selected process only: unit properties over D-Bus
+    (system bus for system units, session bus for user units), the logind
+    session, the `.desktop` name, the container name (podman's
+    `containers.json`, Docker's API when its socket is reachable). Two
+    passes run side by side: if D-Bus has not answered within 150 ms, the
+    sentence from the cgroup shows with a "Looking up details…" line;
+    details fill in when D-Bus answers, and a line says so if it does not.
+  - *Layout*: the sentence; the chain, at most four lines, cause on top and
+    the process last (`multi-user.target` → `sshd.service · restarted 0
+    times` → `sshd 812`), ellipsised with the full text on hover; **If you
+    end it** ("systemd starts it again", "it comes back at the next login",
+    "it starts again on the next connection"), left out when it cannot be
+    known and once the process has exited; actions; **How sysman knows**
+    (cgroup path, unit file, `WantedBy`/`TriggeredBy`), folded by default and
+    remembered. The restart count is the unit's `NRestarts`. "If you end it"
+    follows the unit's `Restart=` and whether the process is its `MainPID`:
+    ending a process that is not the main one restarts nothing, and SIGTERM
+    counts as a clean exit to `on-failure` while SIGKILL does not.
+  - *Actions*: Stop, Restart and Disable for a unit (system units through
+    polkit, user units only when they are this user's), each confirmed, through
+    the systemctl runner Settings uses; "Logs for this unit" opens Logs with
+    `unit:<name>`; for containers the command to copy, never run.
+- **Listening on**: the selected process's listening TCP sockets and bound
+  UDP sockets, each "this machine only" (loopback) or, by its bound address,
+  "reachable from the network" (TCP) or "can receive from the network" (UDP,
+  never called a service: clients' DNS and QUIC sockets are bound too);
+  sockets that read the same are listed once. From the daemon's `listeners`
+  socket request (DESIGN.md, "Privileged helper"), once per selection. For
+  another user's process with no sockets matched while `holders_error` is set,
+  one line gives the reason with the "Enable…" hint. Hidden when it has none.
+- The search field also takes exactly `port:<n>`: the table lists every
+  process, `listeners` is asked once typing pauses, and one line under the
+  field names the holder, which is selected (a process other than PID 1 or a
+  user `systemd`); else the socket unit holding it and the service it starts
+  on the next connection, the owner when the holder cannot be read, the
+  kernel, or "Nothing is listening on port N."
 - Context menu: Copy name/PID/command line; End process (SIGTERM) and Force end
-  (SIGKILL), each confirmed; disabled for other users' processes.
+  (SIGKILL), each confirmed, the confirmation warning when the process will
+  come back; disabled for other users' processes.
 - Values the collector may not read (other users' I/O and FDs) show "–" with a
   "not permitted" tooltip, never 0.
 
@@ -223,7 +295,21 @@ Metric sidebar built from the `series` table, grouped by module, with friendly
 names for known paths; process search over `procs` (including exited); chart
 grid (3 columns) with a shared cursor; Earlier/Later, go-to-time, zoom, Live;
 inspector with values at the cursor and window statistics; CSV export of the
-visible range.
+visible range. A process picked from the search, running or exited, shows one
+**Why it ran** line under its name (below).
+
+### Why it ran (recorded processes)
+
+`procs` keeps each instance's cgroup path and parent pid, written once when
+`sysmand` first records it (DESIGN.md). For a process that is no longer
+running, Explorer and the Logs inspector show one sentence from that record,
+classified by the same function as the live inspector, with the parent chain
+rebuilt from recorded `procs` rows (the parent instance that ran at the
+child's start). Unit details (trigger, restart policy) are not recorded: when
+the unit still exists they are looked up now and the sentence says "as of
+now"; otherwise the sentence names only the unit, app, container or session.
+Rows recorded before this existed say "Not recorded (sysman was older then)".
+Nothing here runs in the daemon or per tick.
 
 ### 6.9 Insights
 "What's happening" callouts from rules over recent history: swap climbing,
@@ -284,7 +370,7 @@ what sysman recorded at the same moment. Reading and the index live in
   **What sysman recorded** — CPU, memory and CPU temperature around the entry
   from history (±10 min, the entry's time as a rule), plus the process's own
   memory history when the entry names a pid sysman recorded (crashes, OOM
-  victims); "Open in Explorer at HH:MM"; **Around this entry** — the 6 entries
+  victims) and its **Why it ran** line (below); "Open in Explorer at HH:MM"; **Around this entry** — the 6 entries
   before and after it with no filter applied; every journal field as a
   key/value list. Actions: Copy (entry as text), Copy fields (JSON), Show
   backtrace (crashes: the stack trace from the coredump's MESSAGE, else

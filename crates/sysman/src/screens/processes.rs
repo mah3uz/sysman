@@ -2,9 +2,12 @@ use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
@@ -22,6 +25,7 @@ use gpui_component::{Disableable, Icon, Sizable, Size, WindowExt};
 use gpui_kit_assets::IconName;
 use schema::Sample;
 use schema::cpu::CpuMeta;
+use schema::listeners::{Holder, Listener, Listeners, Protocol};
 use schema::processes::Process;
 use serde::{Deserialize, Serialize};
 
@@ -32,19 +36,21 @@ use crate::charts::trend::{ChartState, TrendChart, YScale, clock};
 use crate::data::desktop::IconIndex;
 use crate::data::helper;
 use crate::data::history::{Bucket, History, ProcField, bucket_width, db_path};
-use crate::data::live::Live;
+use crate::data::live::{Live, socket_path};
 use crate::data::prefs::{Prefs, prefs};
-use crate::data::process::ProcessFeed;
+use crate::data::process::{ProcessFeed, listeners};
 use crate::data::source::{Combine, Source, top_up};
+use crate::data::systemd::{Runner, System};
+use crate::data::why::{self, Probe, Why};
 use crate::screens::dashboard::{Groups, cpu_colour};
-use crate::ui::shell::{CONTROL_HEIGHT, Focus, Tab, pill, take_focus};
+use crate::ui::shell::{CONTROL_HEIGHT, Focus, Tab, navigate, pill, take_focus};
 use crate::ui::theme::{rem_px, theme};
 use crate::ui::widgets::app_icon::app_icon;
 use crate::ui::widgets::card::card;
 use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
 use crate::ui::widgets::hairline;
 use crate::ui::widgets::hint::helper_hint;
-use crate::ui::widgets::panel::caption_label;
+use crate::ui::widgets::panel::{caption_label, heading};
 use crate::ui::widgets::range::{Range, range_picker, remember_in, remembered, remembered_in};
 use crate::ui::widgets::sidebar::{self, Side, Sidebar, Toggled, Widths};
 use crate::ui::widgets::text::caption;
@@ -56,6 +62,11 @@ const INSPECTOR: Widths = Widths::new(420., 320., 640.);
 const COLUMNS_KEY: &str = "processes.columns";
 const SORT_KEY: &str = "processes.sort";
 const INSPECTOR_KEY: &str = "processes.inspector";
+const WHY_KEY: &str = "processes.why";
+/// How long the cgroup-only answer waits for the full one before it shows, so a quick D-Bus reply does not flicker.
+const QUICK_AFTER: Duration = Duration::from_millis(150);
+/// A `port:` search asks the daemon once typing pauses, not per keystroke.
+const PORT_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Room the table leaves for its vertical scrollbar.
 const SCROLLBAR: f32 = 16.;
 const CELL_PAD: f32 = 6.;
@@ -111,6 +122,7 @@ pub enum Col {
 impl Col {
     /// Every column, in display order.
     pub const ALL: [Col; 21] = [
+        Self::Pid,
         Self::Process,
         Self::Command,
         Self::Path,
@@ -130,7 +142,6 @@ impl Col {
         Self::Nice,
         Self::Priority,
         Self::Started,
-        Self::Pid,
         Self::Ppid,
     ];
     const DEFAULT: [Col; 7] = [
@@ -359,6 +370,319 @@ fn store(f: impl FnOnce(&mut Prefs)) {
     f(&mut prefs().lock().unwrap_or_else(PoisonError::into_inner));
 }
 
+/// Whether "How sysman knows" is unfolded under Why it's running.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct WhyPref {
+    pub evidence: bool,
+}
+
+pub fn load_why(prefs: &Prefs) -> WhyPref {
+    prefs.get(WHY_KEY).unwrap_or_default()
+}
+
+/// The cgroup, parent chain and files only: what `why::explain` can say before D-Bus or Docker answer.
+struct Quick(why::Live);
+
+impl Probe for Quick {
+    fn proc_file(&self, pid: u32, name: &str) -> io::Result<String> {
+        self.0.proc_file(pid, name)
+    }
+
+    fn read(&self, path: &Path) -> io::Result<String> {
+        self.0.read(path)
+    }
+
+    fn data_dirs(&self) -> Vec<PathBuf> {
+        self.0.data_dirs()
+    }
+
+    fn uid(&self) -> u32 {
+        self.0.uid()
+    }
+
+    fn exe_link(&self, pid: u32) -> Option<String> {
+        self.0.exe_link(pid)
+    }
+
+    fn unit(&self, _: &why::Unit) -> Result<why::UnitProps, String> {
+        Err("asked next".into())
+    }
+
+    fn session(&self, _: &str) -> Result<why::Session, String> {
+        Err("asked next".into())
+    }
+
+    fn docker_name(&self, _: &str) -> Result<String, String> {
+        Err("asked next".into())
+    }
+}
+
+/// Why one process instance runs; `complete` once D-Bus and Docker were asked too.
+struct Explained {
+    key: Key,
+    why: Option<Why>,
+    complete: bool,
+}
+
+/// Keeps a result only for the process still selected, and never lets the quick pass replace the full one.
+fn accept(current: &mut Option<Explained>, key: Key, why: Why, complete: bool) -> bool {
+    match current {
+        Some(e) if e.key == key && (complete || !e.complete) => {
+            e.why = Some(why);
+            e.complete = complete;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The listening sockets of one process instance, asked once when it is selected.
+struct Listening {
+    key: Key,
+    answer: Option<Result<Listeners, String>>,
+}
+
+fn ask_listeners() -> Result<Listeners, String> {
+    let path = socket_path().ok_or("XDG_RUNTIME_DIR is not set")?;
+    listeners(&path).map_err(|e| format!("{e:#}"))
+}
+
+/// Who can reach a socket, by its bound address. A bound UDP socket is often a client's (DNS, QUIC), so it is not
+/// called a service.
+fn reach(protocol: Protocol, address: IpAddr) -> &'static str {
+    if address.to_canonical().is_loopback() {
+        "this machine only"
+    } else if is_tcp(protocol) {
+        "reachable from the network"
+    } else {
+        "can receive from the network"
+    }
+}
+
+fn is_tcp(protocol: Protocol) -> bool {
+    matches!(protocol, Protocol::Tcp | Protocol::Tcp6)
+}
+
+/// The sockets this instance holds, by port; sockets that read the same (one per interface, or IPv4 in both
+/// tables) are listed once.
+fn held_by(l: &Listeners, selected: Key) -> Vec<&Listener> {
+    let mut held: Vec<&Listener> = l
+        .listeners
+        .iter()
+        .filter(|s| s.holders.iter().any(|h| (h.pid, h.start_time) == selected))
+        .collect();
+    held.sort_by_key(|s| (s.port, !is_tcp(s.protocol), s.address));
+    held.dedup_by_key(|s| (s.port, is_tcp(s.protocol), s.address));
+    held
+}
+
+/// A socket unit and the units it starts.
+type SocketUnit = (String, Vec<String>);
+
+/// What a `port:` search found.
+#[derive(Debug, PartialEq)]
+enum PortFound {
+    Process(Holder),
+    /// Only PID 1 or a user `systemd` holds it: a socket unit whose service is not running yet.
+    Waiting {
+        system: bool,
+    },
+    /// Opened by the kernel itself (NFS, WireGuard).
+    Kernel,
+    /// No holder could be read; `helper` is why, when the helper's part is missing.
+    Unknown {
+        uid: u32,
+        helper: Option<String>,
+    },
+    Nothing,
+}
+
+/// The holder of `port`, preferring a real process over PID 1 or a user `systemd` keeping a socket unit's port.
+fn port_holder(port: u16, l: &Listeners) -> PortFound {
+    let on: Vec<&Listener> = l.listeners.iter().filter(|s| s.port == port).collect();
+    let Some(first) = on.first() else {
+        return PortFound::Nothing;
+    };
+    let holders = || on.iter().flat_map(|s| &s.holders);
+    let manager = |h: &&Holder| h.pid == 1 || h.comm == "systemd";
+    if let Some(h) = holders().filter(|h| !manager(h)).min_by_key(|h| h.pid) {
+        return PortFound::Process(h.clone());
+    }
+    if let Some(h) = holders().find(manager) {
+        return PortFound::Waiting { system: h.pid == 1 };
+    }
+    if on.iter().all(|s| s.inode == 0) {
+        return PortFound::Kernel;
+    }
+    PortFound::Unknown {
+        uid: first.uid,
+        helper: l.holders_error.clone(),
+    }
+}
+
+/// The line under the search field for a `port:` search; `unit` is the socket unit and what it starts.
+fn port_line(port: u16, found: &PortFound, unit: Option<&SocketUnit>, owner: &str) -> String {
+    match found {
+        PortFound::Process(h) => format!("Port {port} is held by {} (PID {}).", h.comm, h.pid),
+        PortFound::Waiting { .. } => match unit {
+            Some((socket, starts)) => match starts.first() {
+                Some(service) => {
+                    format!("Port {port} is held by {socket}; {service} starts on the next connection.")
+                }
+                None => format!("Port {port} is held by {socket}; its service starts on the next connection."),
+            },
+            None => {
+                format!("Port {port} is held by systemd for a socket unit; its service starts on the next connection.")
+            }
+        },
+        PortFound::Kernel => format!("Port {port} is held by the Linux kernel, not by a process."),
+        PortFound::Unknown { helper: Some(_), .. } => {
+            format!("Port {port} is open, held by {owner}; enable the helper to see which process.")
+        }
+        PortFound::Unknown { helper: None, .. } => {
+            format!("Port {port} is open, held by {owner}; sysman can't see which process.")
+        }
+        PortFound::Nothing => format!("Nothing is listening on port {port}."),
+    }
+}
+
+/// A `port:` search: the line to show once answered, and whether it needs the helper's "Enable…".
+struct PortSearch {
+    port: u16,
+    line: Option<(String, bool)>,
+}
+
+/// Whether "If you end it" warns that the process returns, for the End process confirmation.
+fn comes_back(if_you_end: &str) -> bool {
+    ["starts it again", "stays stopped until"]
+        .iter()
+        .any(|p| if_you_end.contains(p))
+}
+
+/// A unit action's result, `None` while it runs.
+type Outcome = Option<Result<(), String>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitVerb {
+    Stop,
+    Restart,
+    Disable,
+}
+
+impl UnitVerb {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stop => "Stop",
+            Self::Restart => "Restart",
+            Self::Disable => "Disable",
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::Disable => "disable",
+        }
+    }
+
+    fn doing(self) -> &'static str {
+        match self {
+            Self::Stop => "Stopping",
+            Self::Restart => "Restarting",
+            Self::Disable => "Disabling",
+        }
+    }
+
+    fn done(self) -> &'static str {
+        match self {
+            Self::Stop => "Stopped",
+            Self::Restart => "Restarted",
+            Self::Disable => "Disabled",
+        }
+    }
+
+    fn explain(self, user: bool) -> String {
+        let what = match self {
+            Self::Stop => "systemd stops the service and every process in it.",
+            Self::Restart => "systemd stops the service and starts it again.",
+            Self::Disable if user => "It keeps running for now but no longer starts when you log in.",
+            Self::Disable => "It keeps running for now but no longer starts at boot.",
+        };
+        let who = if user {
+            "Your user's service manager does it."
+        } else {
+            "The system asks for your password first."
+        };
+        format!("{what} {who}")
+    }
+}
+
+/// `--user` reaches this user's own manager; a system unit goes to systemd, which asks polkit.
+pub fn unit_args<'a>(verb: &'static str, unit: &'a str, user: bool) -> Vec<&'a str> {
+    let mut args = Vec::with_capacity(4);
+    if user {
+        args.push("--user");
+    }
+    args.extend([verb, "--", unit]);
+    args
+}
+
+/// The Logs search that shows one unit's entries.
+pub fn unit_logs_query(unit: &str) -> String {
+    format!("unit:{unit}")
+}
+
+fn unit_action(runner: &dyn Runner, verb: UnitVerb, unit: &str, user: bool) -> Result<(), String> {
+    let args = unit_args(verb.verb(), unit, user);
+    let ran = runner
+        .run("systemctl", &args)
+        .map_err(|e| format!("Could not run systemctl: {e}"))?;
+    if ran.ok {
+        return Ok(());
+    }
+    let message = ran.stderr.trim();
+    Err(if message.contains("Interactive authentication required") {
+        format!(
+            "No polkit agent is running to ask for your password. Run: sudo systemctl {} {unit}",
+            verb.verb()
+        )
+    } else if message.is_empty() {
+        format!("systemctl {} failed", args.join(" "))
+    } else {
+        message.to_owned()
+    })
+}
+
+fn confirm_unit(
+    this: WeakEntity<Processes>,
+    key: Key,
+    verb: UnitVerb,
+    unit: String,
+    user: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let (this, unit) = (this.clone(), unit.clone());
+        alert
+            .title(SharedString::from(format!("{} {unit}?", verb.label())))
+            .description(SharedString::from(verb.explain(user)))
+            .ok_text(verb.label())
+            .ok_variant(if verb == UnitVerb::Restart {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Danger
+            })
+            .show_cancel(true)
+            .on_ok(move |_, _, cx| {
+                this.update(cx, |p, cx| p.run_unit(key, verb, unit.clone(), user, cx))
+                    .ok();
+                true
+            })
+    });
+}
+
 fn state_meaning(state: &str) -> &'static str {
     match state {
         "R" => "Running or runnable",
@@ -396,10 +720,16 @@ fn started(start: u64, now: f64) -> String {
     }
 }
 
-/// Case-insensitive substring of the name or command line, or the exact pid.
+/// `port:<n>` typed into the filter; any other text filters by name, command line or PID.
+pub fn port_query(query: &str) -> Option<u16> {
+    query.trim().strip_prefix("port:")?.parse().ok().filter(|&p| p > 0)
+}
+
+/// Case-insensitive substring of the name or command line, or the exact pid; a `port:` search lists everything
+/// and selects the holder instead.
 pub fn matches(p: &Process, query: &str) -> bool {
     let query = query.trim();
-    if query.is_empty() {
+    if query.is_empty() || port_query(query).is_some() {
         return true;
     }
     let query = query.to_lowercase();
@@ -580,9 +910,13 @@ fn send(p: &Process, signal: Signal) -> Result<(), String> {
 }
 
 fn current_user() -> Option<String> {
+    user_name(unsafe { libc::getuid() })
+}
+
+fn user_name(uid: u32) -> Option<String> {
     // SAFETY: getpwuid returns null or a pointer to static storage, read here before any other call can reuse it.
     unsafe {
-        let pw = libc::getpwuid(libc::getuid());
+        let pw = libc::getpwuid(uid);
         if pw.is_null() {
             return None;
         }
@@ -590,12 +924,17 @@ fn current_user() -> Option<String> {
     }
 }
 
-fn confirm(p: Process, signal: Signal, window: &mut Window, cx: &mut App) {
+/// `returns` is the inspector's "If you end it" line when it says the process comes back.
+fn confirm(p: Process, signal: Signal, returns: Option<String>, window: &mut Window, cx: &mut App) {
     window.open_alert_dialog(cx, move |alert, _, _| {
         let p = p.clone();
+        let mut text = signal.explain(&p);
+        if let Some(returns) = &returns {
+            text = format!("{text}\n\n{returns}");
+        }
         alert
             .title(SharedString::from(format!("{} “{}”?", signal.label(), p.comm)))
-            .description(SharedString::from(signal.explain(&p)))
+            .description(SharedString::from(text))
             .ok_text(signal.label())
             .ok_variant(ButtonVariant::Danger)
             .show_cancel(true)
@@ -625,6 +964,8 @@ pub struct ProcessTable {
     icons: Arc<IconIndex>,
     me: Option<String>,
     mem_total: Option<u64>,
+    /// The inspected process's "If you end it" line, when it says the process comes back.
+    comes_back: Option<(Key, String)>,
 }
 
 impl TableDelegate for ProcessTable {
@@ -864,14 +1205,20 @@ impl TableDelegate for ProcessTable {
             return menu;
         };
         let allowed = may_signal(&p, self.me.as_deref());
+        let returns = self
+            .comes_back
+            .as_ref()
+            .filter(|(k, _)| *k == key(&p))
+            .map(|(_, line)| line.clone());
         let copy = |label: &'static str, text: String| {
             PopupMenuItem::new(label)
                 .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone())))
         };
         let end = |signal: Signal, p: Process| {
+            let returns = returns.clone();
             PopupMenuItem::new(signal.label())
                 .disabled(!allowed)
-                .on_click(move |_, window, cx| confirm(p.clone(), signal, window, cx))
+                .on_click(move |_, window, cx| confirm(p.clone(), signal, returns.clone(), window, cx))
         };
         menu.item(copy("Copy name", p.comm.clone()))
             .item(copy("Copy PID", p.pid.to_string()))
@@ -1072,6 +1419,16 @@ pub struct Processes {
     /// The columns the user picked; `None` follows the defaults.
     columns: Option<Vec<Col>>,
     panel: InspectorPref,
+    why: Option<Explained>,
+    why_pref: WhyPref,
+    listening: Option<Listening>,
+    port_search: Option<PortSearch>,
+    /// Counts edits of the search field, so only the last `port:` typed is asked.
+    typed: u64,
+    /// The last unit action from Why it's running.
+    unit_action: Option<(Key, UnitVerb, Outcome)>,
+    /// A unit action succeeded: explain this process again once the next scan is in.
+    rerun: Option<Key>,
     inspector: Entity<Sidebar>,
     keys: FocusHandle,
     #[cfg(debug_assertions)]
@@ -1106,9 +1463,14 @@ impl Processes {
             }
         };
         let cursor = Rc::new(Cell::new(None));
-        let (columns, sort, panel) = {
+        let (columns, sort, panel, why_pref) = {
             let prefs = prefs().lock().unwrap_or_else(PoisonError::into_inner);
-            (load_columns(&prefs), load_sort(&prefs), load_inspector(&prefs))
+            (
+                load_columns(&prefs),
+                load_sort(&prefs),
+                load_inspector(&prefs),
+                load_why(&prefs),
+            )
         };
         let mut model = Model::new(cx.try_global::<HierarchyMode>().is_some_and(|h| h.0));
         if let Some((col, descending)) = sort {
@@ -1137,9 +1499,17 @@ impl Processes {
                 cols: Vec::new(),
                 widths: Vec::new(),
                 mem_total: None,
+                comes_back: None,
             }),
             columns,
             panel,
+            why: None,
+            why_pref,
+            listening: None,
+            port_search: None,
+            typed: 0,
+            unit_action: None,
+            rerun: None,
             inspector,
             keys: cx.focus_handle(),
             search: None,
@@ -1186,11 +1556,19 @@ impl Processes {
             this.panel.collapsed = true;
         }
         #[cfg(debug_assertions)]
+        if std::env::var_os("SYSMAN_DEV_WHY_EVIDENCE").is_some() {
+            this.why_pref.evidence = true;
+        }
+        #[cfg(debug_assertions)]
         if let Ok(name) = std::env::var("SYSMAN_DEV_INSPECTOR_RANGE") {
             this.proc_range = Range::ALL
                 .into_iter()
                 .find(|r| r.label().eq_ignore_ascii_case(&name))
                 .unwrap_or(this.proc_range);
+        }
+        #[cfg(debug_assertions)]
+        if let Ok(query) = std::env::var("SYSMAN_DEV_PROC_QUERY") {
+            this.set_query(query, cx);
         }
         this.on_feed(cx);
         this
@@ -1209,7 +1587,13 @@ impl Processes {
             && selected.is_none_or(|selected| {
                 self.attempt
                     .is_some_and(|(range, key, _)| range == self.proc_range && key == selected)
+                    && self.why.as_ref().is_some_and(|e| e.key == selected && e.complete)
+                    && self
+                        .listening
+                        .as_ref()
+                        .is_some_and(|l| l.key == selected && l.answer.is_some())
             })
+            && self.port_search.as_ref().is_none_or(|s| s.line.is_some())
     }
 
     fn delegate<'a>(&'a self, cx: &'a App) -> &'a ProcessTable {
@@ -1263,6 +1647,11 @@ impl Processes {
             }
         }
         self.sync_selection(cx);
+        if let Some(k) = self.rerun.take()
+            && self.delegate(cx).model.selected_process().is_some_and(|p| key(p) == k)
+        {
+            self.explain_fully(k, cx);
+        }
         if let Some(p) = self.delegate(cx).model.selected_process().cloned() {
             self.trail.retain(|(at, _)| *at >= t - TRAIL_S);
             self.trail.push((t, p.clone()));
@@ -1303,7 +1692,191 @@ impl Processes {
             self.trail.push((*t, p.clone()));
         }
         self.sync_inspector(cx);
+        self.explain(cx);
+        self.listen(cx);
         self.refresh(cx);
+    }
+
+    /// Asks which sockets the inspected process listens on, once per instance.
+    fn listen(&mut self, cx: &mut Context<Self>) {
+        let selected = self.inspected.as_ref().map(key);
+        if self.listening.as_ref().map(|l| l.key) == selected {
+            return;
+        }
+        let Some(selected) = selected else {
+            self.listening = None;
+            return;
+        };
+        self.listening = Some(Listening {
+            key: selected,
+            answer: None,
+        });
+        let task = cx.background_executor().spawn(async { ask_listeners() });
+        cx.spawn(async move |this, cx| {
+            let answer = task.await;
+            this.update(cx, |this, cx| {
+                if let Some(l) = this.listening.as_mut().filter(|l| l.key == selected) {
+                    l.answer = Some(answer);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
+        self.typed += 1;
+        self.port_search = port_query(&query).map(|port| PortSearch { port, line: None });
+        self.with_table(cx, |table| {
+            table.model.filter = query;
+            table.model.rebuild();
+        });
+        let Some(port) = self.port_search.as_ref().map(|s| s.port) else {
+            return;
+        };
+        let typed = self.typed;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PORT_DEBOUNCE).await;
+            if !this.update(cx, |this, _| this.typed == typed).unwrap_or(false) {
+                return;
+            }
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    let l = ask_listeners()?;
+                    let found = port_holder(port, &l);
+                    let unit = match found {
+                        PortFound::Waiting { system } => why::socket_unit(system, port).ok().flatten(),
+                        _ => None,
+                    };
+                    Ok::<_, String>((found, unit))
+                })
+                .await;
+            this.update(cx, |this, cx| this.port_found(typed, port, found, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn port_found(
+        &mut self,
+        typed: u64,
+        port: u16,
+        found: Result<(PortFound, Option<SocketUnit>), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.typed != typed {
+            return;
+        }
+        let line = match found {
+            Err(e) => (format!("Couldn't look up port {port}: {e}."), false),
+            Ok((found, unit)) => {
+                if let PortFound::Process(h) = &found {
+                    self.focus = Some(Focus::Process {
+                        comm: h.comm.clone(),
+                        instance: Some((h.pid, h.start_time)),
+                    });
+                    // before the first table the next feed applies it
+                    if !self.delegate(cx).model.table.is_empty() {
+                        self.apply_focus(cx);
+                        self.sync_selection(cx);
+                    }
+                }
+                let owner = match &found {
+                    PortFound::Unknown { uid, .. } => user_name(*uid).unwrap_or_else(|| format!("uid {uid}")),
+                    _ => String::new(),
+                };
+                let hint = matches!(found, PortFound::Unknown { helper: Some(_), .. });
+                (port_line(port, &found, unit.as_ref(), &owner), hint)
+            }
+        };
+        self.port_search = Some(PortSearch { port, line: Some(line) });
+        cx.notify();
+    }
+
+    /// Works out why the inspected process runs, once per instance: the cgroup-only answer if D-Bus is slow, then
+    /// the full one.
+    fn explain(&mut self, cx: &mut Context<Self>) {
+        let selected = self.inspected.as_ref().map(key);
+        if self.why.as_ref().map(|e| e.key) == selected {
+            return;
+        }
+        self.rerun = None;
+        self.with_table(cx, |t| t.comes_back = None);
+        let Some(selected) = selected else {
+            self.why = None;
+            return;
+        };
+        self.why = Some(Explained {
+            key: selected,
+            why: None,
+            complete: false,
+        });
+        let table = self.delegate(cx).model.table.clone();
+        let quick = cx
+            .background_executor()
+            .spawn(async move { why::explain_with(&Quick(why::Live::default()), selected.0, selected.1, &table) });
+        cx.spawn(async move |this, cx| {
+            let why = quick.await;
+            cx.background_executor().timer(QUICK_AFTER).await;
+            this.update(cx, |this, cx| this.explained(selected, why, false, cx))
+                .ok();
+        })
+        .detach();
+        self.explain_fully(selected, cx);
+    }
+
+    fn explain_fully(&mut self, selected: Key, cx: &mut Context<Self>) {
+        let table = self.delegate(cx).model.table.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { why::explain(selected.0, selected.1, &table) });
+        cx.spawn(async move |this, cx| {
+            let why = task.await;
+            this.update(cx, |this, cx| this.explained(selected, why, true, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn explained(&mut self, selected: Key, why: Why, complete: bool, cx: &mut Context<Self>) {
+        let returns = why.if_you_end.clone().filter(|l| comes_back(l));
+        if accept(&mut self.why, selected, why, complete) {
+            self.with_table(cx, |t| t.comes_back = returns.map(|l| (selected, l)));
+            cx.notify();
+        }
+    }
+
+    fn toggle_evidence(&mut self, cx: &mut Context<Self>) {
+        self.why_pref.evidence = !self.why_pref.evidence;
+        let pref = self.why_pref;
+        store(|p| p.set(WHY_KEY, &pref));
+        cx.notify();
+    }
+
+    fn run_unit(&mut self, selected: Key, verb: UnitVerb, unit: String, user: bool, cx: &mut Context<Self>) {
+        self.unit_action = Some((selected, verb, None));
+        cx.notify();
+        let task = cx
+            .background_executor()
+            .spawn(async move { unit_action(&System, verb, &unit, user) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if this
+                    .unit_action
+                    .as_ref()
+                    .is_some_and(|(k, v, _)| *k == selected && *v == verb)
+                {
+                    if result.is_ok() {
+                        this.rerun = Some(selected);
+                    }
+                    this.unit_action = Some((selected, verb, Some(result)));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn inspector_open(&self) -> bool {
@@ -1535,6 +2108,47 @@ fn copyable(id: &'static str, label: &str, value: Option<String>, absent: &str, 
             Some(value) => text.text_color(t.text).child(value),
             None => text.text_color(t.text_tertiary).child(absent.to_owned()),
         })
+}
+
+fn details_card(cx: &App) -> Div {
+    let t = theme(cx);
+    hairline(
+        div()
+            .flex()
+            .flex_col()
+            .gap(rem_px(6.))
+            .py(rem_px(10.))
+            .px(rem_px(12.))
+            .rounded(t.card_radius)
+            .bg(t.card)
+            .border_color(t.hairline),
+        t.hairline_width,
+    )
+}
+
+fn kv(label: &str, value: String, label_width: f32, cx: &App) -> Div {
+    let t = theme(cx);
+    div()
+        .flex()
+        .flex_row()
+        .gap(rem_px(8.))
+        .text_size(t.caption)
+        .child(
+            div()
+                .w(rem_px(label_width))
+                .text_color(t.text_secondary)
+                .child(label.to_owned()),
+        )
+        .child(div().flex_1().min_w_0().font_features(t.numbers.clone()).child(value))
+}
+
+/// why.rs words its notes as clauses; they stand alone here.
+fn sentence_case(s: &str) -> String {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 fn value_row(value: String, detail: Option<String>, cx: &App) -> impl IntoElement {
@@ -1880,6 +2494,234 @@ impl Processes {
         .height(px(CHART_HEIGHT))
     }
 
+    /// Why it's running: the sentence, the chain, what ending it does, the unit's actions and the evidence.
+    fn why_section(&self, running: bool, this: WeakEntity<Self>, cx: &App) -> Option<Div> {
+        let e = self.why.as_ref()?;
+        let t = theme(cx);
+        let section =
+            div()
+                .flex()
+                .flex_col()
+                .gap(rem_px(8.))
+                .child(heading(IconName::Waypoints, "Why it's running", cx));
+        let Some(why) = &e.why else {
+            return Some(section);
+        };
+        let selected = e.key;
+        let chain = why.chain.iter().take(4).enumerate().map(|(i, line)| {
+            let full = SharedString::from(line.clone());
+            div()
+                .id(("why-chain", i))
+                .flex()
+                .flex_row()
+                .min_w_0()
+                .pl(rem_px(14. * i.saturating_sub(1) as f32))
+                .text_size(t.caption)
+                .text_color(t.text_secondary)
+                .font_features(t.numbers.clone())
+                .when(i > 0, |d| d.child(div().flex_shrink_0().pr(rem_px(5.)).child("└")))
+                .child(div().min_w_0().truncate().child(full.clone()))
+                .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+        });
+        let ending = why.if_you_end.clone().filter(|_| running).map(|line| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(rem_px(2.))
+                .child(caption("If you end it", cx))
+                .child(div().text_size(t.caption).child(line))
+        });
+        let notes: Vec<String> = if e.complete {
+            why.notes.iter().map(|n| sentence_case(n)).collect()
+        } else {
+            vec!["Looking up details…".into()]
+        };
+        let a = &why.actions;
+        let action = self.unit_action.as_ref().filter(|(k, ..)| *k == selected);
+        let busy = action.is_some_and(|(_, _, r)| r.is_none());
+        let unit_button = |verb: UnitVerb, icon: IconName, unit: &str| {
+            let (this, unit, user) = (this.clone(), unit.to_owned(), a.user);
+            Button::new(verb.verb())
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(icon))
+                .label(verb.label())
+                .disabled(busy)
+                .on_click(move |_, window, cx| {
+                    confirm_unit(this.clone(), selected, verb, unit.clone(), user, window, cx)
+                })
+        };
+        let buttons = a.unit.as_deref().map(|unit| {
+            let query = unit_logs_query(unit);
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(rem_px(2.))
+                .ml(rem_px(-6.))
+                .when(a.stop, |d| {
+                    d.child(unit_button(UnitVerb::Stop, IconName::CircleStop, unit))
+                })
+                .when(a.restart, |d| {
+                    d.child(unit_button(UnitVerb::Restart, IconName::RotateCw, unit))
+                })
+                .when(a.disable, |d| {
+                    d.child(unit_button(UnitVerb::Disable, IconName::Ban, unit))
+                })
+                .child(
+                    Button::new("why-logs")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::FileText))
+                        .label("Logs for this unit")
+                        .on_click(move |_, _, cx| navigate(Tab::Logs, Some(Focus::LogQuery(query.clone())), cx)),
+                )
+        });
+        let outcome = action.zip(a.unit.as_deref()).map(|((_, verb, result), unit)| {
+            let line = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(rem_px(6.))
+                .px(rem_px(10.))
+                .py(rem_px(7.))
+                .rounded(t.card_radius)
+                .bg(t.card)
+                .text_size(t.caption);
+            match result {
+                None => line
+                    .text_color(t.text_secondary)
+                    .child(format!("{} {unit}…", verb.doing())),
+                Some(Ok(())) => line
+                    .text_color(t.green)
+                    .child(Icon::new(IconName::Check).xsmall())
+                    .child(format!("{} {unit}", verb.done())),
+                Some(Err(err)) => line
+                    .flex_col()
+                    .items_start()
+                    .gap(rem_px(2.))
+                    .child(
+                        div()
+                            .text_color(t.red)
+                            .font_weight(t.weight_semibold)
+                            .child(format!("Could not {} {unit}", verb.verb())),
+                    )
+                    .child(caption(err.clone(), cx)),
+            }
+        });
+        let container = a
+            .container_command
+            .clone()
+            .map(|command| copyable("why-container", "To stop the container, run", Some(command), "", cx));
+        let open = self.why_pref.evidence;
+        let fold = (!why.evidence.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(rem_px(6.))
+                .child(
+                    div()
+                        .id("why-evidence")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(rem_px(4.))
+                        .ml(rem_px(-2.))
+                        .cursor_pointer()
+                        .text_size(t.caption)
+                        .text_color(t.text_secondary)
+                        .hover(|d| d.text_color(t.text))
+                        .child(
+                            Icon::new(if open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .xsmall(),
+                        )
+                        .child("How sysman knows")
+                        .on_click(move |_, _, cx| {
+                            this.update(cx, |p, cx| p.toggle_evidence(cx)).ok();
+                        }),
+                )
+                .when(open, |d| {
+                    d.child(details_card(cx).children(why.evidence.iter().map(|(k, v)| kv(k, v.clone(), 84., cx))))
+                })
+        });
+        Some(
+            section
+                .child(div().text_size(t.panel_title).child(why.sentence.clone()))
+                .children(why.facts.iter().map(|f| caption(f.clone(), cx)))
+                .child(div().flex().flex_col().gap(rem_px(2.)).children(chain))
+                .children(ending)
+                .children(notes.into_iter().map(|n| caption(n, cx)))
+                .children(buttons)
+                .children(outcome)
+                .children(container)
+                .children(fold),
+        )
+    }
+
+    /// The sockets the inspected process listens on; for another user's process whose sockets the daemon could not
+    /// match, why. `None` when it holds none, or before the answer.
+    fn listening_section(&self, p: &Process, cx: &App) -> Option<Div> {
+        let l = self.listening.as_ref().filter(|l| l.key == key(p))?;
+        let Some(Ok(answer)) = &l.answer else {
+            return None;
+        };
+        let t = theme(cx);
+        let section = div()
+            .flex()
+            .flex_col()
+            .gap(rem_px(8.))
+            .child(heading(IconName::Radio, "Listening on", cx));
+        let held = held_by(answer, l.key);
+        if held.is_empty() {
+            let theirs = p.user.is_none() || p.user != self.delegate(cx).me;
+            let reason = answer.holders_error.as_ref().filter(|_| theirs)?;
+            return Some(section.child(helper_hint(
+                "listening-enable",
+                format!("Its ports can't be seen: {reason}."),
+                cx,
+            )));
+        }
+        let rows = held.into_iter().enumerate().map(|(i, s)| {
+            let protocol = if is_tcp(s.protocol) { "TCP" } else { "UDP" };
+            let address = SharedString::from(SocketAddr::new(s.address, s.port).to_string());
+            div()
+                .id(("listening", i))
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .gap(rem_px(8.))
+                .text_size(t.caption)
+                .child(
+                    div()
+                        .w(rem_px(30.))
+                        .flex_shrink_0()
+                        .text_color(t.text_secondary)
+                        .child(protocol),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(t.mono.clone())
+                        .child(address.clone()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(t.text_secondary)
+                        .child(reach(s.protocol, s.address)),
+                )
+                .tooltip(move |window, cx| Tooltip::new(address.clone()).build(window, cx))
+        });
+        Some(section.child(details_card(cx).children(rows)))
+    }
+
     fn inspector(&self, cx: &mut Context<Self>) -> AnyElement {
         let this = cx.entity().downgrade();
         let close = this.clone();
@@ -1903,65 +2745,42 @@ impl Processes {
         } else {
             None
         };
-        let kv = |label: &str, value: String| {
-            div()
-                .flex()
-                .flex_row()
-                .gap(rem_px(8.))
-                .text_size(t.caption)
-                .child(
-                    div()
-                        .w(rem_px(64.))
-                        .text_color(t.text_secondary)
-                        .child(label.to_owned()),
-                )
-                .child(div().flex_1().min_w_0().font_features(t.numbers.clone()).child(value))
-        };
-        let details = hairline(
-            div()
-                .flex()
-                .flex_col()
-                .gap(rem_px(6.))
-                .py(rem_px(10.))
-                .px(rem_px(12.))
-                .rounded(t.card_radius)
-                .bg(t.card)
-                .border_color(t.hairline),
-            t.hairline_width,
-        )
-        .child(kv("User", p.user.clone().unwrap_or_else(|| "–".into())))
-        .child(kv("Started", clock(p.start_time as f64, "%b %-d %H:%M:%S")))
-        .child(kv("State", format!("{} · {}", p.state, state_meaning(&p.state))))
-        .child(kv(
-            "Nice",
-            match (p.nice, p.priority) {
-                (Some(nice), Some(priority)) => format!("{nice} · priority {priority}"),
-                _ => "–".into(),
-            },
-        ))
-        .child(kv("CPU time", p.cpu_time_s.map_or_else(|| "–".into(), cpu_time)))
-        .child(kv(
-            "Virtual",
-            p.vsize_bytes.map_or_else(|| "–".into(), |v| bytes(v as f64)),
-        ))
-        .child(copyable(
-            "copy-path",
-            "Path",
-            p.exe.clone(),
-            if p.cmdline.is_empty() {
-                "–"
-            } else {
-                "– (not permitted)"
-            },
-            cx,
-        ))
-        .child(copyable(
-            "copy-command",
-            "Command line",
-            Some(p.cmdline.clone()).filter(|c| !c.is_empty()),
-            &format!("[{}]", p.comm),
-            cx,
-        ));
+        let kv = |label: &str, value: String| kv(label, value, 64., cx);
+        let why = self.why_section(running, this.clone(), cx);
+        let details = details_card(cx)
+            .child(kv("User", p.user.clone().unwrap_or_else(|| "–".into())))
+            .child(kv("Started", clock(p.start_time as f64, "%b %-d %H:%M:%S")))
+            .child(kv("State", format!("{} · {}", p.state, state_meaning(&p.state))))
+            .child(kv(
+                "Nice",
+                match (p.nice, p.priority) {
+                    (Some(nice), Some(priority)) => format!("{nice} · priority {priority}"),
+                    _ => "–".into(),
+                },
+            ))
+            .child(kv("CPU time", p.cpu_time_s.map_or_else(|| "–".into(), cpu_time)))
+            .child(kv(
+                "Virtual",
+                p.vsize_bytes.map_or_else(|| "–".into(), |v| bytes(v as f64)),
+            ))
+            .child(copyable(
+                "copy-path",
+                "Path",
+                p.exe.clone(),
+                if p.cmdline.is_empty() {
+                    "–"
+                } else {
+                    "– (not permitted)"
+                },
+                cx,
+            ))
+            .child(copyable(
+                "copy-command",
+                "Command line",
+                Some(p.cmdline.clone()).filter(|c| !c.is_empty()),
+                &format!("[{}]", p.comm),
+                cx,
+            ));
         let swatch = |color: Hsla, label: &'static str| {
             div()
                 .flex()
@@ -2029,7 +2848,9 @@ impl Processes {
                         }),
                 ),
         )
+        .children(why)
         .child(details)
+        .children(self.listening_section(p, cx))
         .when_some(status, |d, s| d.child(caption(s, cx).text_color(t.orange)))
         .child(range_picker(
             self.proc_range,
@@ -2115,14 +2936,16 @@ impl Processes {
     /// Builds what needs a window: the table and the search field.
     fn ensure_widgets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search.is_none() {
-            let search = cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name"));
+            let query = self.delegate(cx).model.filter.clone();
+            let search = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Filter by name or port:N")
+                    .default_value(query)
+            });
             cx.subscribe(&search, |this, search, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     let query = search.read(cx).value().to_string();
-                    this.with_table(cx, |table| {
-                        table.model.filter = query;
-                        table.model.rebuild();
-                    });
+                    this.set_query(query, cx);
                 }
             })
             .detach();
@@ -2216,6 +3039,18 @@ impl Render for Processes {
                     .flex_col()
                     .child(self.header(sample.as_deref(), cx))
                     .child(toolbar)
+                    .children(self.port_search.as_ref().map(|search| {
+                        let strip = div()
+                            .px(rem_px(12.))
+                            .py(rem_px(3.))
+                            .border_b_1()
+                            .border_color(t.hairline);
+                        match &search.line {
+                            None => strip.child(caption(format!("Looking up port {}…", search.port), cx)),
+                            Some((line, true)) => strip.child(helper_hint("port-enable", line.clone(), cx)),
+                            Some((line, false)) => strip.child(caption(line.clone(), cx)),
+                        }
+                    }))
                     .when(!helper_running, |d| {
                         d.child(
                             div()
@@ -2447,20 +3282,20 @@ mod tests {
     #[test]
     fn the_process_column_cannot_be_hidden_and_unknown_names_are_dropped() {
         assert_eq!(
-            toggle_column(&[Col::Process, Col::Pid], Col::Process),
-            [Col::Process, Col::Pid],
+            toggle_column(&[Col::Pid, Col::Process], Col::Process),
+            [Col::Pid, Col::Process],
             "it holds the tree and the icon"
         );
         assert_eq!(
-            toggle_column(&[Col::Process, Col::Pid], Col::Memory),
-            [Col::Process, Col::Memory, Col::Pid],
-            "display order, not click order"
+            toggle_column(&[Col::Pid, Col::Process], Col::Memory),
+            [Col::Pid, Col::Process, Col::Memory],
+            "display order, not click order, with PID leading so ids line up at the left edge"
         );
         let dir = tempfile::tempdir().unwrap();
         let mut prefs = Prefs::load(dir.path().join("ui.toml"));
         // a file from a newer or older version may name columns this one does not know
         prefs.set(COLUMNS_KEY, &["pid", "gone", "user"]);
-        assert_eq!(load_columns(&prefs), Some(vec![Col::Process, Col::User, Col::Pid]));
+        assert_eq!(load_columns(&prefs), Some(vec![Col::Pid, Col::Process, Col::User]));
         prefs.set(COLUMNS_KEY, &["gone"]);
         assert_eq!(load_columns(&prefs), None);
     }
@@ -2532,6 +3367,172 @@ mod tests {
     }
 
     #[test]
+    fn only_an_exact_port_search_leaves_the_name_filter() {
+        assert_eq!(port_query("port:631"), Some(631));
+        assert_eq!(port_query(" port:22 "), Some(22));
+        for typed in [
+            "port:",
+            "port:abc",
+            "port:70000",
+            "port:0",
+            "port: 631",
+            "port:631x",
+            "sport:631",
+            "Port",
+        ] {
+            assert_eq!(port_query(typed), None, "{typed:?} is not a port search");
+        }
+
+        // while it is asked, every process stays listed so its holder can be selected and scrolled to
+        let p = proc(4242, 1, "firefox", 1);
+        assert!(matches(&p, "port:631"));
+        // a half-typed or mistyped port filters by name as before
+        assert!(!matches(&p, "port:"));
+        assert!(!matches(&p, "port:abc"));
+        let mut q = proc(7, 1, "port:watch", 1);
+        q.cmdline = "/usr/bin/port:watch".into();
+        assert!(matches(&q, "port:w"), "a name containing port: still matches");
+    }
+
+    fn socket(protocol: Protocol, address: &str, port: u16, inode: u64, holders: &[(u32, &str)]) -> Listener {
+        Listener {
+            protocol,
+            address: address.parse().unwrap(),
+            port,
+            uid: 0,
+            inode,
+            holders: holders
+                .iter()
+                .map(|&(pid, comm)| Holder {
+                    pid,
+                    start_time: 100 + pid as u64,
+                    comm: comm.into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn loopback_stays_on_this_machine_and_udp_is_never_called_a_service() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        for local in ["127.0.0.1", "127.0.0.53", "::1", "::ffff:127.0.0.1"] {
+            assert_eq!(reach(Protocol::Tcp6, ip(local)), "this machine only", "{local}");
+            assert_eq!(reach(Protocol::Udp6, ip(local)), "this machine only", "{local}");
+        }
+        for open in ["0.0.0.0", "::", "192.168.1.5", "::ffff:192.168.1.5", "fe80::1"] {
+            assert_eq!(reach(Protocol::Tcp, ip(open)), "reachable from the network", "{open}");
+        }
+        // a DNS or QUIC client's ephemeral socket is bound like a server's: say only what the address allows
+        assert_eq!(reach(Protocol::Udp, ip("0.0.0.0")), "can receive from the network");
+    }
+
+    #[test]
+    fn the_listening_section_lists_only_this_instance_by_port() {
+        let l = Listeners {
+            listeners: vec![
+                socket(Protocol::Tcp6, "::1", 631, 1, &[(812, "cupsd")]),
+                socket(Protocol::Tcp, "127.0.0.1", 631, 2, &[(812, "cupsd")]),
+                socket(Protocol::Udp, "224.0.0.251", 53, 3, &[(812, "cupsd")]),
+                socket(Protocol::Udp, "224.0.0.251", 53, 5, &[(812, "cupsd")]),
+                socket(Protocol::Tcp6, "127.0.0.1", 631, 6, &[(812, "cupsd")]),
+                socket(Protocol::Tcp, "0.0.0.0", 22, 4, &[(900, "sshd")]),
+            ],
+            holders_error: None,
+        };
+        let held: Vec<_> = held_by(&l, (812, 912))
+            .iter()
+            .map(|s| (s.port, s.protocol, s.address.to_string()))
+            .collect();
+        // one row per thing the reader can tell apart: per-interface copies and a v4 socket in tcp6 read the same
+        assert_eq!(
+            held,
+            [
+                (53, Protocol::Udp, "224.0.0.251".into()),
+                (631, Protocol::Tcp, "127.0.0.1".into()),
+                (631, Protocol::Tcp6, "::1".into())
+            ]
+        );
+        assert!(held_by(&l, (812, 1)).is_empty(), "a reused pid is another process");
+    }
+
+    #[test]
+    fn a_port_search_selects_the_service_not_the_manager_keeping_its_socket() {
+        let l = |listeners: Vec<Listener>, error: Option<&str>| Listeners {
+            listeners,
+            holders_error: error.map(str::to_owned),
+        };
+        let running = l(
+            vec![
+                socket(
+                    Protocol::Tcp,
+                    "0.0.0.0",
+                    22,
+                    1,
+                    &[(1, "systemd"), (950, "sshd"), (900, "sshd")],
+                ),
+                socket(Protocol::Tcp6, "::", 22, 2, &[(1, "systemd")]),
+            ],
+            None,
+        );
+        match port_holder(22, &running) {
+            PortFound::Process(h) => assert_eq!((h.pid, h.comm.as_str()), (900, "sshd")),
+            other => panic!("{other:?}"),
+        }
+
+        let waiting = l(vec![socket(Protocol::Tcp, "0.0.0.0", 631, 1, &[(1, "systemd")])], None);
+        assert_eq!(port_holder(631, &waiting), PortFound::Waiting { system: true });
+        let user = l(
+            vec![socket(Protocol::Tcp, "127.0.0.1", 8080, 1, &[(1500, "systemd")])],
+            None,
+        );
+        assert_eq!(port_holder(8080, &user), PortFound::Waiting { system: false });
+
+        let hidden = l(
+            vec![socket(Protocol::Tcp, "0.0.0.0", 5432, 7, &[])],
+            Some("sysman-helper is not running"),
+        );
+        assert_eq!(
+            port_holder(5432, &hidden),
+            PortFound::Unknown {
+                uid: 0,
+                helper: Some("sysman-helper is not running".into())
+            }
+        );
+        let kernel = l(vec![socket(Protocol::Udp, "0.0.0.0", 51820, 0, &[])], Some("off"));
+        assert_eq!(
+            port_holder(51820, &kernel),
+            PortFound::Kernel,
+            "no helper would find a holder"
+        );
+        assert_eq!(port_holder(80, &running), PortFound::Nothing);
+    }
+
+    #[test]
+    fn a_waiting_port_names_its_socket_unit_and_what_starts() {
+        let unit = ("cups.socket".to_owned(), vec!["cups.service".to_owned()]);
+        assert_eq!(
+            port_line(631, &PortFound::Waiting { system: true }, Some(&unit), ""),
+            "Port 631 is held by cups.socket; cups.service starts on the next connection."
+        );
+        assert_eq!(
+            port_line(
+                5432,
+                &PortFound::Unknown {
+                    uid: 0,
+                    helper: Some("off".into())
+                },
+                None,
+                "root"
+            ),
+            "Port 5432 is open, held by root; enable the helper to see which process."
+        );
+        assert_eq!(
+            port_line(9, &PortFound::Nothing, None, ""),
+            "Nothing is listening on port 9."
+        );
+    }
+
+    #[test]
     fn only_our_own_processes_can_be_signalled() {
         let mut p = proc(1, 0, "x", 1);
         assert!(may_signal(&p, Some("me")));
@@ -2539,5 +3540,189 @@ mod tests {
         assert!(!may_signal(&p, None), "an unknown current user may signal nothing");
         p.user = None;
         assert!(!may_signal(&p, Some("me")), "an unknown owner is not ours");
+    }
+
+    fn why(sentence: &str) -> Why {
+        Why {
+            cause: why::Cause::Orphan,
+            sentence: sentence.into(),
+            chain: Vec::new(),
+            if_you_end: None,
+            evidence: Vec::new(),
+            notes: Vec::new(),
+            facts: Vec::new(),
+            actions: why::Actions::default(),
+        }
+    }
+
+    #[test]
+    fn a_late_answer_never_lands_on_another_process_or_over_the_full_one() {
+        let (a, b) = ((10, 100), (11, 110));
+        let shown = |e: &Option<Explained>| e.as_ref().and_then(|e| e.why.as_ref()).map(|w| w.sentence.clone());
+        let mut current = Some(Explained {
+            key: b,
+            why: None,
+            complete: false,
+        });
+        assert!(
+            !accept(&mut current, a, why("for a"), true),
+            "the selection moved on to b while a was being explained"
+        );
+        assert_eq!(shown(&current), None);
+        assert!(accept(&mut current, b, why("full"), true));
+        assert!(
+            !accept(&mut current, b, why("cgroup only"), false),
+            "the quick pass waits before it shows, so it can arrive after a fast full answer"
+        );
+        assert_eq!(shown(&current).as_deref(), Some("full"));
+        assert!(
+            accept(&mut current, b, why("after restart"), true),
+            "a unit action explains the same process again"
+        );
+        assert_eq!(shown(&current).as_deref(), Some("after restart"));
+        assert!(!accept(&mut None, b, why("deselected"), true));
+    }
+
+    #[test]
+    fn the_evidence_fold_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui.toml");
+        let mut prefs = Prefs::load(path.clone());
+        assert_eq!(load_why(&prefs), WhyPref { evidence: false }, "folded by default");
+        prefs.set(WHY_KEY, &WhyPref { evidence: true });
+        assert_eq!(load_why(&Prefs::load(path)), WhyPref { evidence: true });
+    }
+
+    struct Fixed(crate::data::systemd::Ran);
+
+    impl Runner for Fixed {
+        fn run(&self, _: &str, _: &[&str]) -> io::Result<crate::data::systemd::Ran> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn a_user_unit_goes_to_the_users_manager_and_a_system_unit_to_systemd() {
+        assert_eq!(
+            unit_args("stop", "pipewire.service", true),
+            ["--user", "stop", "--", "pipewire.service"]
+        );
+        assert_eq!(
+            unit_args("disable", "-cups.service", false),
+            ["disable", "--", "-cups.service"],
+            "a unit name is never read as an option"
+        );
+        let refused = Fixed(crate::data::systemd::Ran {
+            ok: false,
+            stdout: String::new(),
+            stderr: "Failed to stop cups.service: Interactive authentication required.\n".into(),
+        });
+        let err = unit_action(&refused, UnitVerb::Stop, "cups.service", false).unwrap_err();
+        assert!(
+            err.contains("sudo systemctl stop cups.service"),
+            "without a polkit agent it says what to run instead: {err}"
+        );
+        let ok = Fixed(crate::data::systemd::Ran {
+            ok: true,
+            ..Default::default()
+        });
+        assert_eq!(unit_action(&ok, UnitVerb::Restart, "cups.service", false), Ok(()));
+    }
+
+    #[test]
+    fn the_logs_link_filters_to_exactly_that_unit() {
+        use crate::data::logs::Query;
+        for unit in [
+            "sshd.service",
+            "getty@tty1.service",
+            r"systemd-fsck@dev-disk-by\x2duuid-1.service",
+        ] {
+            let q = Query::parse(&unit_logs_query(unit), 0, &jiff::tz::TimeZone::UTC);
+            assert_eq!(q.units, [unit], "{unit}");
+            assert!(q.text.is_empty(), "{unit} must not become a free-text search");
+        }
+    }
+
+    struct Machine {
+        restart: &'static str,
+        main_pid: u32,
+    }
+
+    impl Probe for Machine {
+        fn proc_file(&self, pid: u32, name: &str) -> io::Result<String> {
+            match (pid, name) {
+                (700, "cgroup") => Ok("0::/system.slice/demo.service\n".into()),
+                _ => Err(io::ErrorKind::NotFound.into()),
+            }
+        }
+
+        fn read(&self, _: &Path) -> io::Result<String> {
+            Err(io::ErrorKind::NotFound.into())
+        }
+
+        fn data_dirs(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+
+        fn uid(&self) -> u32 {
+            1000
+        }
+
+        fn unit(&self, _: &why::Unit) -> Result<why::UnitProps, String> {
+            Ok(why::UnitProps {
+                id: "demo.service".into(),
+                unit_file_state: "enabled".into(),
+                wanted_by: vec!["multi-user.target".into()],
+                restart: self.restart.into(),
+                main_pid: Some(self.main_pid),
+                ..Default::default()
+            })
+        }
+
+        fn session(&self, _: &str) -> Result<why::Session, String> {
+            Err("none".into())
+        }
+
+        fn docker_name(&self, _: &str) -> Result<String, String> {
+            Err("none".into())
+        }
+
+        fn exe_link(&self, _: u32) -> Option<String> {
+            None
+        }
+    }
+
+    #[test]
+    fn ending_a_process_warns_only_when_systemd_brings_it_back() {
+        let table = [proc(700, 1, "demo", 1), proc(1, 0, "systemd", 1)];
+        let warns = |restart, main_pid| {
+            let w = why::explain_with(&Machine { restart, main_pid }, 700, 1700, &table);
+            w.if_you_end.as_deref().is_some_and(comes_back)
+        };
+        assert!(warns("always", 700));
+        assert!(warns("on-failure", 700), "Force end brings it back");
+        assert!(!warns("no", 700));
+        assert!(
+            !warns("always", 699),
+            "only the main process's exit restarts the service"
+        );
+    }
+
+    #[test]
+    fn the_quick_pass_names_the_cause_without_asking_d_bus() {
+        let proc_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(proc_root.path().join("700")).unwrap();
+        std::fs::write(proc_root.path().join("700/cgroup"), "0::/system.slice/demo.service\n").unwrap();
+        let table = [proc(700, 1, "demo", 1), proc(1, 0, "systemd", 1)];
+        let quick = Quick(why::Live {
+            proc_root: proc_root.path().to_owned(),
+        });
+        let w = why::explain_with(&quick, 700, 1700, &table);
+        assert!(w.sentence.contains("demo.service"), "{}", w.sentence);
+        assert_eq!(
+            w.actions.unit.as_deref(),
+            Some("demo.service"),
+            "the unit's actions show at once"
+        );
     }
 }

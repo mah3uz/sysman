@@ -102,6 +102,7 @@ gpui_kit_assets::icon_assets!(
         ChartColumn,
         Skull,
         Columns3,
+        CircleStop,
     ]
 );
 
