@@ -289,7 +289,21 @@ Metric sidebar built from the `series` table, grouped by module, with friendly
 names for known paths; process search over `procs` (including exited); chart
 grid (3 columns) with a shared cursor; Earlier/Later, go-to-time, zoom, Live;
 inspector with values at the cursor and window statistics; CSV export of the
-visible range.
+visible range. A process picked from the search, running or exited, shows one
+**Why it ran** line under its name (below).
+
+### Why it ran (recorded processes)
+
+`procs` keeps each instance's cgroup path and parent pid, written once when
+`sysmand` first records it (DESIGN.md). For a process that is no longer
+running, Explorer and the Logs inspector show one sentence from that record,
+classified by the same function as the live inspector, with the parent chain
+rebuilt from recorded `procs` rows (the parent instance that ran at the
+child's start). Unit details (trigger, restart policy) are not recorded: when
+the unit still exists they are looked up now and the sentence says "as of
+now"; otherwise the sentence names only the unit, app, container or session.
+Rows recorded before this existed say "Not recorded (sysman was older then)".
+Nothing here runs in the daemon or per tick.
 
 ### 6.9 Insights
 "What's happening" callouts from rules over recent history: swap climbing,
@@ -350,7 +364,7 @@ what sysman recorded at the same moment. Reading and the index live in
   **What sysman recorded** — CPU, memory and CPU temperature around the entry
   from history (±10 min, the entry's time as a rule), plus the process's own
   memory history when the entry names a pid sysman recorded (crashes, OOM
-  victims); "Open in Explorer at HH:MM"; **Around this entry** — the 6 entries
+  victims) and its **Why it ran** line (below); "Open in Explorer at HH:MM"; **Around this entry** — the 6 entries
   before and after it with no filter applied; every journal field as a
   key/value list. Actions: Copy (entry as text), Copy fields (JSON), Show
   backtrace (crashes: the stack trace from the coredump's MESSAGE, else
