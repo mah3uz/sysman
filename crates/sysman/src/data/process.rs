@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use schema::listeners::Listener;
+use schema::listeners::Listeners;
 use schema::processes::Table;
 use serde::Deserialize;
 
@@ -17,7 +17,7 @@ use crate::data::live::Conn;
 const BACKOFF_START: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 const PAUSED_POLL: Duration = Duration::from_millis(250);
-/// The daemon's scan plus up to half a second waiting on the helper; past this the daemon is stuck.
+/// The daemon's scan plus up to 3 s waiting on the helper; past this the daemon is stuck.
 const LISTENERS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -99,12 +99,13 @@ fn parse(line: &str) -> Event {
     }
 }
 
-/// Every listening socket now, asked once on a connection of its own; blocks while the daemon scans.
-pub fn listeners(path: &Path) -> Result<Vec<Listener>> {
+/// Every listening socket now, and why other users' holders are missing when they are; asked once on a connection
+/// of its own, blocking while the daemon scans.
+pub fn listeners(path: &Path) -> Result<Listeners> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Reply {
-        Listeners { listeners: Vec<Listener> },
+        Listeners(Listeners),
         Error { error: String },
     }
     let mut stream = UnixStream::connect(path).with_context(|| format!("connecting to {}", path.display()))?;
@@ -115,7 +116,7 @@ pub fn listeners(path: &Path) -> Result<Vec<Listener>> {
         bail!("the daemon closed the connection");
     }
     match serde_json::from_str(&line).context("the daemon's answer does not fit the schema")? {
-        Reply::Listeners { listeners } => Ok(listeners),
+        Reply::Listeners(l) => Ok(l),
         Reply::Error { error } => bail!("{error}"),
     }
 }
@@ -228,12 +229,22 @@ mod tests {
             {"protocol": "udp", "address": "127.0.0.53", "port": 53, "uid": 991, "inode": 10}
         ]}));
         let got = listeners(&path).unwrap();
+        assert_eq!(got.holders_error, None);
+        let got = got.listeners;
         assert_eq!((got[0].port, got[0].holders[0].comm.as_str()), (22, "systemd"));
         assert!(
             got[1].holders.is_empty(),
             "a socket with no known holder still arrives, with its uid"
         );
         assert_eq!(got[1].uid, 991);
+
+        // the app can say why another user's service has no process instead of showing it as nobody's
+        let (_dir, path) = answer_listeners(json!({"type": "listeners", "t": 1.0, "listeners": [],
+            "holders_error": "sysman-helper is not running"}));
+        assert_eq!(
+            listeners(&path).unwrap().holders_error.as_deref(),
+            Some("sysman-helper is not running")
+        );
 
         let (_dir, path) = answer_listeners(json!({"error": "reading /proc/net/tcp: Permission denied"}));
         assert!(listeners(&path).unwrap_err().to_string().contains("Permission denied"));

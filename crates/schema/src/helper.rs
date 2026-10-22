@@ -50,10 +50,11 @@ pub struct Reading {
     pub smart: BTreeMap<String, crate::storage::Smart>,
 }
 
-/// The helper's answer to `sockets`: socket inodes and nothing else, so no other open file is revealed.
+/// The helper's answer to `sockets`: inodes of listening sockets and nothing else, so no other open file and no
+/// connection is revealed.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Sockets {
-    /// Only processes holding at least one socket.
+    /// Only processes holding at least one listening socket.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub processes: Vec<ProcSockets>,
 }
@@ -63,7 +64,8 @@ pub struct ProcSockets {
     pub pid: u32,
     /// As in [`ProcCounters::start_ticks`].
     pub start_ticks: u64,
-    /// The `N` of each `socket:[N]` link in `/proc/<pid>/fd`, sorted, each once.
+    /// The `N` of each `socket:[N]` link in `/proc/<pid>/fd` whose socket is listening TCP or bound, unconnected UDP
+    /// in PID 1's network namespace, sorted, each once.
     pub inodes: Vec<u64>,
 }
 

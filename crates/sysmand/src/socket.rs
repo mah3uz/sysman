@@ -156,13 +156,16 @@ fn processes(scanner: &mut Option<ProcessScanner>, sys: &Sys) -> Result<String> 
 }
 
 fn listeners(sys: &Sys) -> Result<String> {
-    let listeners = crate::listeners::scan(sys)?;
-    Ok(json!({
+    let found = crate::listeners::scan(sys)?;
+    let mut reply = json!({
         "type": "listeners",
         "t": (unix_now() * 1000.0).round() / 1000.0,
-        "listeners": listeners,
-    })
-    .to_string())
+        "listeners": found.listeners,
+    });
+    if let Some(e) = found.holders_error {
+        reply["holders_error"] = json!(e);
+    }
+    Ok(reply.to_string())
 }
 
 fn error(msg: &str) -> String {
