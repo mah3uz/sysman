@@ -452,21 +452,27 @@ fn ask_listeners() -> Result<Listeners, String> {
 fn reach(protocol: Protocol, address: IpAddr) -> &'static str {
     if address.to_canonical().is_loopback() {
         "this machine only"
-    } else if matches!(protocol, Protocol::Tcp | Protocol::Tcp6) {
+    } else if is_tcp(protocol) {
         "reachable from the network"
     } else {
         "can receive from the network"
     }
 }
 
-/// The sockets this instance holds, by port.
+fn is_tcp(protocol: Protocol) -> bool {
+    matches!(protocol, Protocol::Tcp | Protocol::Tcp6)
+}
+
+/// The sockets this instance holds, by port; sockets that read the same (one per interface, or IPv4 in both
+/// tables) are listed once.
 fn held_by(l: &Listeners, selected: Key) -> Vec<&Listener> {
     let mut held: Vec<&Listener> = l
         .listeners
         .iter()
         .filter(|s| s.holders.iter().any(|h| (h.pid, h.start_time) == selected))
         .collect();
-    held.sort_by_key(|s| (s.port, s.protocol));
+    held.sort_by_key(|s| (s.port, !is_tcp(s.protocol), s.address));
+    held.dedup_by_key(|s| (s.port, is_tcp(s.protocol), s.address));
     held
 }
 
@@ -1770,8 +1776,11 @@ impl Processes {
                         comm: h.comm.clone(),
                         instance: Some((h.pid, h.start_time)),
                     });
-                    self.apply_focus(cx);
-                    self.sync_selection(cx);
+                    // before the first table the next feed applies it
+                    if !self.delegate(cx).model.table.is_empty() {
+                        self.apply_focus(cx);
+                        self.sync_selection(cx);
+                    }
                 }
                 let owner = match &found {
                     PortFound::Unknown { uid, .. } => user_name(*uid).unwrap_or_else(|| format!("uid {uid}")),
@@ -2678,10 +2687,7 @@ impl Processes {
             )));
         }
         let rows = held.into_iter().enumerate().map(|(i, s)| {
-            let protocol = match s.protocol {
-                Protocol::Tcp | Protocol::Tcp6 => "TCP",
-                Protocol::Udp | Protocol::Udp6 => "UDP",
-            };
+            let protocol = if is_tcp(s.protocol) { "TCP" } else { "UDP" };
             let address = SharedString::from(SocketAddr::new(s.address, s.port).to_string());
             div()
                 .id(("listening", i))
@@ -3426,13 +3432,26 @@ mod tests {
             listeners: vec![
                 socket(Protocol::Tcp6, "::1", 631, 1, &[(812, "cupsd")]),
                 socket(Protocol::Tcp, "127.0.0.1", 631, 2, &[(812, "cupsd")]),
-                socket(Protocol::Udp, "0.0.0.0", 53, 3, &[(812, "cupsd")]),
+                socket(Protocol::Udp, "224.0.0.251", 53, 3, &[(812, "cupsd")]),
+                socket(Protocol::Udp, "224.0.0.251", 53, 5, &[(812, "cupsd")]),
+                socket(Protocol::Tcp6, "127.0.0.1", 631, 6, &[(812, "cupsd")]),
                 socket(Protocol::Tcp, "0.0.0.0", 22, 4, &[(900, "sshd")]),
             ],
             holders_error: None,
         };
-        let held: Vec<_> = held_by(&l, (812, 912)).iter().map(|s| (s.port, s.protocol)).collect();
-        assert_eq!(held, [(53, Protocol::Udp), (631, Protocol::Tcp), (631, Protocol::Tcp6)]);
+        let held: Vec<_> = held_by(&l, (812, 912))
+            .iter()
+            .map(|s| (s.port, s.protocol, s.address.to_string()))
+            .collect();
+        // one row per thing the reader can tell apart: per-interface copies and a v4 socket in tcp6 read the same
+        assert_eq!(
+            held,
+            [
+                (53, Protocol::Udp, "224.0.0.251".into()),
+                (631, Protocol::Tcp, "127.0.0.1".into()),
+                (631, Protocol::Tcp6, "::1".into())
+            ]
+        );
         assert!(held_by(&l, (812, 1)).is_empty(), "a reused pid is another process");
     }
 

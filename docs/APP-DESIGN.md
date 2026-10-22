@@ -218,13 +218,19 @@ means" and "How it is calculated". Panels without a chart have no arrow.
     the systemctl runner Settings uses; "Logs for this unit" opens Logs with
     `unit:<name>`; for containers the command to copy, never run.
 - **Listening on**: the selected process's listening TCP sockets and bound
-  UDP sockets, each "reachable from the network" or "this machine only" by
-  its bound address. From the daemon's `listeners` socket request (DESIGN.md,
-  "Privileged helper"); another user's sockets need the helper, else one line
-  says "held by root" with the "Enable…" hint. Hidden when it has none.
-- The search field also takes `port:<n>`: it asks `listeners` once and
-  selects the process holding that port, or says which socket unit holds it
-  when its service is not running.
+  UDP sockets, each "this machine only" (loopback) or, by its bound address,
+  "reachable from the network" (TCP) or "can receive from the network" (UDP,
+  never called a service: clients' DNS and QUIC sockets are bound too);
+  sockets that read the same are listed once. From the daemon's `listeners`
+  socket request (DESIGN.md, "Privileged helper"), once per selection. For
+  another user's process with no sockets matched while `holders_error` is set,
+  one line gives the reason with the "Enable…" hint. Hidden when it has none.
+- The search field also takes exactly `port:<n>`: the table lists every
+  process, `listeners` is asked once typing pauses, and one line under the
+  field names the holder, which is selected (a process other than PID 1 or a
+  user `systemd`); else the socket unit holding it and the service it starts
+  on the next connection, the owner when the holder cannot be read, the
+  kernel, or "Nothing is listening on port N."
 - Context menu: Copy name/PID/command line; End process (SIGTERM) and Force end
   (SIGKILL), each confirmed, the confirmation warning when the process will
   come back; disabled for other users' processes.
