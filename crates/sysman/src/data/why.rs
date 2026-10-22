@@ -880,13 +880,7 @@ pub fn explain_with(probe: &dyn Probe, pid: u32, start_time: u64, table: &[Proce
                 .as_ref()
                 .map(|p| p.source_path.as_str())
                 .filter(|s| !s.is_empty());
-            facts.desktop = desktop_entry(probe, &desktop_candidates(desktop_id), source);
-            if facts.desktop.is_none() {
-                unavailable(
-                    &mut notes,
-                    format!("no .desktop file found for {}", unescape(desktop_id)),
-                );
-            }
+            facts.desktop = app_desktop(probe, desktop_id, source, chain.first());
         }
         Cause::Flatpak { app } => facts.desktop = desktop_entry(probe, std::slice::from_ref(app), None),
         Cause::Container { runtime, id: Some(id) } => match container_name(probe, *runtime, id) {
@@ -958,13 +952,17 @@ pub fn explain_recorded_with(probe: &dyn Probe, origin: &Origin, start_time: u64
     if let Some(props) = &facts.props {
         cause = refine(cause, props);
     }
-    if let Cause::Timer { unit, timer } = &cause {
-        facts.timer = probe
-            .unit(&Unit {
-                name: timer.clone(),
-                uid: unit.uid,
-            })
-            .ok();
+    match &cause {
+        Cause::Timer { unit, timer } => {
+            facts.timer = probe
+                .unit(&Unit {
+                    name: timer.clone(),
+                    uid: unit.uid,
+                })
+                .ok();
+        }
+        Cause::App { desktop_id, .. } => facts.desktop = app_desktop(probe, desktop_id, None, chain.first()),
+        _ => {}
     }
     let mut sentence = sentence(&cause, &facts, probe, start_time);
     if facts.props.is_some() {
@@ -1046,6 +1044,24 @@ fn desktop_entry(probe: &dyn Probe, candidates: &[String], source: Option<&str>)
     candidates.iter().find_map(|c| {
         dirs.iter()
             .find_map(|d| read(d.join("applications").join(format!("{c}.desktop"))))
+    })
+}
+
+/// Apps that name their own scope (Chromium uses `org.chromium.Chromium`) have no `.desktop` file by that id, so the program's own name is tried next.
+fn app_desktop(
+    probe: &dyn Probe,
+    desktop_id: &str,
+    source: Option<&str>,
+    me: Option<&Link>,
+) -> Option<(String, PathBuf)> {
+    desktop_entry(probe, &desktop_candidates(desktop_id), source).or_else(|| {
+        let me = me?;
+        let program = me.exe.as_deref().unwrap_or(&me.comm);
+        let keys: Vec<String> = crate::data::desktop::process_keys(&me.comm, program)
+            .into_iter()
+            .flatten()
+            .collect();
+        desktop_entry(probe, &keys, None)
     })
 }
 
@@ -2046,6 +2062,25 @@ mod tests {
         let w = explain_with(&f, 812, 100, &table());
         assert_eq!(w.sentence, "You opened Firefox at 09:12.");
         assert!(w.notes.is_empty());
+    }
+
+    #[test]
+    fn an_app_that_names_its_own_scope_is_named_by_its_programs_desktop_file() {
+        let mut f = Fake::default();
+        f.files.insert(
+            "/proc/812/cgroup".into(),
+            v2("/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.chromium.Chromium-812.scope"),
+        );
+        f.files.insert(
+            "/usr/share/applications/sshd.desktop".into(),
+            "[Desktop Entry]\nName=Secure Shell\n".into(),
+        );
+        let w = explain_with(&f, 812, 100, &table());
+        assert!(w.sentence.contains("Secure Shell"), "{}", w.sentence);
+        assert!(
+            w.notes.is_empty(),
+            "a missing file under the scope's own id is not worth a note when the program's own entry names it"
+        );
     }
 
     #[test]
