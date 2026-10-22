@@ -25,6 +25,18 @@ const logRows = [
   { time: '03:53:27', unit: 'gnome-shell', text: 'Window manager warning: binding replaced', mark: 'bg-warn' },
 ]
 
+const whyChain = [
+  { text: 'cups.socket', depth: 0 },
+  { text: 'cups.service · restarted 0 times', depth: 1 },
+  { text: 'cupsd 1069', depth: 2, last: true },
+]
+
+const whyMore = [
+  { text: 'Stop, Restart or Disable the unit, each confirmed, or open its logs', dot: 'bg-accent' },
+  { text: 'The ports it listens on; search port:631 to find who holds a port', dot: 'bg-ok' },
+  { text: 'Explorer and Logs say why a process that has exited ran', dot: 'bg-violet' },
+]
+
 const path = (values) => values.map((v, i) => `${i ? 'L' : 'M'}${(i * 100) / (values.length - 1)},${40 - v * 36}`).join(' ')
 const recorded = [
   { label: 'CPU', value: '2%', dot: 'bg-accent', stroke: 'var(--blue)', d: path([0.18, 0.22, 0.15, 0.3, 0.2, 0.26, 0.62, 0.34, 0.22, 0.28, 0.2, 0.24]) },
@@ -160,6 +172,51 @@ jq -c 'select(.errors) | [.time, .errors]' "$f"  # collector failures`
           <ul class="mt-6 flex flex-wrap gap-1.5" aria-label="Log sources">
             <li v-for="s in sources" :key="s" class="rounded-md border border-line bg-canvas-2/70 px-2.5 py-1 text-xs text-muted">{{ s }}</li>
           </ul>
+        </article>
+
+        <!-- why -->
+        <article v-reveal class="card relative overflow-hidden p-6 sm:p-7 md:col-span-6">
+          <div class="grid gap-x-10 gap-y-6 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
+            <div>
+              <div class="flex h-10 w-10 items-center justify-center rounded-xl bg-accent/12 text-accent"><Icon name="layers" /></div>
+              <h3 class="mt-5 text-lg font-semibold">Why is this running?</h3>
+              <p class="mt-2 leading-relaxed text-muted">
+                Select a process and sysman says in one sentence why it exists: a service enabled at boot, a
+                socket, timer or D-Bus activation, a login autostart entry, an app you opened, a command in a
+                terminal, a container, cron or the kernel. It shows the chain from the cause to the process, and
+                whether the process comes back if you end it. When sysman can’t tell, it says why rather than
+                guessing.
+              </p>
+              <ul class="mt-6 space-y-2.5 text-sm text-muted">
+                <li v-for="w in whyMore" :key="w.text" class="flex gap-2.5"><span class="mt-2 h-1.5 w-1.5 shrink-0 rounded-full" :class="w.dot" />{{ w.text }}</li>
+              </ul>
+            </div>
+            <div>
+              <div class="art" aria-hidden="true">
+                <p class="art-label">Why it’s running</p>
+                <p class="mt-2 text-[0.8rem] text-ink">Started when something connected to cups.socket.</p>
+                <ol class="mt-2.5 space-y-1 font-mono">
+                  <li
+                    v-for="c in whyChain"
+                    :key="c.text"
+                    class="truncate"
+                    :class="c.last && 'text-ink'"
+                    :style="{ paddingLeft: `${c.depth * 0.9}rem` }"
+                  ><span v-if="c.depth" class="text-subtle">└ </span>{{ c.text }}</li>
+                </ol>
+                <p class="art-label mt-3 border-t border-line pt-3">If you end it</p>
+                <p class="mt-1.5">
+                  After End it stays stopped until something connects to cups.socket. After Force end, systemd
+                  starts it again right away.
+                </p>
+                <p class="mt-3 flex flex-wrap gap-1.5">
+                  <span v-for="a in ['Stop', 'Restart', 'Disable', 'Logs for this unit']" :key="a" class="rounded-md border border-line bg-surface/60 px-2 py-0.5 text-ink">{{ a }}</span>
+                </p>
+                <p class="art-label mt-3 border-t border-line pt-3">Listening on</p>
+                <p class="mt-1.5 flex justify-between gap-3 font-mono"><span><span class="text-subtle">TCP</span> 127.0.0.1:631</span><span class="font-sans">this machine only</span></p>
+              </div>
+            </div>
+          </div>
         </article>
 
         <!-- crash log -->
