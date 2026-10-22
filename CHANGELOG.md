@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Why it's running:** select a process and the inspector says, in one sentence, why it exists, with the evidence
+  behind it.
+  - **Causes:** a system or user service enabled at boot, a socket, timer or D-Bus activation, a login autostart entry,
+    an app you opened, a command run in a terminal, a process whose parent has exited, an SSH or other login session,
+    a container (Docker, Podman, Kubernetes), Flatpak and Snap apps, cron, and the kernel. When sysman can't tell, it
+    says why rather than guessing.
+  - **The chain** from the cause down to the process, the unit's restart count, and the last and next run of a timer.
+  - **If you end it:** whether systemd starts it again, after End or only after Force end, or whether it comes back on
+    the next connection or login. The End process confirmation repeats this.
+  - **Actions:** Stop, Restart and Disable the unit, each confirmed, and Logs for this unit. They are never offered for
+    the unit that holds your desktop session.
+  - **How sysman knows:** the cgroup, unit file and dependencies behind the answer.
+  - A process still running an older copy of a program that an update has since replaced says so.
+- **Listening on:** the selected process's open ports, each marked reachable from the network or from this machine
+  only. Search `port:631` to find which process holds a port, or which socket unit is waiting on it.
+- **Why it ran:** Explorer and the Logs inspector say why a recorded process ran, including processes that have
+  exited. `sysmand` records each process's cgroup and parent once, when it first sees it; existing history is upgraded
+  in place, and processes recorded before this say so.
+- **Processes:** PID is the first column.
+- `sysman-helper` can name which of another user's processes holds a listening port. It reveals only listening
+  sockets, never connections.
+- `sysmand` answers a new `listeners` request on its socket.
+
 ## 0.2.0 - 2026-10-20
 
 - **Logs**, a new tab: the systemd journal and the package manager's history on one timeline.

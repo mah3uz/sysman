@@ -12,8 +12,9 @@ your machine is doing, and a native app that shows it live and as history.
   Unix socket.
 - **`sysman`** is a GPUI desktop app that reads that data.
 
-No root is needed for either. The app has ten tabs: Dashboard, Processes, GPU,
-Energy, Network, Disk (with a Disk Map), Hardware, Explorer, Insights and Groups.
+No root is needed for either. The app has eleven tabs: Dashboard, Processes,
+GPU, Energy, Network, Disk (with a Disk Map), Hardware, Explorer, Insights, Logs
+and Groups.
 
 ## Hardware support
 
@@ -211,6 +212,7 @@ echo '{"cmd":"latest"}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/sysman.sock | jq
 | `{"cmd":"latest"}` | the newest value of every module |
 | `{"cmd":"subscribe"}` | meta, then every record as it is produced |
 | `{"cmd":"processes"}` | the full process table now |
+| `{"cmd":"listeners"}` | every listening TCP and bound UDP socket now, with the processes holding it where known |
 
 History is read directly from `history.db` (SQLite, WAL mode; open it
 read-only). The record format and table layout are in [DESIGN.md](DESIGN.md)
@@ -220,8 +222,9 @@ and `crates/schema`.
 
 Without root, these are not collected: SMART health and wear, CPU package power
 on most systems (RAPL is root-only), disk I/O and open files of other users'
-processes, and per-process network traffic. The app shows them as "not
-permitted" rather than as zero.
+processes, per-process network traffic, and which of another user's processes
+holds a listening port. The app shows them as "not permitted" rather than as
+zero.
 
 The optional privileged helper, `sysman-helper`, reads exactly these and
 nothing else. It is installed as a system service but not enabled; turn it on
