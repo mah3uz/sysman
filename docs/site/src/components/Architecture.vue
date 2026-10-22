@@ -4,7 +4,7 @@ import Icon from './Icon.vue'
 const stores = [
   { name: 'Crash log', path: '~/.local/share/sysman/log/', note: 'JSON Lines, synced every tick, today and yesterday', dot: 'bg-warn' },
   { name: 'History', path: '~/.local/share/sysman/history.db', note: 'SQLite with rollups and recorded events, opened read-only by readers', dot: 'bg-accent' },
-  { name: 'Live socket', path: '$XDG_RUNTIME_DIR/sysman.sock', note: 'line-delimited JSON: meta, latest, subscribe, processes', dot: 'bg-ok' },
+  { name: 'Live socket', path: '$XDG_RUNTIME_DIR/sysman.sock', note: 'line-delimited JSON: meta, latest, subscribe, processes, listeners', dot: 'bg-ok' },
 ]
 
 const facts = [
@@ -50,7 +50,8 @@ const facts = [
           </div>
           <p class="mt-4 text-sm leading-relaxed text-muted">
             Reads only what needs root: SMART drive health, CPU package power, other users’ disk I/O and
-            open files, and per-process network traffic through eBPF.
+            open files, which of their processes holds a listening port, and per-process network traffic
+            through eBPF.
           </p>
           <p class="mt-auto pt-4 text-xs text-subtle">Confined by systemd, with no network of its own.</p>
         </div>

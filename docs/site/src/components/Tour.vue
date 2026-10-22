@@ -15,9 +15,9 @@ const screens = [
   {
     id: 'processes',
     label: 'Processes',
-    title: 'Every process, with its own history',
-    text: 'A sortable table with over twenty columns to choose from, a hierarchy view and a search filter. The inspector charts one process’s memory, CPU, open files and disk I/O over time, including earlier runs of the same command.',
-    alt: 'The Processes screen: CPU usage, per-core, load average and CPU temperature cards above a table of processes sorted by memory, with CPU %, CPU time, threads, network rates, state and PID columns.',
+    title: 'Every process, and why it’s running',
+    text: 'Select a process and the inspector says in one sentence why it is running: a service enabled at boot, a socket or timer, an app you opened, a command in a terminal, a container. It shows the chain that led to it, whether it comes back if you end it, and the ports it listens on, then charts its memory, CPU, open files and disk I/O over time. The table has over twenty columns, a hierarchy view and a search that also finds which process holds a port.',
+    alt: 'The Processes screen searched for port:631, which names cupsd as the holder. The inspector says why cupsd is running: started when something connected to cups.socket, through cups.socket, cups.service and cupsd, and what happens if you end it, with Stop, Restart, Disable and Logs for this unit, its details, and the two local addresses it listens on.',
   },
   {
     id: 'gpu',
@@ -58,7 +58,7 @@ const screens = [
     id: 'explorer',
     label: 'Explorer',
     title: 'Any metric, any time range',
-    text: 'Pick recorded metrics and processes, including ones that have exited, and chart them side by side with one shared cursor and recorded events marked. Step back in time, zoom, jump to a date, follow live, and export what you see as CSV.',
+    text: 'Pick recorded metrics and processes, including ones that have exited, and chart them side by side with one shared cursor and recorded events marked; a recorded process says why it ran. Step back in time, zoom, jump to a date, follow live, and export what you see as CSV.',
     alt: 'Explorer: a metric list on the left, a grid of charts for total CPU, pressure, memory composition and network throughput, and values at the cursor on the right.',
   },
   {

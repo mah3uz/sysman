@@ -43,8 +43,9 @@ const paths = [
             <p>
               No. The collector runs as a systemd user service and the app runs as you. A few readings are
               root-only in Linux (SMART health, CPU package power on most systems, other users’ disk I/O and
-              open files, per-process network traffic); the app shows them as “not permitted” until you turn
-              on the optional helper. The Logs screen reads the whole system journal if you are in the
+              open files, which of their processes holds a listening port, per-process network traffic); the
+              app shows them as “not permitted” until you turn on the optional helper. The Logs screen
+              reads the whole system journal if you are in the
               <span class="inline-code">systemd-journal</span> group (or <span class="inline-code">adm</span>,
               or <span class="inline-code">wheel</span> on Arch); otherwise it shows only your own entries.
             </p>
@@ -135,9 +136,10 @@ const paths = [
           <summary>Can I use the data in my own scripts?</summary>
           <div class="answer">
             <p>
-              Yes. The socket speaks line-delimited JSON with four requests:
+              Yes. The socket speaks line-delimited JSON with five requests:
               <span class="inline-code">meta</span>, <span class="inline-code">latest</span>,
-              <span class="inline-code">subscribe</span> and <span class="inline-code">processes</span>.
+              <span class="inline-code">subscribe</span>, <span class="inline-code">processes</span> and
+              <span class="inline-code">listeners</span>.
               History is plain SQLite in WAL mode; open it read-only.
             </p>
             <CodeBlock class="mt-4" :code="socket" />
