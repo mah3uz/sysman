@@ -167,6 +167,13 @@ per line, one response per line; errors are `{"error": "…"}`.
 | `{"cmd":"latest"}` | latest sample's envelope plus each module's most recent value (includes `processes.table`) |
 | `{"cmd":"subscribe"}` | meta, then every record as produced; a client 32 lines behind is disconnected |
 | `{"cmd":"processes"}` | full process table now, CPU relative to this client's previous request (first answer takes ~0.5 s) |
+| `{"cmd":"listeners"}` | every listening TCP and bound UDP socket now: protocol, local address and port, owning uid, and the holding process (pid, start time, comm) where known |
+
+`listeners` is answered on request only, never per tick. Sockets come from
+`/proc/net/{tcp,tcp6,udp,udp6}` (any user may read them); the holder is found
+by matching socket inodes in `/proc/<pid>/fd`, which the daemon can read for
+its own user's processes and asks the helper's `sockets` for the rest. A
+socket with no known holder keeps its uid.
 
 A second daemon is refused when the socket answers; any other socket failure
 leaves the daemon logging without it. History is not served over the socket:
@@ -210,7 +217,10 @@ these and nothing else.
   `max_energy_range_uj`), per-process cumulative counters for every pid
   (`read_bytes`, `write_bytes`, `fds`, eBPF `net_rx_bytes`, `net_tx_bytes`,
   keyed by pid and `start_ticks`, field 22 of `stat`), and the latest SMART
-  readings by block device. A field whose source is off is absent. The types
+  readings by block device;
+  `{"cmd":"sockets"}` → for every process (pid and `start_ticks`), the inodes
+  of the sockets it holds, read from `/proc/<pid>/fd`, so `sysmand` can name
+  the holder of another user's listening socket. A field whose source is off is absent. The types
   are `schema::helper::{Request, Status, Reading}`. Rates are computed in
   `sysmand` with its usual `Deltas`; RAPL power reuses the collector's own
   wrap-aware step.
@@ -409,5 +419,5 @@ daemon at startup with a message naming them.
 
 ## Not in scope yet
 
-Docker container names, ARM CPUs, systemd service and
+Docker container names in the collector, ARM CPUs, systemd service and
 mdraid collectors.

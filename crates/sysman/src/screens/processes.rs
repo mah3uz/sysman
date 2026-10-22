@@ -111,6 +111,7 @@ pub enum Col {
 impl Col {
     /// Every column, in display order.
     pub const ALL: [Col; 21] = [
+        Self::Pid,
         Self::Process,
         Self::Command,
         Self::Path,
@@ -130,7 +131,6 @@ impl Col {
         Self::Nice,
         Self::Priority,
         Self::Started,
-        Self::Pid,
         Self::Ppid,
     ];
     const DEFAULT: [Col; 7] = [
@@ -2447,20 +2447,20 @@ mod tests {
     #[test]
     fn the_process_column_cannot_be_hidden_and_unknown_names_are_dropped() {
         assert_eq!(
-            toggle_column(&[Col::Process, Col::Pid], Col::Process),
-            [Col::Process, Col::Pid],
+            toggle_column(&[Col::Pid, Col::Process], Col::Process),
+            [Col::Pid, Col::Process],
             "it holds the tree and the icon"
         );
         assert_eq!(
-            toggle_column(&[Col::Process, Col::Pid], Col::Memory),
-            [Col::Process, Col::Memory, Col::Pid],
-            "display order, not click order"
+            toggle_column(&[Col::Pid, Col::Process], Col::Memory),
+            [Col::Pid, Col::Process, Col::Memory],
+            "display order, not click order, with PID leading so ids line up at the left edge"
         );
         let dir = tempfile::tempdir().unwrap();
         let mut prefs = Prefs::load(dir.path().join("ui.toml"));
         // a file from a newer or older version may name columns this one does not know
         prefs.set(COLUMNS_KEY, &["pid", "gone", "user"]);
-        assert_eq!(load_columns(&prefs), Some(vec![Col::Process, Col::User, Col::Pid]));
+        assert_eq!(load_columns(&prefs), Some(vec![Col::Pid, Col::Process, Col::User]));
         prefs.set(COLUMNS_KEY, &["gone"]);
         assert_eq!(load_columns(&prefs), None);
     }
