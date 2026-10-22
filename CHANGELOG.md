@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-23
+
 - **Why it's running:** select a process and the inspector says, in one sentence, why it exists, with the evidence
   behind it.
   - **Causes:** a system or user service enabled at boot, a socket, timer or D-Bus activation, a login autostart entry,
