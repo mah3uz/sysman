@@ -198,9 +198,10 @@ means" and "How it is calculated". Panels without a chart have no arrow.
   - *Details* for the selected process only: unit properties over D-Bus
     (system bus for system units, session bus for user units), the logind
     session, the `.desktop` name, the container name (podman's
-    `containers.json`, Docker's API when its socket is reachable). The
-    sentence from the cgroup shows at once; details fill in when D-Bus
-    answers, and a line says so if it does not.
+    `containers.json`, Docker's API when its socket is reachable). Two
+    passes run side by side: if D-Bus has not answered within 150 ms, the
+    sentence from the cgroup shows with a "Looking up details…" line;
+    details fill in when D-Bus answers, and a line says so if it does not.
   - *Layout*: the sentence; the chain, at most four lines, cause on top and
     the process last (`multi-user.target` → `sshd.service · restarted 0
     times` → `sshd 812`), ellipsised with the full text on hover; **If you

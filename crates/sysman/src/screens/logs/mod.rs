@@ -304,8 +304,13 @@ impl Logs {
         };
         #[cfg(debug_assertions)]
         this.dev_setup(cx);
-        if let Some(Focus::LogEntry { t_us }) = take_focus(cx) {
-            this.open_at(t_us, cx);
+        match take_focus(cx) {
+            Some(Focus::LogEntry { t_us }) => this.open_at(t_us, cx),
+            Some(Focus::LogQuery(text)) => {
+                this.text = text;
+                this.apply_text(cx);
+            }
+            _ => {}
         }
         this.recompute(cx);
         this.watch(cx);
