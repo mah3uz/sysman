@@ -2,9 +2,11 @@ use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use gpui::{
@@ -36,15 +38,17 @@ use crate::data::live::Live;
 use crate::data::prefs::{Prefs, prefs};
 use crate::data::process::ProcessFeed;
 use crate::data::source::{Combine, Source, top_up};
+use crate::data::systemd::{Runner, System};
+use crate::data::why::{self, Probe, Why};
 use crate::screens::dashboard::{Groups, cpu_colour};
-use crate::ui::shell::{CONTROL_HEIGHT, Focus, Tab, pill, take_focus};
+use crate::ui::shell::{CONTROL_HEIGHT, Focus, Tab, navigate, pill, take_focus};
 use crate::ui::theme::{rem_px, theme};
 use crate::ui::widgets::app_icon::app_icon;
 use crate::ui::widgets::card::card;
 use crate::ui::widgets::detail_sheet::{Detail, Series, opener};
 use crate::ui::widgets::hairline;
 use crate::ui::widgets::hint::helper_hint;
-use crate::ui::widgets::panel::caption_label;
+use crate::ui::widgets::panel::{caption_label, heading};
 use crate::ui::widgets::range::{Range, range_picker, remember_in, remembered, remembered_in};
 use crate::ui::widgets::sidebar::{self, Side, Sidebar, Toggled, Widths};
 use crate::ui::widgets::text::caption;
@@ -56,6 +60,9 @@ const INSPECTOR: Widths = Widths::new(420., 320., 640.);
 const COLUMNS_KEY: &str = "processes.columns";
 const SORT_KEY: &str = "processes.sort";
 const INSPECTOR_KEY: &str = "processes.inspector";
+const WHY_KEY: &str = "processes.why";
+/// How long the cgroup-only answer waits for the full one before it shows, so a quick D-Bus reply does not flicker.
+const QUICK_AFTER: Duration = Duration::from_millis(150);
 /// Room the table leaves for its vertical scrollbar.
 const SCROLLBAR: f32 = 16.;
 const CELL_PAD: f32 = 6.;
@@ -359,6 +366,199 @@ fn store(f: impl FnOnce(&mut Prefs)) {
     f(&mut prefs().lock().unwrap_or_else(PoisonError::into_inner));
 }
 
+/// Whether "How sysman knows" is unfolded under Why it's running.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct WhyPref {
+    pub evidence: bool,
+}
+
+pub fn load_why(prefs: &Prefs) -> WhyPref {
+    prefs.get(WHY_KEY).unwrap_or_default()
+}
+
+/// The cgroup, parent chain and files only: what `why::explain` can say before D-Bus or Docker answer.
+struct Quick(why::Live);
+
+impl Probe for Quick {
+    fn proc_file(&self, pid: u32, name: &str) -> io::Result<String> {
+        self.0.proc_file(pid, name)
+    }
+
+    fn read(&self, path: &Path) -> io::Result<String> {
+        self.0.read(path)
+    }
+
+    fn data_dirs(&self) -> Vec<PathBuf> {
+        self.0.data_dirs()
+    }
+
+    fn uid(&self) -> u32 {
+        self.0.uid()
+    }
+
+    fn unit(&self, _: &why::Unit) -> Result<why::UnitProps, String> {
+        Err("asked next".into())
+    }
+
+    fn session(&self, _: &str) -> Result<why::Session, String> {
+        Err("asked next".into())
+    }
+
+    fn docker_name(&self, _: &str) -> Result<String, String> {
+        Err("asked next".into())
+    }
+}
+
+/// Why one process instance runs; `complete` once D-Bus and Docker were asked too.
+struct Explained {
+    key: Key,
+    why: Option<Why>,
+    complete: bool,
+}
+
+/// Keeps a result only for the process still selected, and never lets the quick pass replace the full one.
+fn accept(current: &mut Option<Explained>, key: Key, why: Why, complete: bool) -> bool {
+    match current {
+        Some(e) if e.key == key && (complete || !e.complete) => {
+            e.why = Some(why);
+            e.complete = complete;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether "If you end it" warns that the process returns, for the End process confirmation.
+fn comes_back(if_you_end: &str) -> bool {
+    ["starts it again", "starts again", "comes back"]
+        .iter()
+        .any(|p| if_you_end.contains(p))
+}
+
+/// A unit action's result, `None` while it runs.
+type Outcome = Option<Result<(), String>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitVerb {
+    Stop,
+    Restart,
+    Disable,
+}
+
+impl UnitVerb {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stop => "Stop",
+            Self::Restart => "Restart",
+            Self::Disable => "Disable",
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::Disable => "disable",
+        }
+    }
+
+    fn doing(self) -> &'static str {
+        match self {
+            Self::Stop => "Stopping",
+            Self::Restart => "Restarting",
+            Self::Disable => "Disabling",
+        }
+    }
+
+    fn done(self) -> &'static str {
+        match self {
+            Self::Stop => "Stopped",
+            Self::Restart => "Restarted",
+            Self::Disable => "Disabled",
+        }
+    }
+
+    fn explain(self, user: bool) -> String {
+        let what = match self {
+            Self::Stop => "systemd stops the service and every process in it.",
+            Self::Restart => "systemd stops the service and starts it again.",
+            Self::Disable if user => "It keeps running for now but no longer starts when you log in.",
+            Self::Disable => "It keeps running for now but no longer starts at boot.",
+        };
+        let who = if user {
+            "Your user's service manager does it."
+        } else {
+            "The system asks for your password first."
+        };
+        format!("{what} {who}")
+    }
+}
+
+/// `--user` reaches this user's own manager; a system unit goes to systemd, which asks polkit.
+pub fn unit_args<'a>(verb: &'static str, unit: &'a str, user: bool) -> Vec<&'a str> {
+    let mut args = Vec::with_capacity(4);
+    if user {
+        args.push("--user");
+    }
+    args.extend([verb, "--", unit]);
+    args
+}
+
+/// The Logs search that shows one unit's entries.
+pub fn unit_logs_query(unit: &str) -> String {
+    format!("unit:{unit}")
+}
+
+fn unit_action(runner: &dyn Runner, verb: UnitVerb, unit: &str, user: bool) -> Result<(), String> {
+    let args = unit_args(verb.verb(), unit, user);
+    let ran = runner
+        .run("systemctl", &args)
+        .map_err(|e| format!("Could not run systemctl: {e}"))?;
+    if ran.ok {
+        return Ok(());
+    }
+    let message = ran.stderr.trim();
+    Err(if message.contains("Interactive authentication required") {
+        format!(
+            "No polkit agent is running to ask for your password. Run: sudo systemctl {} {unit}",
+            verb.verb()
+        )
+    } else if message.is_empty() {
+        format!("systemctl {} failed", args.join(" "))
+    } else {
+        message.to_owned()
+    })
+}
+
+fn confirm_unit(
+    this: WeakEntity<Processes>,
+    key: Key,
+    verb: UnitVerb,
+    unit: String,
+    user: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let (this, unit) = (this.clone(), unit.clone());
+        alert
+            .title(SharedString::from(format!("{} {unit}?", verb.label())))
+            .description(SharedString::from(verb.explain(user)))
+            .ok_text(verb.label())
+            .ok_variant(if verb == UnitVerb::Restart {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Danger
+            })
+            .show_cancel(true)
+            .on_ok(move |_, _, cx| {
+                this.update(cx, |p, cx| p.run_unit(key, verb, unit.clone(), user, cx))
+                    .ok();
+                true
+            })
+    });
+}
+
 fn state_meaning(state: &str) -> &'static str {
     match state {
         "R" => "Running or runnable",
@@ -590,12 +790,17 @@ fn current_user() -> Option<String> {
     }
 }
 
-fn confirm(p: Process, signal: Signal, window: &mut Window, cx: &mut App) {
+/// `returns` is the inspector's "If you end it" line when it says the process comes back.
+fn confirm(p: Process, signal: Signal, returns: Option<String>, window: &mut Window, cx: &mut App) {
     window.open_alert_dialog(cx, move |alert, _, _| {
         let p = p.clone();
+        let mut text = signal.explain(&p);
+        if let Some(returns) = &returns {
+            text = format!("{text}\n\n{returns}");
+        }
         alert
             .title(SharedString::from(format!("{} “{}”?", signal.label(), p.comm)))
-            .description(SharedString::from(signal.explain(&p)))
+            .description(SharedString::from(text))
             .ok_text(signal.label())
             .ok_variant(ButtonVariant::Danger)
             .show_cancel(true)
@@ -625,6 +830,8 @@ pub struct ProcessTable {
     icons: Arc<IconIndex>,
     me: Option<String>,
     mem_total: Option<u64>,
+    /// The inspected process's "If you end it" line, when it says the process comes back.
+    comes_back: Option<(Key, String)>,
 }
 
 impl TableDelegate for ProcessTable {
@@ -864,14 +1071,20 @@ impl TableDelegate for ProcessTable {
             return menu;
         };
         let allowed = may_signal(&p, self.me.as_deref());
+        let returns = self
+            .comes_back
+            .as_ref()
+            .filter(|(k, _)| *k == key(&p))
+            .map(|(_, line)| line.clone());
         let copy = |label: &'static str, text: String| {
             PopupMenuItem::new(label)
                 .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone())))
         };
         let end = |signal: Signal, p: Process| {
+            let returns = returns.clone();
             PopupMenuItem::new(signal.label())
                 .disabled(!allowed)
-                .on_click(move |_, window, cx| confirm(p.clone(), signal, window, cx))
+                .on_click(move |_, window, cx| confirm(p.clone(), signal, returns.clone(), window, cx))
         };
         menu.item(copy("Copy name", p.comm.clone()))
             .item(copy("Copy PID", p.pid.to_string()))
@@ -1072,6 +1285,12 @@ pub struct Processes {
     /// The columns the user picked; `None` follows the defaults.
     columns: Option<Vec<Col>>,
     panel: InspectorPref,
+    why: Option<Explained>,
+    why_pref: WhyPref,
+    /// The last unit action from Why it's running.
+    unit_action: Option<(Key, UnitVerb, Outcome)>,
+    /// A unit action succeeded: explain this process again once the next scan is in.
+    rerun: Option<Key>,
     inspector: Entity<Sidebar>,
     keys: FocusHandle,
     #[cfg(debug_assertions)]
@@ -1106,9 +1325,14 @@ impl Processes {
             }
         };
         let cursor = Rc::new(Cell::new(None));
-        let (columns, sort, panel) = {
+        let (columns, sort, panel, why_pref) = {
             let prefs = prefs().lock().unwrap_or_else(PoisonError::into_inner);
-            (load_columns(&prefs), load_sort(&prefs), load_inspector(&prefs))
+            (
+                load_columns(&prefs),
+                load_sort(&prefs),
+                load_inspector(&prefs),
+                load_why(&prefs),
+            )
         };
         let mut model = Model::new(cx.try_global::<HierarchyMode>().is_some_and(|h| h.0));
         if let Some((col, descending)) = sort {
@@ -1137,9 +1361,14 @@ impl Processes {
                 cols: Vec::new(),
                 widths: Vec::new(),
                 mem_total: None,
+                comes_back: None,
             }),
             columns,
             panel,
+            why: None,
+            why_pref,
+            unit_action: None,
+            rerun: None,
             inspector,
             keys: cx.focus_handle(),
             search: None,
@@ -1186,6 +1415,10 @@ impl Processes {
             this.panel.collapsed = true;
         }
         #[cfg(debug_assertions)]
+        if std::env::var_os("SYSMAN_DEV_WHY_EVIDENCE").is_some() {
+            this.why_pref.evidence = true;
+        }
+        #[cfg(debug_assertions)]
         if let Ok(name) = std::env::var("SYSMAN_DEV_INSPECTOR_RANGE") {
             this.proc_range = Range::ALL
                 .into_iter()
@@ -1209,6 +1442,7 @@ impl Processes {
             && selected.is_none_or(|selected| {
                 self.attempt
                     .is_some_and(|(range, key, _)| range == self.proc_range && key == selected)
+                    && self.why.as_ref().is_some_and(|e| e.key == selected && e.complete)
             })
     }
 
@@ -1263,6 +1497,11 @@ impl Processes {
             }
         }
         self.sync_selection(cx);
+        if let Some(k) = self.rerun.take()
+            && self.delegate(cx).model.selected_process().is_some_and(|p| key(p) == k)
+        {
+            self.explain_fully(k, cx);
+        }
         if let Some(p) = self.delegate(cx).model.selected_process().cloned() {
             self.trail.retain(|(at, _)| *at >= t - TRAIL_S);
             self.trail.push((t, p.clone()));
@@ -1303,7 +1542,93 @@ impl Processes {
             self.trail.push((*t, p.clone()));
         }
         self.sync_inspector(cx);
+        self.explain(cx);
         self.refresh(cx);
+    }
+
+    /// Works out why the inspected process runs, once per instance: the cgroup-only answer if D-Bus is slow, then
+    /// the full one.
+    fn explain(&mut self, cx: &mut Context<Self>) {
+        let selected = self.inspected.as_ref().map(key);
+        if self.why.as_ref().map(|e| e.key) == selected {
+            return;
+        }
+        self.rerun = None;
+        self.with_table(cx, |t| t.comes_back = None);
+        let Some(selected) = selected else {
+            self.why = None;
+            return;
+        };
+        self.why = Some(Explained {
+            key: selected,
+            why: None,
+            complete: false,
+        });
+        let table = self.delegate(cx).model.table.clone();
+        let quick = cx
+            .background_executor()
+            .spawn(async move { why::explain_with(&Quick(why::Live::default()), selected.0, selected.1, &table) });
+        cx.spawn(async move |this, cx| {
+            let why = quick.await;
+            cx.background_executor().timer(QUICK_AFTER).await;
+            this.update(cx, |this, cx| this.explained(selected, why, false, cx))
+                .ok();
+        })
+        .detach();
+        self.explain_fully(selected, cx);
+    }
+
+    fn explain_fully(&mut self, selected: Key, cx: &mut Context<Self>) {
+        let table = self.delegate(cx).model.table.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { why::explain(selected.0, selected.1, &table) });
+        cx.spawn(async move |this, cx| {
+            let why = task.await;
+            this.update(cx, |this, cx| this.explained(selected, why, true, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn explained(&mut self, selected: Key, why: Why, complete: bool, cx: &mut Context<Self>) {
+        let returns = why.if_you_end.clone().filter(|l| comes_back(l));
+        if accept(&mut self.why, selected, why, complete) {
+            self.with_table(cx, |t| t.comes_back = returns.map(|l| (selected, l)));
+            cx.notify();
+        }
+    }
+
+    fn toggle_evidence(&mut self, cx: &mut Context<Self>) {
+        self.why_pref.evidence = !self.why_pref.evidence;
+        let pref = self.why_pref;
+        store(|p| p.set(WHY_KEY, &pref));
+        cx.notify();
+    }
+
+    fn run_unit(&mut self, selected: Key, verb: UnitVerb, unit: String, user: bool, cx: &mut Context<Self>) {
+        self.unit_action = Some((selected, verb, None));
+        cx.notify();
+        let task = cx
+            .background_executor()
+            .spawn(async move { unit_action(&System, verb, &unit, user) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if this
+                    .unit_action
+                    .as_ref()
+                    .is_some_and(|(k, v, _)| *k == selected && *v == verb)
+                {
+                    if result.is_ok() {
+                        this.rerun = Some(selected);
+                    }
+                    this.unit_action = Some((selected, verb, Some(result)));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn inspector_open(&self) -> bool {
@@ -1535,6 +1860,47 @@ fn copyable(id: &'static str, label: &str, value: Option<String>, absent: &str, 
             Some(value) => text.text_color(t.text).child(value),
             None => text.text_color(t.text_tertiary).child(absent.to_owned()),
         })
+}
+
+fn details_card(cx: &App) -> Div {
+    let t = theme(cx);
+    hairline(
+        div()
+            .flex()
+            .flex_col()
+            .gap(rem_px(6.))
+            .py(rem_px(10.))
+            .px(rem_px(12.))
+            .rounded(t.card_radius)
+            .bg(t.card)
+            .border_color(t.hairline),
+        t.hairline_width,
+    )
+}
+
+fn kv(label: &str, value: String, label_width: f32, cx: &App) -> Div {
+    let t = theme(cx);
+    div()
+        .flex()
+        .flex_row()
+        .gap(rem_px(8.))
+        .text_size(t.caption)
+        .child(
+            div()
+                .w(rem_px(label_width))
+                .text_color(t.text_secondary)
+                .child(label.to_owned()),
+        )
+        .child(div().flex_1().min_w_0().font_features(t.numbers.clone()).child(value))
+}
+
+/// why.rs words its notes as clauses; they stand alone here.
+fn sentence_case(s: &str) -> String {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 fn value_row(value: String, detail: Option<String>, cx: &App) -> impl IntoElement {
@@ -1880,6 +2246,174 @@ impl Processes {
         .height(px(CHART_HEIGHT))
     }
 
+    /// Why it's running: the sentence, the chain, what ending it does, the unit's actions and the evidence.
+    fn why_section(&self, running: bool, this: WeakEntity<Self>, cx: &App) -> Option<Div> {
+        let e = self.why.as_ref()?;
+        let t = theme(cx);
+        let section =
+            div()
+                .flex()
+                .flex_col()
+                .gap(rem_px(8.))
+                .child(heading(IconName::Waypoints, "Why it's running", cx));
+        let Some(why) = &e.why else {
+            return Some(section);
+        };
+        let selected = e.key;
+        let chain = why.chain.iter().take(4).enumerate().map(|(i, line)| {
+            let full = SharedString::from(line.clone());
+            div()
+                .id(("why-chain", i))
+                .flex()
+                .flex_row()
+                .min_w_0()
+                .pl(rem_px(14. * i.saturating_sub(1) as f32))
+                .text_size(t.caption)
+                .text_color(t.text_secondary)
+                .font_features(t.numbers.clone())
+                .when(i > 0, |d| d.child(div().flex_shrink_0().pr(rem_px(5.)).child("└")))
+                .child(div().min_w_0().truncate().child(full.clone()))
+                .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+        });
+        let ending = why.if_you_end.clone().filter(|_| running).map(|line| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(rem_px(2.))
+                .child(caption("If you end it", cx))
+                .child(div().text_size(t.caption).child(line))
+        });
+        let notes: Vec<String> = if e.complete {
+            why.notes.iter().map(|n| sentence_case(n)).collect()
+        } else {
+            vec!["Looking up details…".into()]
+        };
+        let a = &why.actions;
+        let action = self.unit_action.as_ref().filter(|(k, ..)| *k == selected);
+        let busy = action.is_some_and(|(_, _, r)| r.is_none());
+        let unit_button = |verb: UnitVerb, icon: IconName, unit: &str| {
+            let (this, unit, user) = (this.clone(), unit.to_owned(), a.user);
+            Button::new(verb.verb())
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(icon))
+                .label(verb.label())
+                .disabled(busy)
+                .on_click(move |_, window, cx| {
+                    confirm_unit(this.clone(), selected, verb, unit.clone(), user, window, cx)
+                })
+        };
+        let buttons = a.unit.as_deref().map(|unit| {
+            let query = unit_logs_query(unit);
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(rem_px(2.))
+                .ml(rem_px(-6.))
+                .when(a.stop, |d| {
+                    d.child(unit_button(UnitVerb::Stop, IconName::CircleStop, unit))
+                })
+                .when(a.restart, |d| {
+                    d.child(unit_button(UnitVerb::Restart, IconName::RotateCw, unit))
+                })
+                .when(a.disable, |d| {
+                    d.child(unit_button(UnitVerb::Disable, IconName::Ban, unit))
+                })
+                .child(
+                    Button::new("why-logs")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::FileText))
+                        .label("Logs for this unit")
+                        .on_click(move |_, _, cx| navigate(Tab::Logs, Some(Focus::LogQuery(query.clone())), cx)),
+                )
+        });
+        let outcome = action.zip(a.unit.as_deref()).map(|((_, verb, result), unit)| {
+            let line = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(rem_px(6.))
+                .px(rem_px(10.))
+                .py(rem_px(7.))
+                .rounded(t.card_radius)
+                .bg(t.card)
+                .text_size(t.caption);
+            match result {
+                None => line
+                    .text_color(t.text_secondary)
+                    .child(format!("{} {unit}…", verb.doing())),
+                Some(Ok(())) => line
+                    .text_color(t.green)
+                    .child(Icon::new(IconName::Check).xsmall())
+                    .child(format!("{} {unit}", verb.done())),
+                Some(Err(err)) => line
+                    .flex_col()
+                    .items_start()
+                    .gap(rem_px(2.))
+                    .child(
+                        div()
+                            .text_color(t.red)
+                            .font_weight(t.weight_semibold)
+                            .child(format!("Could not {} {unit}", verb.verb())),
+                    )
+                    .child(caption(err.clone(), cx)),
+            }
+        });
+        let container = a
+            .container_command
+            .clone()
+            .map(|command| copyable("why-container", "To stop the container, run", Some(command), "", cx));
+        let open = self.why_pref.evidence;
+        let fold = (!why.evidence.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(rem_px(6.))
+                .child(
+                    div()
+                        .id("why-evidence")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(rem_px(4.))
+                        .ml(rem_px(-2.))
+                        .cursor_pointer()
+                        .text_size(t.caption)
+                        .text_color(t.text_secondary)
+                        .hover(|d| d.text_color(t.text))
+                        .child(
+                            Icon::new(if open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .xsmall(),
+                        )
+                        .child("How sysman knows")
+                        .on_click(move |_, _, cx| {
+                            this.update(cx, |p, cx| p.toggle_evidence(cx)).ok();
+                        }),
+                )
+                .when(open, |d| {
+                    d.child(details_card(cx).children(why.evidence.iter().map(|(k, v)| kv(k, v.clone(), 84., cx))))
+                })
+        });
+        Some(
+            section
+                .child(div().text_size(t.panel_title).child(why.sentence.clone()))
+                .child(div().flex().flex_col().gap(rem_px(2.)).children(chain))
+                .children(ending)
+                .children(notes.into_iter().map(|n| caption(n, cx)))
+                .children(buttons)
+                .children(outcome)
+                .children(container)
+                .children(fold),
+        )
+    }
+
     fn inspector(&self, cx: &mut Context<Self>) -> AnyElement {
         let this = cx.entity().downgrade();
         let close = this.clone();
@@ -1903,65 +2437,42 @@ impl Processes {
         } else {
             None
         };
-        let kv = |label: &str, value: String| {
-            div()
-                .flex()
-                .flex_row()
-                .gap(rem_px(8.))
-                .text_size(t.caption)
-                .child(
-                    div()
-                        .w(rem_px(64.))
-                        .text_color(t.text_secondary)
-                        .child(label.to_owned()),
-                )
-                .child(div().flex_1().min_w_0().font_features(t.numbers.clone()).child(value))
-        };
-        let details = hairline(
-            div()
-                .flex()
-                .flex_col()
-                .gap(rem_px(6.))
-                .py(rem_px(10.))
-                .px(rem_px(12.))
-                .rounded(t.card_radius)
-                .bg(t.card)
-                .border_color(t.hairline),
-            t.hairline_width,
-        )
-        .child(kv("User", p.user.clone().unwrap_or_else(|| "–".into())))
-        .child(kv("Started", clock(p.start_time as f64, "%b %-d %H:%M:%S")))
-        .child(kv("State", format!("{} · {}", p.state, state_meaning(&p.state))))
-        .child(kv(
-            "Nice",
-            match (p.nice, p.priority) {
-                (Some(nice), Some(priority)) => format!("{nice} · priority {priority}"),
-                _ => "–".into(),
-            },
-        ))
-        .child(kv("CPU time", p.cpu_time_s.map_or_else(|| "–".into(), cpu_time)))
-        .child(kv(
-            "Virtual",
-            p.vsize_bytes.map_or_else(|| "–".into(), |v| bytes(v as f64)),
-        ))
-        .child(copyable(
-            "copy-path",
-            "Path",
-            p.exe.clone(),
-            if p.cmdline.is_empty() {
-                "–"
-            } else {
-                "– (not permitted)"
-            },
-            cx,
-        ))
-        .child(copyable(
-            "copy-command",
-            "Command line",
-            Some(p.cmdline.clone()).filter(|c| !c.is_empty()),
-            &format!("[{}]", p.comm),
-            cx,
-        ));
+        let kv = |label: &str, value: String| kv(label, value, 64., cx);
+        let why = self.why_section(running, this.clone(), cx);
+        let details = details_card(cx)
+            .child(kv("User", p.user.clone().unwrap_or_else(|| "–".into())))
+            .child(kv("Started", clock(p.start_time as f64, "%b %-d %H:%M:%S")))
+            .child(kv("State", format!("{} · {}", p.state, state_meaning(&p.state))))
+            .child(kv(
+                "Nice",
+                match (p.nice, p.priority) {
+                    (Some(nice), Some(priority)) => format!("{nice} · priority {priority}"),
+                    _ => "–".into(),
+                },
+            ))
+            .child(kv("CPU time", p.cpu_time_s.map_or_else(|| "–".into(), cpu_time)))
+            .child(kv(
+                "Virtual",
+                p.vsize_bytes.map_or_else(|| "–".into(), |v| bytes(v as f64)),
+            ))
+            .child(copyable(
+                "copy-path",
+                "Path",
+                p.exe.clone(),
+                if p.cmdline.is_empty() {
+                    "–"
+                } else {
+                    "– (not permitted)"
+                },
+                cx,
+            ))
+            .child(copyable(
+                "copy-command",
+                "Command line",
+                Some(p.cmdline.clone()).filter(|c| !c.is_empty()),
+                &format!("[{}]", p.comm),
+                cx,
+            ));
         let swatch = |color: Hsla, label: &'static str| {
             div()
                 .flex()
@@ -2029,6 +2540,7 @@ impl Processes {
                         }),
                 ),
         )
+        .children(why)
         .child(details)
         .when_some(status, |d, s| d.child(caption(s, cx).text_color(t.orange)))
         .child(range_picker(
@@ -2539,5 +3051,184 @@ mod tests {
         assert!(!may_signal(&p, None), "an unknown current user may signal nothing");
         p.user = None;
         assert!(!may_signal(&p, Some("me")), "an unknown owner is not ours");
+    }
+
+    fn why(sentence: &str) -> Why {
+        Why {
+            cause: why::Cause::Orphan,
+            sentence: sentence.into(),
+            chain: Vec::new(),
+            if_you_end: None,
+            evidence: Vec::new(),
+            notes: Vec::new(),
+            actions: why::Actions::default(),
+        }
+    }
+
+    #[test]
+    fn a_late_answer_never_lands_on_another_process_or_over_the_full_one() {
+        let (a, b) = ((10, 100), (11, 110));
+        let shown = |e: &Option<Explained>| e.as_ref().and_then(|e| e.why.as_ref()).map(|w| w.sentence.clone());
+        let mut current = Some(Explained {
+            key: b,
+            why: None,
+            complete: false,
+        });
+        assert!(
+            !accept(&mut current, a, why("for a"), true),
+            "the selection moved on to b while a was being explained"
+        );
+        assert_eq!(shown(&current), None);
+        assert!(accept(&mut current, b, why("full"), true));
+        assert!(
+            !accept(&mut current, b, why("cgroup only"), false),
+            "the quick pass waits before it shows, so it can arrive after a fast full answer"
+        );
+        assert_eq!(shown(&current).as_deref(), Some("full"));
+        assert!(
+            accept(&mut current, b, why("after restart"), true),
+            "a unit action explains the same process again"
+        );
+        assert_eq!(shown(&current).as_deref(), Some("after restart"));
+        assert!(!accept(&mut None, b, why("deselected"), true));
+    }
+
+    #[test]
+    fn the_evidence_fold_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui.toml");
+        let mut prefs = Prefs::load(path.clone());
+        assert_eq!(load_why(&prefs), WhyPref { evidence: false }, "folded by default");
+        prefs.set(WHY_KEY, &WhyPref { evidence: true });
+        assert_eq!(load_why(&Prefs::load(path)), WhyPref { evidence: true });
+    }
+
+    struct Fixed(crate::data::systemd::Ran);
+
+    impl Runner for Fixed {
+        fn run(&self, _: &str, _: &[&str]) -> io::Result<crate::data::systemd::Ran> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn a_user_unit_goes_to_the_users_manager_and_a_system_unit_to_systemd() {
+        assert_eq!(
+            unit_args("stop", "pipewire.service", true),
+            ["--user", "stop", "--", "pipewire.service"]
+        );
+        assert_eq!(
+            unit_args("disable", "-cups.service", false),
+            ["disable", "--", "-cups.service"],
+            "a unit name is never read as an option"
+        );
+        let refused = Fixed(crate::data::systemd::Ran {
+            ok: false,
+            stdout: String::new(),
+            stderr: "Failed to stop cups.service: Interactive authentication required.\n".into(),
+        });
+        let err = unit_action(&refused, UnitVerb::Stop, "cups.service", false).unwrap_err();
+        assert!(
+            err.contains("sudo systemctl stop cups.service"),
+            "without a polkit agent it says what to run instead: {err}"
+        );
+        let ok = Fixed(crate::data::systemd::Ran {
+            ok: true,
+            ..Default::default()
+        });
+        assert_eq!(unit_action(&ok, UnitVerb::Restart, "cups.service", false), Ok(()));
+    }
+
+    #[test]
+    fn the_logs_link_filters_to_exactly_that_unit() {
+        use crate::data::logs::Query;
+        for unit in [
+            "sshd.service",
+            "getty@tty1.service",
+            r"systemd-fsck@dev-disk-by\x2duuid-1.service",
+        ] {
+            let q = Query::parse(&unit_logs_query(unit), 0, &jiff::tz::TimeZone::UTC);
+            assert_eq!(q.units, [unit], "{unit}");
+            assert!(q.text.is_empty(), "{unit} must not become a free-text search");
+        }
+    }
+
+    struct Machine {
+        restart: &'static str,
+        main_pid: u32,
+    }
+
+    impl Probe for Machine {
+        fn proc_file(&self, pid: u32, name: &str) -> io::Result<String> {
+            match (pid, name) {
+                (700, "cgroup") => Ok("0::/system.slice/demo.service\n".into()),
+                _ => Err(io::ErrorKind::NotFound.into()),
+            }
+        }
+
+        fn read(&self, _: &Path) -> io::Result<String> {
+            Err(io::ErrorKind::NotFound.into())
+        }
+
+        fn data_dirs(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+
+        fn uid(&self) -> u32 {
+            1000
+        }
+
+        fn unit(&self, _: &why::Unit) -> Result<why::UnitProps, String> {
+            Ok(why::UnitProps {
+                id: "demo.service".into(),
+                unit_file_state: "enabled".into(),
+                wanted_by: vec!["multi-user.target".into()],
+                restart: self.restart.into(),
+                main_pid: Some(self.main_pid),
+                ..Default::default()
+            })
+        }
+
+        fn session(&self, _: &str) -> Result<why::Session, String> {
+            Err("none".into())
+        }
+
+        fn docker_name(&self, _: &str) -> Result<String, String> {
+            Err("none".into())
+        }
+    }
+
+    #[test]
+    fn ending_a_process_warns_only_when_systemd_brings_it_back() {
+        let table = [proc(700, 1, "demo", 1), proc(1, 0, "systemd", 1)];
+        let warns = |restart, main_pid| {
+            let w = why::explain_with(&Machine { restart, main_pid }, 700, 1700, &table);
+            w.if_you_end.as_deref().is_some_and(comes_back)
+        };
+        assert!(warns("always", 700));
+        assert!(warns("on-failure", 700), "Force end brings it back");
+        assert!(!warns("no", 700));
+        assert!(
+            !warns("always", 699),
+            "only the main process's exit restarts the service"
+        );
+    }
+
+    #[test]
+    fn the_quick_pass_names_the_cause_without_asking_d_bus() {
+        let proc_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(proc_root.path().join("700")).unwrap();
+        std::fs::write(proc_root.path().join("700/cgroup"), "0::/system.slice/demo.service\n").unwrap();
+        let table = [proc(700, 1, "demo", 1), proc(1, 0, "systemd", 1)];
+        let quick = Quick(why::Live {
+            proc_root: proc_root.path().to_owned(),
+        });
+        let w = why::explain_with(&quick, 700, 1700, &table);
+        assert!(w.sentence.contains("demo.service"), "{}", w.sentence);
+        assert_eq!(
+            w.actions.unit.as_deref(),
+            Some("demo.service"),
+            "the unit's actions show at once"
+        );
     }
 }
