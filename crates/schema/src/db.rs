@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS procs (
     id INTEGER PRIMARY KEY, pid INTEGER NOT NULL, start_time INTEGER NOT NULL, comm TEXT NOT NULL,
     cmdline TEXT, user TEXT, first_t INTEGER NOT NULL, last_t INTEGER NOT NULL,
     UNIQUE (pid, start_time));
+CREATE TABLE IF NOT EXISTS cgroups (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS proc_points (
     proc_id INTEGER NOT NULL, t INTEGER NOT NULL, cpu_pct REAL, rss_bytes INTEGER, threads INTEGER,
     fds INTEGER, read_bps REAL, write_bps REAL,
@@ -39,3 +40,10 @@ CREATE TABLE IF NOT EXISTS events_state (name TEXT PRIMARY KEY, value TEXT NOT N
 CREATE INDEX IF NOT EXISTS procs_comm ON procs (comm);
 CREATE INDEX IF NOT EXISTS procs_last ON procs (last_t);
 ";
+
+/// Columns added to `SCHEMA`'s tables since their first release, as (table, column, type). A new database gets them
+/// the way an existing one does, by `ALTER TABLE` after `SCHEMA`, so the two always have the same shape.
+pub const ADDED_COLUMNS: &[(&str, &str, &str)] = &[("procs", "ppid", "INTEGER"), ("procs", "cgroup_id", "INTEGER")];
+
+/// Run after `ADDED_COLUMNS`, which it needs.
+pub const AFTER_ADDED: &str = "CREATE INDEX IF NOT EXISTS procs_cgroup ON procs (cgroup_id);";

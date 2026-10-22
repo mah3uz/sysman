@@ -12,7 +12,7 @@ GPUI app (`sysman`) that shows them live and as history.
 | Live data | The daemon serves it over a Unix socket. |
 | Paths | XDG directories. |
 | DB model | Numeric series with rollups; list-shaped data as JSON snapshots. |
-| Processes | Every process recorded every 10 s (48 h raw, 7 days of 1-minute rollups); top N in the crash log; the full table also on the socket. |
+| Processes | Every process recorded every 10 s (48 h raw, 7 days of 1-minute rollups); top N in the crash log; the full table also on the socket. Each instance's parent pid and cgroup path are recorded once, when it is first seen, so the app can say why a process ran after it has exited. |
 | JSONL | Today and yesterday, uncompressed. |
 | NVIDIA | NVML in-process; after an NVML timeout, `nvidia-smi` with a kill timeout until restart. |
 | Hardware | Vendor-neutral records. GPUs: NVIDIA, AMD, Intel (i915 and xe), generic DRM fallback. CPUs: x86 (AMD, Intel). |
@@ -107,6 +107,19 @@ cache is older than ~1.5 s; at 2 s polling that alone cost ~4.6% of a core.
 match wins); the default is `{ nct67 = 10 }`. Measured whole-daemon cost with
 defaults: ~2% of one core.
 
+### Footprint budget
+
+`sysmand` is always running, and most people run it on a modest laptop. Every
+collector or daemon change measures the daemon's average CPU and RSS before and
+after it (release builds, the same machine, a few minutes each), judges the
+difference for a modest laptop rather than for the machine it was measured on,
+and reports both numbers with the change. Work proportional to the number of
+processes belongs once per process instance, not once per tick.
+
+Reference point, 2026-10-22, on a 32-thread desktop with ~700 processes: 2.6% of
+one core on average, 85 MB RSS, 23 threads. About 11,600 new process instances
+a day (≈1.3 per 10 s tick).
+
 ### Writers
 
 1. **JSONL** (scheduler thread): compact JSON, `write` + `fdatasync` per line.
@@ -126,7 +139,8 @@ rollup_15m (same)
 snapshots  (module, t, data)                             PK (module, t)
 errors     (t, module, message)                          PK (t, module)
 meta       (t, data)
-procs      (id, pid, start_time, comm, cmdline, user, first_t, last_t)  UNIQUE (pid, start_time)
+procs      (id, pid, start_time, comm, cmdline, user, first_t, last_t, ppid, cgroup_id)  UNIQUE (pid, start_time)
+cgroups    (id, path UNIQUE)
 proc_points    (proc_id, t, cpu_pct, rss_bytes, threads, fds, read_bps, write_bps)
 proc_rollup_1m (proc_id, t, cpu_avg, cpu_max, rss_avg, rss_max, threads_max, fds_max, read_bps_avg, write_bps_avg, count)
 events     (t, kind, key, boot_id, summary, data)        PK (t, kind, key)
@@ -144,14 +158,30 @@ events_state (name PRIMARY KEY, value)
   rebuilt from raw points, so a restart loses nothing.
 - **Processes**: one `procs` row per process instance (pid + start time, so a
   reused pid is a new process), one `proc_points` row per process per 10 s.
-- **Retention** runs hourly as per-key range deletes on primary keys.
+  `ppid` and `cgroup_id` are the parent and the cgroup when the instance was
+  first seen, which is when its row is first in `processes.table` (at least one
+  tick after it started), and are never updated. The `processes` collector reads
+  `/proc/<pid>/cgroup` only then, and puts the path (the `name=systemd` line of a
+  v1 hybrid unless it is the root, else the `0::` line, else the first line) in
+  that one table row, after the top lists are taken, so it reaches neither the
+  crash log nor `snapshots`. Paths are interned in `cgroups`. Both are NULL for
+  rows recorded before they were, and when the cgroup could not be read (the
+  process had exited); a row from before that is still running gets them from
+  the first sample after the upgrade.
+- **Schema changes** are applied on open, in one transaction: `SCHEMA`
+  creates missing tables, then each of `ADDED_COLUMNS` missing from its table is
+  added with `ALTER TABLE … ADD COLUMN`. New databases take the same path, so a
+  new and an upgraded database have the same shape. An existing database is
+  never rebuilt.
+- **Retention** runs hourly as per-key range deletes on primary keys. When it
+  deletes `procs` rows, `cgroups` rows no process refers to go with them.
 
 | Data | Default retention | Key |
 | --- | --- | --- |
 | `points`, `snapshots`, `errors`, `proc_points` | 48 h | `raw_hours` |
 | `rollup_1m` | 90 days | `rollup_1m_days` |
 | `rollup_15m` | 730 days | `rollup_15m_days` |
-| `proc_rollup_1m`, `procs` | 7 days | `proc_rollup_days` |
+| `proc_rollup_1m`, `procs`, `cgroups` | 7 days | `proc_rollup_days` |
 | `events` | 90 days | `events_days` |
 | JSONL | 2 days | `log_days` |
 | `meta`, `events_state` | forever | |
@@ -418,7 +448,8 @@ collector's output is tested to round-trip through them.
   (package), `temps_c` (CCD/core), `power_w` (RAPL where readable); meta has
   vendor and topology (L3 groups, hybrid core types, preferred-core ranking).
 - `processes`: top lists by CPU, memory and I/O, totals by name, and `table`
-  (every row, kept out of the crash log); rows carry `start_time`.
+  (every row, kept out of the crash log); rows carry `start_time`. A `table`
+  row carries `cgroup` only on the sample that first reports its instance.
 
 ## Config
 

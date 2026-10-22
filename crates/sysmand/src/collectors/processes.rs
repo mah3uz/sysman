@@ -136,6 +136,7 @@ impl ProcessScanner {
                 vsize_bytes: Some(p.vsize_bytes),
                 cpu_time_s: Some(p.cpu_time_s),
                 exe: None,
+                cgroup: None,
             });
         }
         rows.sort_by_key(|r| r.pid);
@@ -227,16 +228,27 @@ impl ProcessScanner {
 
     /// Fills `user`, `fds`, `cmdline` and `exe`. The last three cost a metadata call, a file read and a link read,
     /// so they are read only for processes not seen on the previous call; `fds` is read every time.
-    pub fn fill_table(&mut self, rows: &mut [Process]) {
+    /// Returns the indices of those first-seen rows.
+    pub fn fill_table(&mut self, rows: &mut [Process]) -> Vec<usize> {
         self.refresh_users();
         let mut old = std::mem::take(&mut self.identity);
-        for r in rows {
+        let mut new = Vec::new();
+        for (i, r) in rows.iter_mut().enumerate() {
             let key = (r.pid, r.start_time);
-            let identity = old.remove(&key).unwrap_or_else(|| self.read_identity(r.pid));
+            let identity = old.remove(&key).unwrap_or_else(|| {
+                new.push(i);
+                self.read_identity(r.pid)
+            });
             r.fds = self.read_fds(r.pid);
             Self::apply(r, identity.clone());
             self.identity.insert(key, identity);
         }
+        new
+    }
+
+    fn read_cgroup(&self, pid: u32) -> Option<String> {
+        let text = self.sys.read_opt(format!("/proc/{pid}/cgroup"))?;
+        cgroup_path(&text).map(str::to_owned)
     }
 
     /// Adds what only the privileged helper can read: I/O and open files of processes this user may not
@@ -318,6 +330,26 @@ fn per_second<K: Eq + std::hash::Hash>(deltas: Option<(f64, HashMap<K, Vec<u64>>
     d.into_iter().map(|(k, v)| (k, (rate(v[0]), rate(v[1])))).collect()
 }
 
+/// The systemd hierarchy's path: the `name=systemd` line of a v1 hybrid unless it is the root, else the v2 `0::`
+/// line, else the first line's.
+fn cgroup_path(text: &str) -> Option<&str> {
+    let (mut systemd, mut v2, mut first) = (None, None, None);
+    for line in text.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (Some(_), Some(ctrl), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        match ctrl {
+            "name=systemd" => systemd = Some(path),
+            "" => v2 = Some(path),
+            _ => {}
+        }
+        first.get_or_insert(path);
+    }
+    let path = systemd.filter(|p| *p != "/").or(v2).or(systemd).or(first)?;
+    Some(path.trim_end_matches(" (deleted)"))
+}
+
 fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
@@ -358,7 +390,7 @@ impl Collector for Processes {
             return Ok(None);
         };
         let n = self.opts.top_n;
-        self.scanner.fill_table(&mut table.rows);
+        let new = self.scanner.fill_table(&mut table.rows);
         self.scanner.fill_helper(&mut table.rows);
         let rows = &table.rows;
         let mut out = schema::processes::Processes {
@@ -398,6 +430,10 @@ impl Collector for Processes {
                 .collect();
             out.groups_cpu = Some(top(&groups, |g| g.cpu_pct, n));
             out.groups_memory = Some(top(&groups, |g| g.rss_bytes as f64, n));
+        }
+        // after the top lists are taken, so the path reaches only the table and from it the history
+        for i in new {
+            table.rows[i].cgroup = self.scanner.read_cgroup(table.rows[i].pid);
         }
         out.table = table.rows;
         Ok(Some(serde_json::to_value(out)?))
@@ -837,6 +873,120 @@ mod tests {
 
     fn rows(v: &Value) -> Vec<Value> {
         v["table"].as_array().unwrap().clone()
+    }
+
+    /// Counts opens of a fixture file through inotify, so a test sees every read of it the code under test makes.
+    struct Opens(std::os::fd::OwnedFd);
+
+    impl Opens {
+        fn of(path: &std::path::Path) -> Self {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: the fd is checked before it is owned, and the path is a valid C string.
+            unsafe {
+                let fd = libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC);
+                assert!(fd >= 0, "inotify_init1");
+                let fd = OwnedFd::from_raw_fd(fd);
+                // watching closes too keeps successive opens from being merged into one event
+                let mask = libc::IN_OPEN | libc::IN_CLOSE_NOWRITE;
+                assert!(libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), mask) >= 0);
+                Self(fd)
+            }
+        }
+
+        /// Opens since the last call.
+        fn take(&self) -> usize {
+            use std::os::fd::AsRawFd;
+            let mut buf = [0u8; 4096];
+            let mut opens = 0;
+            loop {
+                // SAFETY: reads at most the buffer's length into it.
+                let len = unsafe { libc::read(self.0.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                if len <= 0 {
+                    return opens;
+                }
+                let mut at = 0;
+                while at < len as usize {
+                    // SAFETY: the kernel writes whole events, each a header followed by `len` name bytes.
+                    let ev: libc::inotify_event = unsafe { std::ptr::read_unaligned(buf[at..].as_ptr().cast()) };
+                    opens += usize::from(ev.mask & libc::IN_OPEN != 0);
+                    at += std::mem::size_of::<libc::inotify_event>() + ev.len as usize;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cgroup_is_read_once_per_instance_and_handed_over_only_in_the_table() {
+        let f = Fixture::new()
+            .file("proc/5/stat", &stat(5, "a", 1, 0, 1, 10, 7))
+            .file("proc/5/cgroup", "0::/system.slice/a.service\n");
+        let opens = Opens::of(&f.path().join("proc/5/cgroup"));
+        let mut c = Processes::new(Options::default(), f.sys()).unwrap();
+        assert!(c.sample().unwrap().is_none());
+        assert_eq!(
+            opens.take(),
+            0,
+            "a process seen once has no row, so nothing reaches the history yet"
+        );
+        let v = c.sample().unwrap().unwrap();
+        assert_schema::<schema::processes::Processes>(&v);
+        assert_eq!(rows(&v)[0]["cgroup"], "/system.slice/a.service");
+        assert_eq!(v["top_memory"][0]["pid"], 5);
+        assert!(
+            v["top_memory"][0].get("cgroup").is_none(),
+            "the top lists reach the crash log and snapshots every tick"
+        );
+        assert_eq!(opens.take(), 1);
+        for _ in 0..3 {
+            let v = c.sample().unwrap().unwrap();
+            assert!(rows(&v)[0].get("cgroup").is_none(), "the history already has it");
+        }
+        assert_eq!(opens.take(), 0, "a live instance is never read again");
+        // a new instance on the same pid is a new process with its own cgroup
+        std::fs::write(f.path().join("proc/5/stat"), stat(5, "a", 1, 0, 1, 99, 7)).unwrap();
+        std::fs::write(f.path().join("proc/5/cgroup"), "0::/system.slice/b.service\n").unwrap();
+        opens.take();
+        let v = c.sample().unwrap().unwrap();
+        assert!(v.get("table").is_none(), "a new instance has no rate yet");
+        let v = c.sample().unwrap().unwrap();
+        assert_eq!(rows(&v)[0]["cgroup"], "/system.slice/b.service");
+        assert_eq!(opens.take(), 1);
+    }
+
+    #[test]
+    fn a_process_whose_cgroup_cannot_be_read_has_none_and_the_sample_still_succeeds() {
+        // as when the process exits between the scan and the read
+        let f = Fixture::new().file("proc/5/stat", &stat(5, "a", 1, 0, 1, 10, 7));
+        let mut c = Processes::new(Options::default(), f.sys()).unwrap();
+        c.sample().unwrap();
+        let v = c.sample().unwrap().unwrap();
+        assert_eq!(rows(&v)[0]["pid"], 5);
+        assert!(rows(&v)[0].get("cgroup").is_none());
+    }
+
+    #[test]
+    fn cgroup_path_is_the_systemd_hierarchys() {
+        assert_eq!(
+            cgroup_path("0::/system.slice/a.service"),
+            Some("/system.slice/a.service")
+        );
+        let hybrid = "12:cpu,cpuacct:/\n1:name=systemd:/system.slice/cups.service\n0::/system.slice/cups.service";
+        assert_eq!(cgroup_path(hybrid), Some("/system.slice/cups.service"));
+        assert_eq!(
+            cgroup_path("1:name=systemd:/\n0::/system.slice/cups.service"),
+            Some("/system.slice/cups.service"),
+            "a hybrid whose systemd line is the root names its unit on the v2 line"
+        );
+        assert_eq!(
+            cgroup_path("4:memory:/user.slice\n1:name=systemd:/"),
+            Some("/"),
+            "pure v1: the systemd line, even at the root"
+        );
+        assert_eq!(cgroup_path("4:memory:/user.slice\n3:cpu:/x"), Some("/user.slice"));
+        assert_eq!(cgroup_path("0::/a.slice/b.scope (deleted)"), Some("/a.slice/b.scope"));
+        assert_eq!(cgroup_path(""), None);
     }
 
     #[test]

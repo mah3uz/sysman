@@ -42,6 +42,10 @@ pub struct Process {
     /// Target of `/proc/<pid>/exe`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exe: Option<String>,
+    /// Path in the systemd cgroup hierarchy, for the history; only in `table`, and only on the first sample that
+    /// reports this instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup: Option<String>,
 }
 
 /// Processes sharing a `comm`, summed. Shared memory is counted once per process.
