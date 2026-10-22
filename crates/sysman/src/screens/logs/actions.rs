@@ -54,7 +54,7 @@ const SESSION_UNITS: &[&str] = &[
 
 /// A unit name that is safe to hand to `systemctl restart`: well formed, a service, socket or mount, and not one
 /// whose restart takes the session down. Transient D-Bus activated services come and go on their own.
-fn restartable_unit(name: &str) -> bool {
+pub(crate) fn restartable_unit(name: &str) -> bool {
     let Some(stem) = [".service", ".socket", ".mount"]
         .into_iter()
         .find_map(|s| name.strip_suffix(s))

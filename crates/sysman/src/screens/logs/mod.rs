@@ -1,4 +1,4 @@
-mod actions;
+pub(crate) mod actions;
 mod findings;
 mod inspector;
 mod lanes;
