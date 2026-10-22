@@ -81,10 +81,10 @@ impl Sources {
         }
     }
 
-    pub fn sockets(&self) -> Sockets {
-        Sockets {
-            processes: procs::sockets(&self.root),
-        }
+    pub fn sockets(&self) -> Result<Sockets, String> {
+        Ok(Sockets {
+            processes: procs::sockets(&self.root)?,
+        })
     }
 }
 
@@ -147,7 +147,10 @@ fn answer(line: &str, sources: &Sources) -> String {
     let reply = match serde_json::from_str::<Request>(line) {
         Ok(Request::Status) => serde_json::to_value(sources.status()),
         Ok(Request::Read) => serde_json::to_value(sources.read()),
-        Ok(Request::Sockets) => serde_json::to_value(sources.sockets()),
+        Ok(Request::Sockets) => match sources.sockets() {
+            Ok(s) => serde_json::to_value(s),
+            Err(e) => Ok(json!({ "error": e })),
+        },
         Err(_) => Ok(json!({"error": r#"expected {"cmd":"status"}, {"cmd":"read"} or {"cmd":"sockets"}"#})),
     };
     reply.unwrap_or_else(|e| json!({"error": e.to_string()})).to_string()
@@ -216,9 +219,21 @@ mod tests {
         .unwrap();
         std::os::unix::fs::symlink("socket:[31337]", p.join("fd/3")).unwrap();
         std::os::unix::fs::symlink("/etc/shadow", p.join("fd/4")).unwrap();
-        let reply: Value = serde_json::from_str(&answer("{\"cmd\":\"sockets\"}\n", &sources(root.path()))).unwrap();
+        let ask =
+            || -> Value { serde_json::from_str(&answer("{\"cmd\":\"sockets\"}\n", &sources(root.path()))).unwrap() };
+        assert!(
+            ask()["error"].as_str().unwrap().contains("proc/1/net"),
+            "without the host's tables to filter by there is no answer"
+        );
+        let net = root.path().join("proc/1/net");
+        std::fs::create_dir_all(&net).unwrap();
+        std::fs::write(
+            net.join("tcp"),
+            "  sl  local_address rem_address   st\n   0: 00000000:0016 00000000:0000 0A 0:0 0:0 0 0 0 31337 1\n",
+        )
+        .unwrap();
         assert_eq!(
-            reply,
+            ask(),
             serde_json::json!({"processes": [{"pid": 9, "start_ticks": 555, "inodes": [31337]}]})
         );
     }

@@ -1,110 +1,39 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufRead, BufReader, ErrorKind};
-use std::net::{IpAddr, Ipv6Addr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
-use schema::listeners::{Holder, Listener, Protocol};
+use anyhow::{Result, bail};
+use schema::listeners::{Holder, Listener, Listeners};
 
 use crate::sys::Sys;
 
-const TABLES: [(&str, Protocol); 4] = [
-    ("/proc/net/tcp", Protocol::Tcp),
-    ("/proc/net/tcp6", Protocol::Tcp6),
-    ("/proc/net/udp", Protocol::Udp),
-    ("/proc/net/udp6", Protocol::Udp6),
-];
-const TCP_LISTEN: &str = "0A";
-/// `TCP_CLOSE`, the state of a UDP socket with no remote address.
-const UDP_UNCONNECTED: &str = "07";
+type ByInode = HashMap<u64, Vec<Holder>>;
 
 /// Every listening TCP and bound, unconnected UDP socket in the daemon's network namespace, each with the process
 /// instances holding it where they can be found.
-pub fn scan(sys: &Sys) -> Result<Vec<Listener>> {
-    let mut found = Vec::new();
-    for (path, protocol) in TABLES {
-        let full = sys.path(path);
-        let file = match File::open(&full) {
-            Ok(f) => f,
-            // a kernel without IPv6 has no tcp6 or udp6
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("reading {}", full.display())),
-        };
-        // read line by line: a busy server's table of connections can run to megabytes
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        while reader
-            .read_line(&mut line)
-            .with_context(|| format!("reading {}", full.display()))?
-            > 0
-        {
-            found.extend(parse_line(&line, protocol));
-            line.clear();
-        }
-    }
-    let holders = holders(sys, &found)?;
+pub fn scan(sys: &Sys) -> Result<Listeners> {
+    let mut found = schema::listeners::read_net(&sys.path("/proc/net"))?;
+    let (holders, holders_error) = holders(sys, &found)?;
     for l in &mut found {
         if let Some(h) = holders.get(&l.inode) {
             l.holders = h.clone();
         }
     }
     found.sort_by_key(|l| (l.port, l.protocol, l.address));
-    Ok(found)
-}
-
-/// One row of a `/proc/net/{tcp,udp}[6]` table, if it is a listening or bound unconnected socket.
-fn parse_line(line: &str, protocol: Protocol) -> Option<Listener> {
-    let mut f = line.split_whitespace();
-    let local = f.nth(1)?;
-    let state = f.nth(1)?;
-    let uid = f.nth(3)?.parse().ok()?;
-    let inode = f.nth(1)?.parse().ok()?;
-    let (address, port) = local.split_once(':')?;
-    let port = u16::from_str_radix(port, 16).ok()?;
-    let listening = match protocol {
-        Protocol::Tcp | Protocol::Tcp6 => state == TCP_LISTEN,
-        Protocol::Udp | Protocol::Udp6 => state == UDP_UNCONNECTED && port != 0,
-    };
-    if !listening {
-        return None;
-    }
-    let address = decode_address(address, matches!(protocol, Protocol::Tcp6 | Protocol::Udp6))?;
-    Some(Listener {
-        protocol,
-        address,
-        port,
-        uid,
-        inode,
-        holders: Vec::new(),
+    Ok(Listeners {
+        listeners: found,
+        holders_error,
     })
 }
 
-fn decode_address(hex: &str, v6: bool) -> Option<IpAddr> {
-    if hex.len() != if v6 { 32 } else { 8 } || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    // the kernel prints each 32-bit word of the network-order address as a host-endian number
-    let mut bytes = [0u8; 16];
-    for i in 0..hex.len() / 8 {
-        let word = u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16).ok()?;
-        bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_ne_bytes());
-    }
-    Some(if v6 {
-        Ipv6Addr::from(bytes).to_canonical()
-    } else {
-        IpAddr::from([bytes[0], bytes[1], bytes[2], bytes[3]])
-    })
-}
-
-/// Socket inode → the process instances holding it: first from the fd links this user can read, then for the
-/// rest from the helper when it runs.
-fn holders(sys: &Sys, listeners: &[Listener]) -> Result<HashMap<u64, Vec<Holder>>> {
+/// Socket inode → the process instances holding it, from the fd links this user can read and from the helper,
+/// and why the helper's part is missing when it is.
+fn holders(sys: &Sys, listeners: &[Listener]) -> Result<(ByInode, Option<String>)> {
+    // inode 0 is a socket the kernel opened for itself, which no fd links to
     let wanted: HashSet<u64> = listeners.iter().map(|l| l.inode).filter(|&n| n != 0).collect();
-    let mut found: HashMap<u64, Vec<Holder>> = HashMap::new();
+    let mut found = ByInode::new();
     if wanted.is_empty() {
-        return Ok(found);
+        return Ok((found, None));
     }
     let (btime, clk_tck) = clock(sys)?;
     let holder = |pid, start_ticks: u64, comm: &str| Holder {
@@ -138,30 +67,31 @@ fn holders(sys: &Sys, listeners: &[Listener]) -> Result<HashMap<u64, Vec<Holder>
         }
     }
 
-    let unmapped: HashSet<u64> = wanted.into_iter().filter(|n| !found.contains_key(n)).collect();
-    if !unmapped.is_empty()
-        && sys.helper().present()
-        && let Ok(answer) = sys.helper().sockets()
-    {
-        for p in answer.processes {
-            let hits: Vec<u64> = p.inodes.into_iter().filter(|n| unmapped.contains(n)).collect();
-            if hits.is_empty() {
-                continue;
+    // matched against every inode, not only the unmatched: a socket shared with another user's process has both
+    let holders_error = match sys.helper().sockets() {
+        Ok(answer) => {
+            for p in &answer.processes {
+                let hits: Vec<u64> = p.inodes.iter().copied().filter(|n| wanted.contains(n)).collect();
+                if hits.is_empty() {
+                    continue;
+                }
+                // the pid may have been reused since the helper read it
+                let Some((comm, _)) = identity(sys, p.pid).filter(|i| i.1 == p.start_ticks) else {
+                    continue;
+                };
+                for n in hits {
+                    found.entry(n).or_default().push(holder(p.pid, p.start_ticks, &comm));
+                }
             }
-            // the pid may have been reused since the helper read it
-            let Some((comm, _)) = identity(sys, p.pid).filter(|i| i.1 == p.start_ticks) else {
-                continue;
-            };
-            for n in hits {
-                found.entry(n).or_default().push(holder(p.pid, p.start_ticks, &comm));
-            }
+            None
         }
-    }
+        Err(e) => Some(e),
+    };
     for h in found.values_mut() {
         h.sort_by_key(|h| h.pid);
         h.dedup_by_key(|h| h.pid);
     }
-    Ok(found)
+    Ok((found, holders_error))
 }
 
 /// Boot time in Unix seconds and clock ticks per second, to turn `start_ticks` into `start_time` as the process
@@ -203,9 +133,10 @@ fn socket_inode(target: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::unix::fs::symlink;
 
+    use schema::listeners::Protocol;
     use serde_json::json;
 
     use super::*;
@@ -249,7 +180,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            short(&scan(&f.sys()).unwrap()),
+            short(&scan(&f.sys()).unwrap().listeners),
             vec![
                 (Protocol::Tcp, v4(0, 0, 0, 0), 22, 0, 1002),
                 (Protocol::Tcp, v4(127, 0, 0, 1), 631, 0, 1001),
@@ -300,7 +231,7 @@ mod tests {
                 ),
             ]),
         );
-        let got = scan(&f.sys()).unwrap();
+        let got = scan(&f.sys()).unwrap().listeners;
         assert_eq!(
             short(&got),
             vec![
@@ -330,12 +261,41 @@ mod tests {
                 &table(&[row("00000000000000000000000000000000:14E9", zero6, "07", 1000, 12)]),
             );
         assert_eq!(
-            short(&scan(&f.sys()).unwrap()),
+            short(&scan(&f.sys()).unwrap().listeners),
             vec![
                 (Protocol::Udp, v4(127, 0, 0, 53), 53, 991, 10),
                 (Protocol::Udp6, IpAddr::V6(Ipv6Addr::UNSPECIFIED), 5353, 1000, 12),
             ]
         );
+    }
+
+    #[test]
+    fn a_row_repeated_across_reads_is_listed_once_and_kernel_sockets_each_once() {
+        // each read of a table is filled on its own, so a row can repeat; inode 0 alone cannot tell kernel sockets apart
+        let f = Fixture::new().file(
+            "proc/net/tcp",
+            &table(&[
+                row("00000000:0016", "00000000:0000", "0A", 0, 1002),
+                row("00000000:0016", "00000000:0000", "0A", 0, 1002),
+                row("00000000:0801", "00000000:0000", "0A", 0, 0),
+                row("00000000:0801", "00000000:0000", "0A", 0, 0),
+                row("00000000:4E2D", "00000000:0000", "0A", 0, 0),
+            ]),
+        );
+        assert_eq!(
+            short(&scan(&f.sys()).unwrap().listeners),
+            vec![
+                (Protocol::Tcp, v4(0, 0, 0, 0), 22, 0, 1002),
+                (Protocol::Tcp, v4(0, 0, 0, 0), 2049, 0, 0),
+                (Protocol::Tcp, v4(0, 0, 0, 0), 20013, 0, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_socket_tables_at_all_is_an_error_not_an_empty_list() {
+        let err = scan(&Fixture::new().sys()).unwrap_err().to_string();
+        assert!(err.contains("no socket tables"), "{err}");
     }
 
     fn stat(pid: u32, comm: &str, start_ticks: u64) -> String {
@@ -352,6 +312,7 @@ mod tests {
                     row("0100007F:1F90", "00000000:0000", "0A", 1000, 1001),
                     row("00000000:0016", "00000000:0000", "0A", 0, 2002),
                     row("00000000:0050", "00000000:0000", "0A", 33, 3003),
+                    row("00000000:0801", "00000000:0000", "0A", 0, 0),
                 ]),
             )
             .file("proc/100/stat", &stat(100, "dev server", 25_000))
@@ -372,6 +333,10 @@ mod tests {
             .iter()
             .map(|h| (h.pid, h.start_time, h.comm.clone()))
             .collect()
+    }
+
+    fn pids_of(ls: &[Listener], port: u16) -> Vec<u32> {
+        holders_of(ls, port).into_iter().map(|h| h.0).collect()
     }
 
     #[test]
@@ -395,6 +360,8 @@ mod tests {
         let (btime, tck) = clock(&sys).unwrap();
         assert_eq!(btime, 1_700_000_000);
         let got = scan(&sys).unwrap();
+        assert_eq!(got.holders_error, None);
+        let got = got.listeners;
         assert_eq!(
             holders_of(&got, 8080),
             vec![(100, btime + 25_000 / tck, "dev server".to_string())],
@@ -416,45 +383,88 @@ mod tests {
     }
 
     #[test]
-    fn without_the_helper_other_users_sockets_keep_only_their_uid() {
+    fn a_socket_shared_with_another_users_process_lists_both_holders() {
+        // a server started by this user that hands its socket to a privileged worker, or the other way round
+        let f = host();
+        f.fake_helper(|_| {
+            json!({"processes": [
+                {"pid": 100, "start_ticks": 25_000, "inodes": [1001]},
+                {"pid": 200, "start_ticks": 500, "inodes": [1001]}
+            ]})
+        });
+        let got = scan(&f.sys()).unwrap().listeners;
+        assert_eq!(pids_of(&got, 8080), vec![100, 200], "each holder once");
+    }
+
+    #[test]
+    fn a_kernel_socket_has_no_holder() {
+        // inode 0 is every socket the kernel opened itself; a process claiming it would be named for all of them
+        let f = host();
+        symlink("socket:[0]", f.path().join("proc/100/fd/6")).unwrap();
+        f.fake_helper(|_| json!({"processes": [{"pid": 200, "start_ticks": 500, "inodes": [0, 2002]}]}));
+        let got = scan(&f.sys()).unwrap().listeners;
+        assert!(pids_of(&got, 2049).is_empty());
+        assert_eq!(pids_of(&got, 22), vec![200]);
+    }
+
+    #[test]
+    fn without_the_helper_other_users_sockets_keep_only_their_uid_and_say_why() {
         let f = host();
         let got = scan(&f.sys()).unwrap();
+        assert_eq!(got.holders_error.as_deref(), Some("sysman-helper is not running"));
         assert_eq!(
-            holders_of(&got, 8080).len(),
+            holders_of(&got.listeners, 8080).len(),
             1,
             "this user's own processes are still found"
         );
-        let ssh = got.iter().find(|l| l.port == 22).unwrap();
+        let ssh = got.listeners.iter().find(|l| l.port == 22).unwrap();
         assert_eq!((ssh.uid, ssh.holders.len()), (0, 0));
     }
 
     #[test]
-    fn a_failing_helper_leaves_the_answer_as_without_it() {
-        let f = host();
-        f.fake_helper(|_| json!({"error": "expected {\"cmd\":\"status\"} or {\"cmd\":\"read\"}"}));
-        let got = scan(&f.sys()).unwrap();
-        assert_eq!(got.len(), 3);
-        assert!(got.iter().find(|l| l.port == 22).unwrap().holders.is_empty());
+    fn a_helper_that_cannot_list_sockets_leaves_the_answer_as_without_it_and_says_why() {
+        for (answer, why) in [
+            (
+                json!({"error": "expected {\"cmd\":\"status\"} or {\"cmd\":\"read\"}"}),
+                "older than sysmand",
+            ),
+            (
+                json!({"error": "reading /proc/1/net/tcp: Permission denied (os error 13)"}),
+                "sysman-helper: reading /proc/1/net/tcp: Permission denied",
+            ),
+        ] {
+            let f = host();
+            f.fake_helper(move |_| answer.clone());
+            let got = scan(&f.sys()).unwrap();
+            assert_eq!(got.listeners.len(), 4);
+            assert!(pids_of(&got.listeners, 22).is_empty());
+            let error = got.holders_error.unwrap();
+            assert!(error.contains(why), "{error}");
+        }
     }
 
     #[test]
-    fn malformed_rows_are_skipped_not_misread() {
-        // "01é007F" is eight bytes but not eight hex digits; slicing it by byte offsets would panic
-        for local in [
-            "0100007F",
-            "0100007G:0016",
-            "0100007F:XYZ",
-            "01é007F:0016",
-            "0100007F00:0016",
-        ] {
-            assert_eq!(
-                parse_line(&row(local, "00000000:0000", "0A", 0, 1), Protocol::Tcp),
-                None,
-                "{local}"
-            );
+    fn a_helper_socket_this_user_may_not_open_says_so() {
+        // the daemon's user is not in the helper's group
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root ignores the socket's mode");
+            return;
         }
-        assert_eq!(parse_line(HEAD, Protocol::Tcp), None);
+        let f = host();
+        let path = f.path().join(crate::helper::SOCKET.trim_start_matches('/'));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        let error = scan(&f.sys()).unwrap().holders_error.unwrap();
+        assert!(error.contains("Permission denied"), "{error}");
+    }
+
+    #[test]
+    fn socket_links_parse_only_as_socket_inodes() {
         assert_eq!(socket_inode(Path::new("socket:[]")), None);
+        assert_eq!(socket_inode(Path::new("socket:[1x]")), None);
+        assert_eq!(socket_inode(Path::new("pipe:[12]")), None);
         assert_eq!(socket_inode(Path::new("socket:[12]")), Some(12));
     }
 }

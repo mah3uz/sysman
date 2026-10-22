@@ -171,18 +171,30 @@ per line, one response per line; errors are `{"error": "…"}`.
 
 `listeners` is answered on request only, never per tick. Sockets come from
 `/proc/net/{tcp,tcp6,udp,udp6}` (any user may read them): TCP in LISTEN, UDP
-bound to a port and unconnected; a v4-mapped IPv6 address is given as IPv4. The
-holder is found by matching socket inodes in `/proc/<pid>/fd`, which the daemon
-can read for its own user's processes and asks the helper's `sockets` for the
-rest (inodes still unmatched, 500 ms limit). A socket has every process
-instance holding it (`holders`, by pid; workers, or PID 1 or a user `systemd`
-for a socket unit beside its service); a holder is read from its `stat`
-before and after its links, and a helper answer is kept only while the pid's
-`start_ticks` still match, so a reused pid is never named. A socket with no
-known holder keeps its uid. The reply is
-`{"type":"listeners","t":…,"listeners":[{"protocol":"tcp","address":"127.0.0.1","port":631,"uid":0,"inode":…,"holders":[{"pid":…,"start_time":…,"comm":"cupsd"}]}]}`
-(`schema::listeners::Listener`). Only the daemon's network namespace is
-listed: ports bound inside a container's own namespace are not.
+bound to a port and unconnected; a v4-mapped IPv6 address is given as IPv4; a
+row the kernel repeats across reads of a table is listed once. Unconnected UDP
+includes clients' ephemeral sockets (DNS lookups, QUIC, mDNS), as `ss -uln`
+does, so a UDP port is not by itself a service others reach. The holder is
+found by matching socket inodes in `/proc/<pid>/fd`, which the daemon can read
+for its own user's processes, and in the helper's `sockets` answer for all
+listed inodes, so a socket shared with another user's process names both.
+`sockets` waits up to 3 s; its answer is shared for 1 s by every client and
+only one request is in flight, so clients asking in a loop cost the helper one
+walk a second. A socket has every process instance holding it (`holders`, by
+pid; workers, or PID 1 or a user `systemd` for a socket unit beside its
+service); a holder is read from its `stat` before and after its links, and a
+helper answer is kept only while the pid's `start_ticks` still match, so a
+reused pid is never named. A socket with no known holder keeps its uid. A
+socket the kernel opened itself (NFS, WireGuard) has inode 0 and never a
+holder. With `/proc` mounted `hidepid=2` the daemon cannot read other users'
+`stat`, so their holders are dropped even with the helper. When the helper's
+part is missing, `holders_error` says why: not running, permission denied on
+its socket, too old to know `sockets`, no answer in time, or its own error
+(such as `/proc/1/net` unreadable). The reply is
+`{"type":"listeners","t":…,"listeners":[{"protocol":"tcp","address":"127.0.0.1","port":631,"uid":0,"inode":…,"holders":[{"pid":…,"start_time":…,"comm":"cupsd"}]}],"holders_error":"sysman-helper is not running"}`
+(`schema::listeners::Listeners`, less `type` and `t`). Only the daemon's
+network namespace is listed: ports bound inside a container's own namespace
+are not.
 
 A second daemon is refused when the socket answers; any other socket failure
 leaves the daemon logging without it. History is not served over the socket:
@@ -227,12 +239,19 @@ these and nothing else.
   (`read_bytes`, `write_bytes`, `fds`, eBPF `net_rx_bytes`, `net_tx_bytes`,
   keyed by pid and `start_ticks`, field 22 of `stat`), and the latest SMART
   readings by block device;
-  `{"cmd":"sockets"}` → for every process holding a socket (pid and
-  `start_ticks`), the inodes of its `socket:[N]` links in `/proc/<pid>/fd` and
-  no other fd target, so `sysmand` can name the holder of another user's
-  listening socket. It needs the same access to other users' `/proc/<pid>/fd`
-  as `fds`, so `proc_io` covers it and there is no feature key of its own. A
-  field whose source is off is absent. The types are
+  `{"cmd":"sockets"}` → for every process holding a listening socket (pid and
+  `start_ticks`), the inodes of its `socket:[N]` links in `/proc/<pid>/fd`
+  whose socket is listening TCP or bound, unconnected UDP in
+  `/proc/1/net/{tcp,tcp6,udp,udp6}`, and no other fd target, so `sysmand` can
+  name the holder of another user's listening socket, e.g.
+  `{"processes":[{"pid":812,"start_ticks":2250,"inodes":[23817,23819]}]}`.
+  Connections and unix sockets are left out: joined with the world-readable
+  `/proc/net/tcp`, their inodes would tie every user's remote peers to
+  processes. The tables are PID 1's because `PrivateNetwork` gives the helper
+  an empty namespace of its own; when they cannot be read the answer is an
+  error, never the unfiltered list. It needs the same access to other users'
+  `/proc/<pid>/fd` as `fds`, so `proc_io` covers it and there is no feature
+  key of its own. A field whose source is off is absent. The types are
   `schema::helper::{Request, Status, Reading, Sockets}`. Rates are computed in
   `sysmand` with its usual `Deltas`; RAPL power reuses the collector's own
   wrap-aware step.
