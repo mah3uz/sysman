@@ -248,7 +248,7 @@ impl ProcessScanner {
 
     fn read_cgroup(&self, pid: u32) -> Option<String> {
         let text = self.sys.read_opt(format!("/proc/{pid}/cgroup"))?;
-        cgroup_path(&text).map(str::to_owned)
+        schema::cgroups::cgroup_path(&text).map(str::to_owned)
     }
 
     /// Adds what only the privileged helper can read: I/O and open files of processes this user may not
@@ -328,26 +328,6 @@ fn per_second<K: Eq + std::hash::Hash>(deltas: Option<(f64, HashMap<K, Vec<u64>>
     };
     let rate = |v: u64| (v as f64 / dt).round() as u64;
     d.into_iter().map(|(k, v)| (k, (rate(v[0]), rate(v[1])))).collect()
-}
-
-/// The systemd hierarchy's path: the `name=systemd` line of a v1 hybrid unless it is the root, else the v2 `0::`
-/// line, else the first line's.
-fn cgroup_path(text: &str) -> Option<&str> {
-    let (mut systemd, mut v2, mut first) = (None, None, None);
-    for line in text.lines() {
-        let mut parts = line.splitn(3, ':');
-        let (Some(_), Some(ctrl), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
-            continue;
-        };
-        match ctrl {
-            "name=systemd" => systemd = Some(path),
-            "" => v2 = Some(path),
-            _ => {}
-        }
-        first.get_or_insert(path);
-    }
-    let path = systemd.filter(|p| *p != "/").or(v2).or(systemd).or(first)?;
-    Some(path.trim_end_matches(" (deleted)"))
 }
 
 fn round1(x: f64) -> f64 {
@@ -964,29 +944,6 @@ mod tests {
         let v = c.sample().unwrap().unwrap();
         assert_eq!(rows(&v)[0]["pid"], 5);
         assert!(rows(&v)[0].get("cgroup").is_none());
-    }
-
-    #[test]
-    fn cgroup_path_is_the_systemd_hierarchys() {
-        assert_eq!(
-            cgroup_path("0::/system.slice/a.service"),
-            Some("/system.slice/a.service")
-        );
-        let hybrid = "12:cpu,cpuacct:/\n1:name=systemd:/system.slice/cups.service\n0::/system.slice/cups.service";
-        assert_eq!(cgroup_path(hybrid), Some("/system.slice/cups.service"));
-        assert_eq!(
-            cgroup_path("1:name=systemd:/\n0::/system.slice/cups.service"),
-            Some("/system.slice/cups.service"),
-            "a hybrid whose systemd line is the root names its unit on the v2 line"
-        );
-        assert_eq!(
-            cgroup_path("4:memory:/user.slice\n1:name=systemd:/"),
-            Some("/"),
-            "pure v1: the systemd line, even at the root"
-        );
-        assert_eq!(cgroup_path("4:memory:/user.slice\n3:cpu:/x"), Some("/user.slice"));
-        assert_eq!(cgroup_path("0::/a.slice/b.scope (deleted)"), Some("/a.slice/b.scope"));
-        assert_eq!(cgroup_path(""), None);
     }
 
     #[test]

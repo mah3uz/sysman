@@ -7,9 +7,11 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use schema::cgroups::cgroup_path;
 use schema::processes::Process;
 
 use super::desktop::data_dirs;
+use super::history::{History, Origin, Proc};
 use crate::screens::logs::actions::restartable_unit;
 
 const TIMEOUT: Duration = Duration::from_secs(1);
@@ -156,24 +158,6 @@ pub fn unescape(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-/// The systemd hierarchy's path: the `name=systemd` line of a v1 hybrid, else the v2 `0::` line.
-fn cgroup_path(text: &str) -> Option<&str> {
-    let mut v2 = None;
-    for line in text.lines() {
-        let mut parts = line.splitn(3, ':');
-        let (Some(_), Some(ctrl), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
-            continue;
-        };
-        if ctrl == "name=systemd" && path.len() > 1 {
-            return Some(path);
-        }
-        if ctrl.is_empty() {
-            v2 = Some(path);
-        }
-    }
-    v2.map(|p| p.trim_end_matches(" (deleted)"))
 }
 
 fn is_hex_id(s: &str) -> bool {
@@ -862,6 +846,76 @@ pub fn explain_with(probe: &dyn Probe, pid: u32, start_time: u64, table: &[Proce
         actions: actions(&cause, &facts, probe, id_of(&cause)),
         cause,
         notes,
+    }
+}
+
+/// Why a recorded process ran, from its recorded cgroup and ancestors; for one that has exited. Unit details are
+/// looked up now, only if the unit still exists, and the sentence says so. No actions: there is nothing to act on.
+pub fn explain_recorded(origin: &Origin, start_time: u64) -> Why {
+    explain_recorded_with(&Live::default(), origin, start_time)
+}
+
+/// How long after its last recorded reading a process still counts as running.
+const RUNNING_S: i64 = 30;
+
+/// One line on why a recorded process ran, for the background executor: the live explanation if it is still
+/// running, else the one rebuilt from the record.
+pub fn recorded_line(history: &History, p: &Proc, now: i64) -> String {
+    if now - p.last_t <= RUNNING_S {
+        return explain(p.pid as u32, p.start_time as u64, &[]).sentence;
+    }
+    match history.origin(p.id) {
+        Ok(Some(o)) => explain_recorded(&o, p.start_time as u64).sentence,
+        _ => NOT_RECORDED.into(),
+    }
+}
+
+pub const NOT_RECORDED: &str = "Not recorded (sysman was older then)";
+
+pub fn explain_recorded_with(probe: &dyn Probe, origin: &Origin, start_time: u64) -> Why {
+    let chain: Vec<Link> = origin
+        .chain
+        .iter()
+        .map(|(pid, comm)| Link {
+            pid: *pid,
+            comm: comm.clone(),
+            exe: None,
+        })
+        .collect();
+    let mut cause = classify(&format!("0::{}\n", origin.cgroup), &chain);
+    let mut facts = Facts::default();
+    if let Some(unit) =
+        unit_of(&cause).filter(|u| u.name.ends_with(".service") && u.uid.is_none_or(|uid| uid == probe.uid()))
+    {
+        facts.props = probe.unit(unit).ok();
+    }
+    if let Some(props) = &facts.props {
+        cause = refine(cause, props);
+    }
+    if let Cause::Timer { unit, timer } = &cause {
+        facts.timer = probe
+            .unit(&Unit {
+                name: timer.clone(),
+                uid: unit.uid,
+            })
+            .ok();
+    }
+    let mut sentence = sentence(&cause, &facts, probe, start_time);
+    if facts.props.is_some() {
+        sentence = format!("{} (as of now)", sentence.trim_end_matches('.')) + ".";
+    }
+    let me = chain
+        .first()
+        .map_or_else(String::new, |l| format!("{} {}", l.comm, l.pid));
+    Why {
+        chain: chain_lines(&cause, &facts, &chain, &me),
+        sentence,
+        cause,
+        if_you_end: None,
+        evidence: Vec::new(),
+        notes: Vec::new(),
+        facts: Vec::new(),
+        actions: Actions::default(),
     }
 }
 
@@ -2269,5 +2323,42 @@ mod tests {
         };
         assert_eq!(live.proc_file(7, "cgroup").unwrap(), "0::/system.slice/a.service\n");
         assert!(live.proc_file(8, "cgroup").is_err());
+    }
+
+    fn origin(cgroup: &str, chain: &[(u32, &str)]) -> Origin {
+        Origin {
+            cgroup: cgroup.into(),
+            chain: chain.iter().map(|(p, c)| (*p, (*c).into())).collect(),
+        }
+    }
+
+    #[test]
+    fn a_recorded_service_whose_unit_is_gone_names_only_the_unit() {
+        let o = origin("/system.slice/gone.service", &[(812, "gone"), (1, "systemd")]);
+        let w = explain_recorded_with(&Fake::default(), &o, 100);
+        assert_eq!(w.sentence, "System service gone.service.");
+        assert!(w.if_you_end.is_none() && w.actions == Actions::default());
+    }
+
+    #[test]
+    fn a_recorded_service_whose_unit_still_exists_says_the_details_are_as_of_now() {
+        let o = origin("/system.slice/sshd.service", &[(812, "sshd"), (1, "systemd")]);
+        let w = explain_recorded_with(&sshd_probe("on-failure"), &o, 100);
+        assert_eq!(
+            w.sentence,
+            "System service OpenSSH Daemon (sshd.service), enabled at boot (as of now)."
+        );
+        assert!(w.if_you_end.is_none(), "an exited process has nothing to end");
+    }
+
+    #[test]
+    fn a_recorded_process_is_classified_from_its_recorded_parents() {
+        let o = origin("/", &[(900, "make"), (800, "bash"), (700, "kitty"), (1, "systemd")]);
+        let w = explain_recorded_with(&Fake::default(), &o, 100);
+        assert!(
+            matches!(w.cause, Cause::Terminal { emulator: true, .. }),
+            "{:?}",
+            w.cause
+        );
     }
 }

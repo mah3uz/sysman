@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -106,6 +106,18 @@ pub struct History {
     conn: Connection,
     /// Oldest `t` per table and series or process; instances live for one load, so pruning cannot outdate it.
     oldest: RefCell<HashMap<(&'static str, i64), Option<i64>>>,
+    /// Whether `procs` has `ppid` and `cgroup_id`; a database from an older daemon lacks them. Checked once.
+    has_origin: Cell<Option<bool>>,
+}
+
+/// Longest recorded ancestor chain, the process included.
+const MAX_LINEAGE: usize = 16;
+
+/// Where a recorded process came from: its cgroup path and the recorded ancestors, the process first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    pub cgroup: String,
+    pub chain: Vec<(u32, String)>,
 }
 
 pub fn db_path() -> PathBuf {
@@ -135,6 +147,7 @@ impl History {
         Ok(Self {
             conn: Connection::open_with_flags(path, flags)?,
             oldest: RefCell::default(),
+            has_origin: Cell::default(),
         })
     }
 
@@ -208,6 +221,74 @@ impl History {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// The cgroup and recorded parent chain of the instance `proc_id`. `None` when the daemon that recorded it
+    /// predates the columns or never read its cgroup. The chain stops at PID 1, at a parent that was not recorded,
+    /// or at `MAX_LINEAGE`; a parent is the instance with that pid that had started by the child's start.
+    pub fn origin(&self, proc_id: i64) -> Result<Option<Origin>> {
+        if !self.origin_columns()? {
+            return Ok(None);
+        }
+        let row = self
+            .conn
+            .query_row(
+                "SELECT p.pid, p.comm, p.ppid, p.start_time, c.path FROM procs p
+                 LEFT JOIN cgroups c ON c.id = p.cgroup_id WHERE p.id = ?1",
+                [proc_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((pid, comm, mut ppid, start, Some(cgroup))) = row else {
+            return Ok(None);
+        };
+        let mut chain = vec![(pid as u32, comm)];
+        let mut parent = self.conn.prepare_cached(
+            "SELECT pid, comm, ppid, start_time FROM procs WHERE pid = ?1 AND start_time <= ?2
+             ORDER BY (last_t >= ?2) DESC, start_time DESC LIMIT 1",
+        )?;
+        let mut child_start = start;
+        while chain.len() < MAX_LINEAGE && chain.last().is_some_and(|(p, _)| *p != 1) {
+            let Some(pp) = ppid.filter(|p| *p > 0 && !chain.iter().any(|(c, _)| i64::from(*c) == *p)) else {
+                break;
+            };
+            let found = parent
+                .query_row(params![pp, child_start], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .optional()?;
+            let Some((pid, comm, next_ppid, next_start)) = found else {
+                break;
+            };
+            chain.push((pid as u32, comm));
+            ppid = next_ppid;
+            child_start = next_start;
+        }
+        Ok(Some(Origin { cgroup, chain }))
+    }
+
+    fn origin_columns(&self) -> Result<bool> {
+        if let Some(known) = self.has_origin.get() {
+            return Ok(known);
+        }
+        let mut stmt = self.conn.prepare("SELECT name FROM pragma_table_info('procs')")?;
+        let names: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let known = ["ppid", "cgroup_id"].iter().all(|c| names.iter().any(|n| n == c));
+        self.has_origin.set(Some(known));
+        Ok(known)
     }
 
     /// Processes whose command name contains `name`, ignoring case, most recently seen first.
@@ -738,5 +819,86 @@ mod tests {
         assert_eq!(h.sample_count("/cpu/total_pct", 0, 4).unwrap(), 2);
         assert_eq!(h.sample_count("/nope", 0, 4).unwrap(), 0);
         assert_eq!(h.proc_sample_count(2, 0, 60).unwrap(), 2);
+    }
+
+    fn db_with_origin() -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = db();
+        for (table, col, kind) in schema::db::ADDED_COLUMNS {
+            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {kind}"), [])
+                .unwrap();
+        }
+        conn.execute("INSERT INTO cgroups VALUES (1, '/system.slice/a.service')", [])
+            .unwrap();
+        (dir, conn)
+    }
+
+    // id, pid, start, comm, first_t, last_t, ppid, cgroup_id
+    fn add_proc(conn: &Connection, row: (i64, i64, i64, &str, i64, i64, i64, Option<i64>)) {
+        conn.execute(
+            "INSERT INTO procs (id, pid, start_time, comm, first_t, last_t, ppid, cgroup_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7],
+        )
+        .unwrap();
+    }
+
+    fn pids(o: &Origin) -> Vec<(u32, &str)> {
+        o.chain.iter().map(|(p, c)| (*p, c.as_str())).collect()
+    }
+
+    #[test]
+    fn the_parent_is_the_instance_that_ran_at_the_childs_start_not_just_the_pid() {
+        let (dir, conn) = db_with_origin();
+        add_proc(&conn, (1, 100, 1000, "old-shell", 1000, 2000, 1, None));
+        add_proc(&conn, (2, 100, 5000, "new-shell", 5000, 6000, 1, None));
+        add_proc(&conn, (3, 200, 1500, "child-a", 1500, 1800, 100, Some(1)));
+        add_proc(&conn, (4, 200, 5100, "child-b", 5100, 5200, 100, Some(1)));
+        let h = history(&dir);
+        assert_eq!(pids(&h.origin(3).unwrap().unwrap())[1], (100, "old-shell"));
+        assert_eq!(pids(&h.origin(4).unwrap().unwrap())[1], (100, "new-shell"));
+    }
+
+    #[test]
+    fn the_chain_ends_at_pid_1() {
+        let (dir, conn) = db_with_origin();
+        add_proc(&conn, (1, 1, 10, "systemd", 10, 9000, 0, None));
+        add_proc(&conn, (2, 50, 100, "sh", 100, 200, 1, None));
+        add_proc(&conn, (3, 60, 150, "job", 150, 160, 50, Some(1)));
+        let o = history(&dir).origin(3).unwrap().unwrap();
+        assert_eq!(o.cgroup, "/system.slice/a.service");
+        assert_eq!(pids(&o), [(60, "job"), (50, "sh"), (1, "systemd")]);
+    }
+
+    #[test]
+    fn the_chain_stops_at_a_parent_that_was_never_recorded() {
+        let (dir, conn) = db_with_origin();
+        add_proc(&conn, (1, 60, 150, "job", 150, 160, 50, Some(1)));
+        assert_eq!(pids(&history(&dir).origin(1).unwrap().unwrap()), [(60, "job")]);
+    }
+
+    #[test]
+    fn the_chain_walk_is_capped() {
+        let (dir, conn) = db_with_origin();
+        for i in 0..40 {
+            add_proc(&conn, (i + 1, 100 + i, 1000 - i, "p", 0, 9999, 101 + i, Some(1)));
+        }
+        let o = history(&dir).origin(1).unwrap().unwrap();
+        assert_eq!(o.chain.len(), MAX_LINEAGE);
+    }
+
+    #[test]
+    fn a_row_without_a_recorded_cgroup_has_no_origin() {
+        let (dir, conn) = db_with_origin();
+        add_proc(&conn, (1, 60, 150, "job", 150, 160, 50, None));
+        assert_eq!(history(&dir).origin(1).unwrap(), None);
+    }
+
+    #[test]
+    fn a_database_from_an_older_daemon_reads_as_not_recorded_not_an_error() {
+        let (dir, conn) = db();
+        conn.execute("INSERT INTO procs VALUES (1, 42, 100, 'old', NULL, NULL, 0, 500)", [])
+            .unwrap();
+        let h = history(&dir);
+        assert_eq!(h.origin(1).unwrap(), None);
+        assert_eq!(h.origin(1).unwrap(), None, "the cached answer agrees");
     }
 }
